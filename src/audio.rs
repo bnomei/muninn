@@ -131,7 +131,10 @@ impl AudioRecorder for MacosAudioRecorder {
             self.started_at = Some(Instant::now());
             tracing::debug!(
                 capture_sample_rate_hz,
-                capture_channels, output_sample_rate_hz, output_mono, "audio recording started"
+                capture_channels,
+                output_sample_rate_hz,
+                output_mono,
+                "audio recording started"
             );
             Ok(())
         }
@@ -753,8 +756,7 @@ fn write_wav_file(
     source_channels: u16,
     output_config: &RecordingConfig,
 ) -> MacosAdapterResult<std::path::PathBuf> {
-    let wav_path =
-        std::env::temp_dir().join(format!("muninn-{}.wav", uuid::Uuid::now_v7()));
+    let wav_path = std::env::temp_dir().join(format!("muninn-{}.wav", uuid::Uuid::now_v7()));
     let output_spec = output_wav_spec(source_channels, output_config);
     let spec = hound::WavSpec {
         channels: output_spec.channels,
