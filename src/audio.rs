@@ -705,6 +705,27 @@ fn output_wav_spec(source_channels: u16, output_config: &RecordingConfig) -> Out
     }
 }
 
+#[doc(hidden)]
+#[must_use]
+pub fn benchmark_render_output_checksum(
+    samples: &[i16],
+    source_sample_rate: u32,
+    source_channels: u16,
+    output_config: &RecordingConfig,
+) -> (usize, i64) {
+    let mut rendered_samples = 0_usize;
+    let mut checksum = 0_i64;
+
+    for sample in OutputSampleIter::new(samples, source_sample_rate, source_channels, output_config)
+    {
+        rendered_samples += 1;
+        checksum =
+            checksum.wrapping_add((sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i64);
+    }
+
+    (rendered_samples, checksum)
+}
+
 #[cfg(test)]
 fn collect_output_samples(
     samples: &[i16],

@@ -1,0 +1,39 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bench-compile:
+    name: Benchmark Build
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build benchmark suite
+        run: cargo bench --bench runtime_bottlenecks --no-run
+
+  codspeed:
+    name: CodSpeed
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust + cargo-codspeed
+        uses: moonrepo/setup-rust@v0
+        with:
+          bins: cargo-codspeed
+      - name: Build benchmarks
+        run: cargo codspeed build --bench runtime_bottlenecks
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          run: cargo codspeed run --bench runtime_bottlenecks

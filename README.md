@@ -8,7 +8,7 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-AI-native macOS menu bar dictation for developers.
+AI-native macOS menu bar dictation.
 
 Muninn records a short utterance, runs it through a configurable pipeline, and injects the result back into the active app. It is designed for code-adjacent dictation: commands, flags, package names, file paths, env vars, acronyms, and other text that normal voice tools often mangle.
 
@@ -151,19 +151,9 @@ profile = "terminal"
 bundle_id = "com.apple.Terminal"
 
 [[profile_rules]]
-id = "alacritty-app"
-profile = "terminal"
-bundle_id = "org.alacritty"
-
-[[profile_rules]]
 id = "mail-app"
 profile = "mail"
 bundle_id_prefix = "com.apple.mail"
-
-[[profile_rules]]
-id = "proton-mail-app"
-profile = "mail"
-bundle_id = "ch.protonmail.desktop"
 ```
 
 Resolution order is:
@@ -273,3 +263,29 @@ Use the fixtures in `tests/fixtures/` when you want example input.
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.
 - Provider-backed transcription needs realistic timeout budgets.
+
+## Benchmarking
+
+Run the tracked benchmark suite with:
+
+```bash
+cargo bench --bench runtime_bottlenecks
+```
+
+The suite focuses on the bottlenecks that directly affect per-utterance latency without relying on network calls:
+- audio output transform and resampling
+- envelope JSON round trips on representative payload sizes
+- Google request-body construction for representative WAV sizes
+- per-utterance profile and voice resolution across many rules
+- replacement scoring on dense candidate sets
+- in-process pipeline runner overhead on larger envelopes
+- replay persistence with and without retained audio artifacts
+
+Filter to one hotspot with a benchmark name substring, for example:
+
+```bash
+cargo bench --bench runtime_bottlenecks pipeline_runner
+cargo bench --bench runtime_bottlenecks replay_persist
+```
+
+CodSpeed runs the same benchmark target in CI so regressions in these paths show up on PRs.
