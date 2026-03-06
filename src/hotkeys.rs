@@ -11,11 +11,17 @@ use crate::{
     MacosAdapterResult,
 };
 
+/// Platform-specific key type: `rdev::Key` on macOS, opaque u32 elsewhere.
+#[cfg(target_os = "macos")]
+type PlatformKey = rdev::Key;
+#[cfg(not(target_os = "macos"))]
+type PlatformKey = u32;
+
 #[derive(Debug, Clone)]
 pub struct MacosHotkeyBinding {
     action: HotkeyAction,
     trigger: TriggerType,
-    key: Option<rdev::Key>,
+    key: Option<PlatformKey>,
     modifiers: ModifierSet,
     double_tap_modifier: Option<Modifier>,
     double_tap_timeout_ms: u64,
@@ -366,7 +372,7 @@ fn parse_binding(
     binding: &HotkeyBinding,
 ) -> MacosAdapterResult<MacosHotkeyBinding> {
     let mut modifiers = ModifierSet::default();
-    let mut key = None;
+    let mut key: Option<PlatformKey> = None;
 
     for part in &binding.chord {
         match part.trim().to_ascii_lowercase().as_str() {
@@ -433,7 +439,8 @@ fn parse_binding(
     }
 }
 
-fn parse_key(value: &str) -> MacosAdapterResult<rdev::Key> {
+#[cfg(target_os = "macos")]
+fn parse_key(value: &str) -> MacosAdapterResult<PlatformKey> {
     use rdev::Key;
 
     let key = match value {
@@ -467,6 +474,53 @@ fn parse_key(value: &str) -> MacosAdapterResult<rdev::Key> {
         "x" => Key::KeyX,
         "y" => Key::KeyY,
         "z" => Key::KeyZ,
+        _ => {
+            return Err(MacosAdapterError::operation_failed(
+                "hotkeys",
+                format!("unsupported hotkey key: {value}"),
+            ))
+        }
+    };
+
+    Ok(key)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_key(value: &str) -> MacosAdapterResult<PlatformKey> {
+    // On non-macOS platforms, map key names to opaque numeric identifiers.
+    // This allows config parsing to succeed even though runtime hotkey
+    // listening is not supported outside macOS.
+    let key = match value {
+        "space" => 1,
+        "escape" | "esc" => 2,
+        "tab" => 3,
+        "return" | "enter" => 4,
+        "a" => 10,
+        "b" => 11,
+        "c" => 12,
+        "d" => 13,
+        "e" => 14,
+        "f" => 15,
+        "g" => 16,
+        "h" => 17,
+        "i" => 18,
+        "j" => 19,
+        "k" => 20,
+        "l" => 21,
+        "m" => 22,
+        "n" => 23,
+        "o" => 24,
+        "p" => 25,
+        "q" => 26,
+        "r" => 27,
+        "s" => 28,
+        "t" => 29,
+        "u" => 30,
+        "v" => 31,
+        "w" => 32,
+        "x" => 33,
+        "y" => 34,
+        "z" => 35,
         _ => {
             return Err(MacosAdapterError::operation_failed(
                 "hotkeys",
