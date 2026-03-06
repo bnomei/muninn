@@ -24,16 +24,23 @@ jobs:
 
   codspeed:
     name: CodSpeed
-    runs-on: macos-15
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev
       - name: Install Rust + cargo-codspeed
         uses: moonrepo/setup-rust@v0
         with:
+          channel: stable
+          cache-target: release
           bins: cargo-codspeed
       - name: Build benchmarks
         run: cargo codspeed build --bench runtime_bottlenecks
       - name: Run benchmarks
         uses: CodSpeedHQ/action@v4
         with:
+          mode: simulation
           run: cargo codspeed run --bench runtime_bottlenecks
