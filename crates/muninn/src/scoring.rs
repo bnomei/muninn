@@ -1,4 +1,30 @@
+use std::collections::HashMap;
+
+use crate::envelope::MuninnEnvelopeV1;
+use crate::runner::PipelineOutcome;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct UncertainSpan {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct ReplacementCandidate {
+    from: String,
+    to: String,
+    score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcceptedReplacement {
+    start: usize,
+    end: usize,
+    from: String,
+    to: String,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Thresholds {
@@ -177,11 +203,195 @@ fn top_two_scores(scores: &[f32]) -> (Option<f32>, Option<f32>) {
     (top, second)
 }
 
+pub fn apply_scored_replacements_to_outcome<T>(outcome: &mut PipelineOutcome, thresholds: T) -> bool
+where
+    T: Into<Thresholds>,
+{
+    let thresholds = thresholds.into();
+    match outcome {
+        PipelineOutcome::Completed { envelope, .. }
+        | PipelineOutcome::FallbackRaw { envelope, .. } => {
+            apply_scored_replacements_to_envelope(envelope, &thresholds)
+        }
+        PipelineOutcome::Aborted { .. } => false,
+    }
+}
+
+pub fn apply_scored_replacements_to_envelope(
+    envelope: &mut MuninnEnvelopeV1,
+    thresholds: &Thresholds,
+) -> bool {
+    if non_empty_text(&envelope.output.final_text).is_some() {
+        return false;
+    }
+
+    let Some(raw_text) = non_empty_text(&envelope.transcript.raw_text) else {
+        return false;
+    };
+
+    let Some(mut replacements) = scored_replacement_plan(
+        raw_text,
+        &envelope.uncertain_spans,
+        &envelope.replacements,
+        thresholds,
+    ) else {
+        return false;
+    };
+    if replacements.is_empty() {
+        return false;
+    }
+
+    replacements.sort_by_key(|replacement| (replacement.start, replacement.end));
+    replacements.dedup_by(|left, right| {
+        left.start == right.start
+            && left.end == right.end
+            && left.from == right.from
+            && left.to == right.to
+    });
+
+    let Some(final_text) = render_replacements(raw_text, &replacements) else {
+        return false;
+    };
+    if final_text == raw_text {
+        return false;
+    }
+
+    envelope.output.final_text = Some(final_text);
+    true
+}
+
+fn scored_replacement_plan(
+    raw_text: &str,
+    uncertain_spans: &[serde_json::Value],
+    replacements: &[serde_json::Value],
+    thresholds: &Thresholds,
+) -> Option<Vec<AcceptedReplacement>> {
+    let parsed_spans: Vec<_> = uncertain_spans
+        .iter()
+        .filter_map(|value| serde_json::from_value::<UncertainSpan>(value.clone()).ok())
+        .collect();
+    let parsed_replacements: Vec<_> = replacements
+        .iter()
+        .filter_map(|value| serde_json::from_value::<ReplacementCandidate>(value.clone()).ok())
+        .collect();
+    if parsed_spans.is_empty() || parsed_replacements.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut replacements_by_source = HashMap::<&str, Vec<&ReplacementCandidate>>::new();
+    for replacement in &parsed_replacements {
+        replacements_by_source
+            .entry(replacement.from.as_str())
+            .or_default()
+            .push(replacement);
+    }
+
+    let mut accepted = Vec::new();
+    for span in parsed_spans {
+        if !span_offsets_match(raw_text, &span) {
+            return None;
+        }
+
+        let Some(candidates) = replacements_by_source.get(span.text.as_str()) else {
+            continue;
+        };
+
+        let decision = decide_replacement(
+            &ReplacementDecisionInput {
+                candidate_scores: candidates.iter().map(|candidate| candidate.score).collect(),
+                span: SpanMetadata::new(
+                    span.text.chars().count(),
+                    looks_like_acronym(&span.text)
+                        || candidates
+                            .iter()
+                            .any(|candidate| looks_like_acronym(candidate.to.as_str())),
+                ),
+            },
+            thresholds,
+        );
+        if !decision.accepted {
+            continue;
+        }
+
+        let Some(best_candidate) = candidates.iter().copied().max_by(|left, right| {
+            left.score
+                .partial_cmp(&right.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        }) else {
+            continue;
+        };
+
+        accepted.push(AcceptedReplacement {
+            start: span.start,
+            end: span.end,
+            from: span.text,
+            to: best_candidate.to.clone(),
+        });
+    }
+
+    Some(accepted)
+}
+
+fn render_replacements(raw_text: &str, replacements: &[AcceptedReplacement]) -> Option<String> {
+    let mut rendered = String::with_capacity(raw_text.len());
+    let mut cursor = 0_usize;
+
+    for replacement in replacements {
+        if replacement.start > replacement.end
+            || replacement.end > raw_text.len()
+            || !raw_text.is_char_boundary(replacement.start)
+            || !raw_text.is_char_boundary(replacement.end)
+            || replacement.start < cursor
+        {
+            return None;
+        }
+
+        let source = raw_text.get(replacement.start..replacement.end)?;
+        if source != replacement.from {
+            return None;
+        }
+
+        rendered.push_str(&raw_text[cursor..replacement.start]);
+        rendered.push_str(&replacement.to);
+        cursor = replacement.end;
+    }
+
+    rendered.push_str(&raw_text[cursor..]);
+    Some(rendered)
+}
+
+fn span_offsets_match(raw_text: &str, span: &UncertainSpan) -> bool {
+    span.start <= span.end
+        && raw_text
+            .get(span.start..span.end)
+            .is_some_and(|slice| slice == span.text)
+}
+
+fn looks_like_acronym(text: &str) -> bool {
+    let normalized: String = text
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    normalized.len() > 1
+        && normalized.chars().any(|ch| ch.is_ascii_alphabetic())
+        && normalized
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn non_empty_text(text: &Option<String>) -> Option<&str> {
+    text.as_deref().filter(|value| !value.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        apply_scored_replacements_to_envelope, apply_scored_replacements_to_outcome,
         decide_replacement, DecisionReason, ReplacementDecisionInput, SpanMetadata, Thresholds,
     };
+    use crate::envelope::MuninnEnvelopeV1;
+    use crate::runner::PipelineOutcome;
+    use serde_json::json;
 
     fn default_thresholds() -> Thresholds {
         Thresholds::default()
@@ -273,5 +483,72 @@ mod tests {
         assert_eq!(decision.top_score, None);
         assert_eq!(decision.second_score, None);
         assert_eq!(decision.margin, None);
+    }
+
+    #[test]
+    fn materializes_output_final_text_for_accepted_replacements() {
+        let mut envelope = MuninnEnvelopeV1::new("utt-123", "2026-03-05T17:00:00Z")
+            .with_transcript_raw_text("ship to sf")
+            .push_uncertain_span(json!({"start": 8, "end": 10, "text": "sf"}))
+            .push_replacement(json!({"from": "sf", "to": "San Francisco", "score": 0.93}));
+
+        let applied = apply_scored_replacements_to_envelope(&mut envelope, &default_thresholds());
+
+        assert!(applied);
+        assert_eq!(
+            envelope.output.final_text.as_deref(),
+            Some("ship to San Francisco")
+        );
+    }
+
+    #[test]
+    fn leaves_output_empty_when_replacement_scores_are_ambiguous() {
+        let mut envelope = MuninnEnvelopeV1::new("utt-123", "2026-03-05T17:00:00Z")
+            .with_transcript_raw_text("ship to sf")
+            .push_uncertain_span(json!({"start": 8, "end": 10, "text": "sf"}))
+            .push_replacement(json!({"from": "sf", "to": "San Francisco", "score": 0.91}))
+            .push_replacement(json!({"from": "sf", "to": "South Ferry", "score": 0.86}));
+
+        let applied = apply_scored_replacements_to_envelope(&mut envelope, &default_thresholds());
+
+        assert!(!applied);
+        assert!(envelope.output.final_text.is_none());
+    }
+
+    #[test]
+    fn leaves_envelope_unchanged_when_span_offsets_are_invalid() {
+        let mut envelope = MuninnEnvelopeV1::new("utt-123", "2026-03-05T17:00:00Z")
+            .with_transcript_raw_text("ship to sf")
+            .push_uncertain_span(json!({"start": 0, "end": 2, "text": "sf"}))
+            .push_replacement(json!({"from": "sf", "to": "San Francisco", "score": 0.93}));
+
+        let applied = apply_scored_replacements_to_envelope(&mut envelope, &default_thresholds());
+
+        assert!(!applied);
+        assert!(envelope.output.final_text.is_none());
+    }
+
+    #[test]
+    fn outcome_helper_updates_completed_outcomes() {
+        let mut outcome = PipelineOutcome::Completed {
+            envelope: MuninnEnvelopeV1::new("utt-123", "2026-03-05T17:00:00Z")
+                .with_transcript_raw_text("ship to sf")
+                .push_uncertain_span(json!({"start": 8, "end": 10, "text": "sf"}))
+                .push_replacement(json!({"from": "sf", "to": "San Francisco", "score": 0.93})),
+            trace: Vec::new(),
+        };
+
+        let applied = apply_scored_replacements_to_outcome(&mut outcome, default_thresholds());
+
+        assert!(applied);
+        match outcome {
+            PipelineOutcome::Completed { envelope, .. } => {
+                assert_eq!(
+                    envelope.output.final_text.as_deref(),
+                    Some("ship to San Francisco")
+                );
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
     }
 }

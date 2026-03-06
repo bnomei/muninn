@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+mod autostart;
 mod internal_tools;
 mod refine;
 mod replay;
@@ -13,15 +14,18 @@ mod stt_openai_tool;
 
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use muninn::config::{resolve_config_path, IndicatorConfig, PipelineConfig};
+use muninn::config::{resolve_config_path, IndicatorConfig, PipelineConfig, PipelineStepConfig};
 use muninn::{
-    detect_platform, ensure_supported_platform, AppConfig, AppEvent, AppState, AudioRecorder,
-    HotkeyAction, HotkeyEvent, HotkeyEventKind, HotkeyEventSource, IndicatorAdapter,
+    capture_frontmost_target_context, detect_platform, ensure_supported_platform, AppConfig,
+    AppEvent, AppState, AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind,
+    HotkeyEventSource, InProcessStepError, InProcessStepExecutor, IndicatorAdapter,
     IndicatorState, MacosAudioRecorder, MacosHotkeyEventSource, MacosPermissionsAdapter,
-    MacosTextInjector, MuninnEnvelopeV1, Orchestrator, PermissionPreflightStatus, PermissionStatus,
-    PermissionsAdapter, PipelineOutcome, PipelineRunner, PipelineStopReason, PipelineTraceEntry,
-    Platform, RecordingMode, TextInjector,
+    MacosTextInjector, MuninnEnvelopeV1, Orchestrator, PermissionPreflightStatus,
+    PermissionStatus, PermissionsAdapter, PipelineOutcome, PipelineRunner, PipelineStopReason,
+    PipelineTraceEntry, Platform, RecordingMode, ResolvedUtteranceConfig,
+    TargetContextSnapshot, TextInjector,
 };
+use serde_json::Value;
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 #[cfg(target_os = "macos")]
@@ -32,15 +36,21 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEv
 use uuid::Uuid;
 
 const INDICATOR_ICON_SIZE_PX: u32 = 36;
+const DEFAULT_INDICATOR_GLYPH: char = 'M';
 const OUTPUT_INDICATOR_MIN_DURATION: Duration = Duration::from_millis(125);
+const MISSING_CREDENTIALS_INDICATOR_DURATION: Duration = Duration::from_secs(1);
 const RUNTIME_EVENT_BUFFER_CAPACITY: usize = 32;
 const HOTKEY_RECOVERY_DELAY: Duration = Duration::from_millis(250);
+const PREVIEW_CONTEXT_POLL_INTERVAL: Duration = Duration::from_millis(400);
 const STALE_RECORDING_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 fn main() -> ExitCode {
     maybe_load_dotenv();
 
     let args = std::env::args().collect::<Vec<_>>();
+    if let Some(exit_code) = maybe_handle_debug_record(&args) {
+        return exit_code;
+    }
     if let Some(exit_code) = internal_tools::maybe_handle_internal_step(&args) {
         return exit_code;
     }
@@ -54,6 +64,20 @@ fn main() -> ExitCode {
     }
 }
 
+fn maybe_handle_debug_record(args: &[String]) -> Option<ExitCode> {
+    if args.get(1).map(String::as_str) != Some("__debug_record") {
+        return None;
+    }
+
+    Some(match run_debug_record(args.get(2)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("muninn debug record failed: {error:#}");
+            ExitCode::FAILURE
+        }
+    })
+}
+
 fn bootstrap() -> Result<()> {
     let config_path = resolve_config_path().context("resolving configured AppConfig path")?;
     let config = AppConfig::load().context("loading AppConfig from configured path")?;
@@ -61,11 +85,63 @@ fn bootstrap() -> Result<()> {
     if let Err(error) = cleanup_stale_temp_recordings() {
         warn!(error = %error, "failed to clean up stale temporary recordings");
     }
+    sync_os_autostart(&config_path, &config);
 
     info!(profile = %config.app.profile, "loaded application configuration");
 
     let runtime = AppRuntime::new(config_path, config)?;
     runtime.run()
+}
+
+fn run_debug_record(duration_arg: Option<&String>) -> Result<()> {
+    let seconds = duration_arg
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .context("parsing __debug_record duration seconds")?
+        .unwrap_or(3)
+        .max(1);
+    let config = AppConfig::load().context("loading AppConfig for __debug_record")?;
+    let _ = init_logging(&config);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("building tokio runtime for __debug_record")?;
+
+    runtime.block_on(async move {
+        let preflight = refresh_permissions_status()
+            .await
+            .context("refreshing permissions for __debug_record")?;
+        ensure_recording_can_start(preflight)?;
+
+        let mut recorder = MacosAudioRecorder::new(config.recording.clone());
+        recorder.warm_up().await.context("warming recorder")?;
+        recorder
+            .start_recording()
+            .await
+            .context("starting debug recording")?;
+        tokio::time::sleep(Duration::from_secs(seconds)).await;
+        let recorded = recorder
+            .stop_recording()
+            .await
+            .context("stopping debug recording")?;
+        let wav_bytes = fs::metadata(&recorded.wav_path)
+            .with_context(|| {
+                format!(
+                    "reading debug recording metadata {}",
+                    recorded.wav_path.display()
+                )
+            })?
+            .len();
+
+        println!("wav_path={}", recorded.wav_path.display());
+        println!("duration_ms={}", recorded.duration_ms);
+        println!("bytes={wav_bytes}");
+        println!("mono={}", config.recording.mono);
+        println!("sample_rate_hz={}", config.recording.sample_rate_hz());
+
+        Ok(())
+    })
 }
 
 fn init_logging(config: &AppConfig) -> Result<()> {
@@ -138,17 +214,23 @@ impl AppRuntime {
         let strict_step_contract = self.config.app.strict_step_contract;
         let preflight = self.preflight;
         let config_path = self.config_path.clone();
-        let mut indicator_config = self.config.indicator.clone();
-        let runtime_config = self.config.clone();
+        let mut current_config = self.config.clone();
+        let mut indicator_config = current_config.indicator.clone();
+        let runtime_config = current_config.clone();
         let (runtime_event_tx, runtime_event_rx) =
             tokio::sync::mpsc::channel::<RuntimeMessage>(RUNTIME_EVENT_BUFFER_CAPACITY);
         let mut runtime_event_rx = Some(runtime_event_rx);
         let mut pending_config_reload: Option<Box<AppConfig>> = None;
+        let mut preview_context = capture_frontmost_target_context();
+        let mut preview_selection = current_config.resolve_profile_selection(&preview_context);
         let tray_icon = Some(build_tray_icon(indicator_icon(
             IndicatorState::Idle,
+            None,
+            preview_selection.voice_glyph,
             &indicator_config,
         ))?);
         let mut last_indicator_state = IndicatorState::Idle;
+        let mut last_active_glyph = None;
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -175,6 +257,7 @@ impl AppRuntime {
                         runtime_events,
                     );
                     spawn_config_watcher(config_path.clone(), proxy.clone());
+                    spawn_preview_context_watcher(proxy.clone());
                 }
                 Event::UserEvent(UserEvent::TrayEvent(event)) => {
                     if let Some(app_event) = map_tray_event(&event) {
@@ -195,21 +278,50 @@ impl AppRuntime {
                         info!(indicator = ?last_indicator_state, ?button_state, "menu bar icon interaction");
                     }
                 }
-                Event::UserEvent(UserEvent::IndicatorUpdated(state)) => {
+                Event::UserEvent(UserEvent::IndicatorUpdated { state, glyph }) => {
                     last_indicator_state = state;
+                    last_active_glyph = glyph;
                     if let Some(icon) = tray_icon.as_ref() {
-                        update_tray_appearance(icon, state, &indicator_config);
+                        update_tray_appearance(
+                            icon,
+                            state,
+                            glyph,
+                            preview_selection.voice_glyph,
+                            &indicator_config,
+                        );
+                    }
+                }
+                Event::UserEvent(UserEvent::PreviewContextUpdated(context)) => {
+                    preview_context = context;
+                    preview_selection = current_config.resolve_profile_selection(&preview_context);
+                    if let Some(icon) = tray_icon.as_ref() {
+                        update_tray_appearance(
+                            icon,
+                            last_indicator_state,
+                            last_active_glyph,
+                            preview_selection.voice_glyph,
+                            &indicator_config,
+                        );
                     }
                 }
                 Event::UserEvent(UserEvent::ConfigReloaded(config)) => {
-                    indicator_config = config.indicator.clone();
+                    current_config = (*config).clone();
+                    indicator_config = current_config.indicator.clone();
+                    preview_selection = current_config.resolve_profile_selection(&preview_context);
+                    sync_os_autostart(&config_path, &current_config);
                     if let Some(icon) = tray_icon.as_ref() {
-                        update_tray_appearance(icon, last_indicator_state, &indicator_config);
+                        update_tray_appearance(
+                            icon,
+                            last_indicator_state,
+                            last_active_glyph,
+                            preview_selection.voice_glyph,
+                            &indicator_config,
+                        );
                     }
                     match runtime_event_tx.try_send(RuntimeMessage::ReloadConfig(config.clone())) {
                         Ok(()) => {
                             info!(
-                                profile = %config.app.profile,
+                                profile = %current_config.app.profile,
                                 "applied live config reload"
                             );
                         }
@@ -233,7 +345,13 @@ impl AppRuntime {
                 Event::UserEvent(UserEvent::RuntimeFailure(message)) => {
                     error!(%message, "runtime worker failed");
                     if let Some(icon) = tray_icon.as_ref() {
-                        update_tray_appearance(icon, IndicatorState::Idle, &indicator_config);
+                        update_tray_appearance(
+                            icon,
+                            IndicatorState::Idle,
+                            None,
+                            preview_selection.voice_glyph,
+                            &indicator_config,
+                        );
                     }
                 }
                 _ => {}
@@ -247,7 +365,11 @@ impl AppRuntime {
 #[derive(Debug, Clone)]
 enum UserEvent {
     TrayEvent(TrayIconEvent),
-    IndicatorUpdated(IndicatorState),
+    IndicatorUpdated {
+        state: IndicatorState,
+        glyph: Option<char>,
+    },
+    PreviewContextUpdated(TargetContextSnapshot),
     ConfigReloaded(Box<AppConfig>),
     ConfigReloadFailed(String),
     RuntimeFailure(String),
@@ -267,13 +389,20 @@ fn install_tray_event_bridge(proxy: EventLoopProxy<UserEvent>) {
 
 fn spawn_config_watcher(config_path: PathBuf, proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
+        let mut last_fingerprint = read_config_fingerprint(&config_path);
         let mut last_snapshot = read_config_snapshot(&config_path);
 
         loop {
             std::thread::sleep(Duration::from_millis(500));
 
+            let fingerprint = read_config_fingerprint(&config_path);
+            if fingerprint == last_fingerprint {
+                continue;
+            }
+
             let snapshot = read_config_snapshot(&config_path);
             if snapshot == last_snapshot {
+                last_fingerprint = fingerprint;
                 continue;
             }
 
@@ -297,15 +426,62 @@ fn spawn_config_watcher(config_path: PathBuf, proxy: EventLoopProxy<UserEvent>) 
                 }
             }
 
+            last_fingerprint = fingerprint;
             last_snapshot = snapshot;
         }
     });
+}
+
+fn spawn_preview_context_watcher(proxy: EventLoopProxy<UserEvent>) {
+    std::thread::spawn(move || {
+        let mut last_key = None;
+
+        loop {
+            let snapshot = capture_frontmost_target_context();
+            let key = preview_context_key(&snapshot);
+            if last_key.as_ref() != Some(&key) {
+                let _ = proxy.send_event(UserEvent::PreviewContextUpdated(snapshot));
+                last_key = Some(key);
+            }
+
+            std::thread::sleep(PREVIEW_CONTEXT_POLL_INTERVAL);
+        }
+    });
+}
+
+fn preview_context_key(
+    snapshot: &TargetContextSnapshot,
+) -> (Option<String>, Option<String>, Option<String>) {
+    (
+        snapshot.bundle_id.clone(),
+        snapshot.app_name.clone(),
+        snapshot.window_title.clone(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigFingerprint {
+    Metadata {
+        modified_at: Option<SystemTime>,
+        len: u64,
+    },
+    ReadError(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ConfigSnapshot {
     Contents(String),
     ReadError(String),
+}
+
+fn read_config_fingerprint(path: &Path) -> ConfigFingerprint {
+    match fs::metadata(path) {
+        Ok(metadata) => ConfigFingerprint::Metadata {
+            modified_at: metadata.modified().ok(),
+            len: metadata.len(),
+        },
+        Err(error) => ConfigFingerprint::ReadError(error.to_string()),
+    }
 }
 
 fn read_config_snapshot(path: &Path) -> ConfigSnapshot {
@@ -326,10 +502,17 @@ fn build_tray_icon(icon: Icon) -> Result<tray_icon::TrayIcon> {
 fn update_tray_appearance(
     tray_icon: &tray_icon::TrayIcon,
     state: IndicatorState,
+    active_glyph: Option<char>,
+    preview_glyph: Option<char>,
     indicator_config: &IndicatorConfig,
 ) {
     let visible_state = visible_indicator_state(state, indicator_config);
-    if let Err(error) = tray_icon.set_icon(Some(indicator_icon(visible_state, indicator_config))) {
+    if let Err(error) = tray_icon.set_icon(Some(indicator_icon(
+        visible_state,
+        active_glyph,
+        preview_glyph,
+        indicator_config,
+    ))) {
         warn!(%error, "failed to update tray icon");
     }
     if let Err(error) = tray_icon.set_tooltip(Some(indicator_tooltip(state))) {
@@ -363,51 +546,91 @@ fn indicator_tooltip(state: IndicatorState) -> &'static str {
         IndicatorState::Transcribing => "Muninn transcribing audio",
         IndicatorState::Pipeline => "Muninn refining transcript",
         IndicatorState::Output => "Muninn outputting text",
+        IndicatorState::MissingCredentials => "Muninn missing provider credentials",
         IndicatorState::Cancelled => "Muninn cancelled",
     }
 }
 
-fn indicator_icon(state: IndicatorState, indicator_config: &IndicatorConfig) -> Icon {
+fn indicator_icon(
+    state: IndicatorState,
+    active_glyph: Option<char>,
+    preview_glyph: Option<char>,
+    indicator_config: &IndicatorConfig,
+) -> Icon {
+    let glyph = resolved_indicator_glyph(state, active_glyph, preview_glyph);
     let rgba = match state {
         IndicatorState::Idle => menu_bar_icon_rgba(
             parse_hex_rgb(&indicator_config.colors.idle),
             parse_hex_rgb(&indicator_config.colors.outline),
             parse_hex_rgb(&indicator_config.colors.glyph),
+            glyph,
         ),
         IndicatorState::Recording { .. } => menu_bar_icon_rgba(
             parse_hex_rgb(&indicator_config.colors.recording),
             parse_hex_rgb(&indicator_config.colors.outline),
             parse_hex_rgb(&indicator_config.colors.glyph),
+            glyph,
         ),
         IndicatorState::Transcribing => menu_bar_icon_rgba(
             parse_hex_rgb(&indicator_config.colors.transcribing),
             parse_hex_rgb(&indicator_config.colors.outline),
             parse_hex_rgb(&indicator_config.colors.glyph),
+            glyph,
         ),
         IndicatorState::Pipeline => menu_bar_icon_rgba(
             parse_hex_rgb(&indicator_config.colors.pipeline),
             parse_hex_rgb(&indicator_config.colors.outline),
             parse_hex_rgb(&indicator_config.colors.glyph),
+            glyph,
         ),
         IndicatorState::Output => menu_bar_icon_rgba(
             parse_hex_rgb(&indicator_config.colors.output),
             parse_hex_rgb(&indicator_config.colors.outline),
             parse_hex_rgb(&indicator_config.colors.glyph),
+            glyph,
+        ),
+        IndicatorState::MissingCredentials => menu_bar_icon_rgba(
+            parse_hex_rgb(&indicator_config.colors.cancelled),
+            parse_hex_rgb(&indicator_config.colors.outline),
+            parse_hex_rgb(&indicator_config.colors.glyph),
+            IndicatorGlyph::Question,
         ),
         IndicatorState::Cancelled => menu_bar_icon_rgba(
             parse_hex_rgb(&indicator_config.colors.cancelled),
             parse_hex_rgb(&indicator_config.colors.outline),
             parse_hex_rgb(&indicator_config.colors.glyph),
+            glyph,
         ),
     };
     Icon::from_rgba(rgba, INDICATOR_ICON_SIZE_PX, INDICATOR_ICON_SIZE_PX)
         .expect("building indicator icon")
 }
 
+fn resolved_indicator_glyph(
+    state: IndicatorState,
+    active_glyph: Option<char>,
+    preview_glyph: Option<char>,
+) -> IndicatorGlyph {
+    match state {
+        IndicatorState::MissingCredentials => IndicatorGlyph::Question,
+        IndicatorState::Idle => {
+            IndicatorGlyph::Letter(preview_glyph.unwrap_or(DEFAULT_INDICATOR_GLYPH))
+        }
+        IndicatorState::Recording { .. }
+        | IndicatorState::Transcribing
+        | IndicatorState::Pipeline
+        | IndicatorState::Output
+        | IndicatorState::Cancelled => {
+            IndicatorGlyph::Letter(active_glyph.unwrap_or(DEFAULT_INDICATOR_GLYPH))
+        }
+    }
+}
+
 fn menu_bar_icon_rgba(
     background_rgb: [u8; 3],
     outline_rgb: [u8; 3],
     glyph_rgb: [u8; 3],
+    glyph: IndicatorGlyph,
 ) -> Vec<u8> {
     let size = INDICATOR_ICON_SIZE_PX as usize;
     let mut rgba = vec![0_u8; size * size * 4];
@@ -432,7 +655,7 @@ fn menu_bar_icon_rgba(
                 write_rgba(&mut rgba, idx, background_rgb);
             }
 
-            if is_background_disc && pixel_m_glyph(x, y) {
+            if is_background_disc && pixel_indicator_glyph(glyph, x, y) {
                 write_rgba(&mut rgba, idx, glyph_rgb);
             }
         }
@@ -440,10 +663,24 @@ fn menu_bar_icon_rgba(
     rgba
 }
 
-fn pixel_m_glyph(x: u32, y: u32) -> bool {
-    const GLYPH: [&str; 8] = [
-        "1000001", "1100011", "1010101", "1001001", "1000001", "1000001", "1000001", "1000001",
-    ];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndicatorGlyph {
+    Letter(char),
+    Question,
+}
+
+fn pixel_indicator_glyph(glyph: IndicatorGlyph, x: u32, y: u32) -> bool {
+    match glyph {
+        IndicatorGlyph::Letter(letter) => pixel_letter_glyph(letter, x, y),
+        IndicatorGlyph::Question => pixel_question_glyph(x, y),
+    }
+}
+
+fn pixel_letter_glyph(letter: char, x: u32, y: u32) -> bool {
+    pixel_bitmap_glyph(letter_bitmap(letter), x, y)
+}
+
+fn pixel_bitmap_glyph(bitmap: &[&str; 8], x: u32, y: u32) -> bool {
     let scale = INDICATOR_ICON_SIZE_PX as f32 / 22.0;
     let glyph_x = (7.0 * scale).round();
     let glyph_y = (6.0 * scale).round();
@@ -453,11 +690,128 @@ fn pixel_m_glyph(x: u32, y: u32) -> bool {
         return false;
     }
 
-    let Some(row) = GLYPH.get(local_y as usize) else {
+    let Some(row) = bitmap.get(local_y as usize) else {
         return false;
     };
 
     matches!(row.as_bytes().get(local_x as usize), Some(b'1'))
+}
+
+fn pixel_question_glyph(x: u32, y: u32) -> bool {
+    const GLYPH: [&str; 8] = [
+        "0111110", "1000001", "0000010", "0001100", "0010000", "0000000", "0010000", "0000000",
+    ];
+    pixel_bitmap_glyph(&GLYPH, x, y)
+}
+
+fn letter_bitmap(letter: char) -> &'static [&'static str; 8] {
+    match letter.to_ascii_uppercase() {
+        'A' => &[
+            "0111110", "1000001", "1000001", "1111111", "1000001", "1000001", "1000001",
+            "0000000",
+        ],
+        'B' => &[
+            "1111110", "1000001", "1000001", "1111110", "1000001", "1000001", "1111110",
+            "0000000",
+        ],
+        'C' => &[
+            "0111111", "1000000", "1000000", "1000000", "1000000", "1000000", "0111111",
+            "0000000",
+        ],
+        'D' => &[
+            "1111110", "1000001", "1000001", "1000001", "1000001", "1000001", "1111110",
+            "0000000",
+        ],
+        'E' => &[
+            "1111111", "1000000", "1000000", "1111110", "1000000", "1000000", "1111111",
+            "0000000",
+        ],
+        'F' => &[
+            "1111111", "1000000", "1000000", "1111110", "1000000", "1000000", "1000000",
+            "0000000",
+        ],
+        'G' => &[
+            "0111110", "1000001", "1000000", "1001111", "1000001", "1000001", "0111110",
+            "0000000",
+        ],
+        'H' => &[
+            "1000001", "1000001", "1000001", "1111111", "1000001", "1000001", "1000001",
+            "0000000",
+        ],
+        'I' => &[
+            "0111110", "0001000", "0001000", "0001000", "0001000", "0001000", "0111110",
+            "0000000",
+        ],
+        'J' => &[
+            "0001111", "0000010", "0000010", "0000010", "0000010", "1000010", "0111100",
+            "0000000",
+        ],
+        'K' => &[
+            "1000001", "1000010", "1000100", "1111000", "1000100", "1000010", "1000001",
+            "0000000",
+        ],
+        'L' => &[
+            "1000000", "1000000", "1000000", "1000000", "1000000", "1000000", "1111111",
+            "0000000",
+        ],
+        'M' => &[
+            "1000001", "1100011", "1010101", "1001001", "1000001", "1000001", "1000001",
+            "1000001",
+        ],
+        'N' => &[
+            "1000001", "1100001", "1010001", "1001001", "1000101", "1000011", "1000001",
+            "0000000",
+        ],
+        'O' => &[
+            "0111110", "1000001", "1000001", "1000001", "1000001", "1000001", "0111110",
+            "0000000",
+        ],
+        'P' => &[
+            "1111110", "1000001", "1000001", "1111110", "1000000", "1000000", "1000000",
+            "0000000",
+        ],
+        'Q' => &[
+            "0111110", "1000001", "1000001", "1000001", "1001001", "1000101", "0111110",
+            "0000001",
+        ],
+        'R' => &[
+            "1111110", "1000001", "1000001", "1111110", "1000100", "1000010", "1000001",
+            "0000000",
+        ],
+        'S' => &[
+            "0111111", "1000000", "1000000", "0111110", "0000001", "0000001", "1111110",
+            "0000000",
+        ],
+        'T' => &[
+            "1111111", "0001000", "0001000", "0001000", "0001000", "0001000", "0001000",
+            "0000000",
+        ],
+        'U' => &[
+            "1000001", "1000001", "1000001", "1000001", "1000001", "1000001", "0111110",
+            "0000000",
+        ],
+        'V' => &[
+            "1000001", "1000001", "1000001", "1000001", "1000001", "0100010", "0011100",
+            "0000000",
+        ],
+        'W' => &[
+            "1000001", "1000001", "1000001", "1001001", "1001001", "1001001", "0110110",
+            "0000000",
+        ],
+        'X' => &[
+            "1000001", "0100010", "0010100", "0001000", "0010100", "0100010", "1000001",
+            "0000000",
+        ],
+        'Y' => &[
+            "1000001", "0100010", "0010100", "0001000", "0001000", "0001000", "0001000",
+            "0000000",
+        ],
+        'Z' => &[
+            "1111111", "0000010", "0000100", "0001000", "0010000", "0100000", "1111111",
+            "0000000",
+        ],
+        _ => letter_bitmap(DEFAULT_INDICATOR_GLYPH),
+    }
 }
 
 fn write_rgba(buffer: &mut [u8], idx: usize, color: [u8; 3]) {
@@ -511,6 +865,7 @@ fn spawn_runtime_worker(
 struct EventLoopIndicator {
     proxy: EventLoopProxy<UserEvent>,
     state: Arc<Mutex<IndicatorState>>,
+    glyph: Arc<Mutex<Option<char>>>,
     sequence: Arc<AtomicU64>,
 }
 
@@ -519,6 +874,7 @@ impl EventLoopIndicator {
         Self {
             proxy,
             state: Arc::new(Mutex::new(IndicatorState::Idle)),
+            glyph: Arc::new(Mutex::new(None)),
             sequence: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -531,11 +887,24 @@ impl IndicatorAdapter for EventLoopIndicator {
     }
 
     async fn set_state(&mut self, state: IndicatorState) -> muninn::MacosAdapterResult<()> {
+        self.set_state_with_glyph(state, None).await
+    }
+
+    async fn set_state_with_glyph(
+        &mut self,
+        state: IndicatorState,
+        glyph: Option<char>,
+    ) -> muninn::MacosAdapterResult<()> {
         self.sequence.fetch_add(1, Ordering::SeqCst);
         if let Ok(mut guard) = self.state.lock() {
             *guard = state;
         }
-        let _ = self.proxy.send_event(UserEvent::IndicatorUpdated(state));
+        if let Ok(mut guard) = self.glyph.lock() {
+            *guard = glyph;
+        }
+        let _ = self
+            .proxy
+            .send_event(UserEvent::IndicatorUpdated { state, glyph });
         Ok(())
     }
 
@@ -545,14 +914,32 @@ impl IndicatorAdapter for EventLoopIndicator {
         min_duration: Duration,
         fallback_state: IndicatorState,
     ) -> muninn::MacosAdapterResult<()> {
+        self.set_temporary_state_with_glyph(state, None, min_duration, fallback_state, None)
+            .await
+    }
+
+    async fn set_temporary_state_with_glyph(
+        &mut self,
+        state: IndicatorState,
+        glyph: Option<char>,
+        min_duration: Duration,
+        fallback_state: IndicatorState,
+        fallback_glyph: Option<char>,
+    ) -> muninn::MacosAdapterResult<()> {
         let generation = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         if let Ok(mut guard) = self.state.lock() {
             *guard = state;
         }
-        let _ = self.proxy.send_event(UserEvent::IndicatorUpdated(state));
+        if let Ok(mut guard) = self.glyph.lock() {
+            *guard = glyph;
+        }
+        let _ = self
+            .proxy
+            .send_event(UserEvent::IndicatorUpdated { state, glyph });
 
         let proxy = self.proxy.clone();
         let state = Arc::clone(&self.state);
+        let stored_glyph = Arc::clone(&self.glyph);
         let sequence = Arc::clone(&self.sequence);
         tokio::spawn(async move {
             tokio::time::sleep(min_duration).await;
@@ -570,7 +957,13 @@ impl IndicatorAdapter for EventLoopIndicator {
             if let Ok(mut guard) = state.lock() {
                 *guard = fallback_state;
             }
-            let _ = proxy.send_event(UserEvent::IndicatorUpdated(fallback_state));
+            if let Ok(mut guard) = stored_glyph.lock() {
+                *guard = fallback_glyph;
+            }
+            let _ = proxy.send_event(UserEvent::IndicatorUpdated {
+                state: fallback_state,
+                glyph: fallback_glyph,
+            });
         });
 
         Ok(())
@@ -579,6 +972,12 @@ impl IndicatorAdapter for EventLoopIndicator {
     async fn state(&self) -> muninn::MacosAdapterResult<IndicatorState> {
         self.state.lock().map(|guard| *guard).map_err(|_| {
             muninn::MacosAdapterError::operation_failed("indicator", "state mutex poisoned")
+        })
+    }
+
+    async fn indicator_glyph(&self) -> muninn::MacosAdapterResult<Option<char>> {
+        self.glyph.lock().map(|guard| *guard).map_err(|_| {
+            muninn::MacosAdapterError::operation_failed("indicator", "glyph mutex poisoned")
         })
     }
 }
@@ -593,10 +992,94 @@ where
 }
 
 struct ProcessingContext<'a> {
-    config: &'a AppConfig,
+    resolved: &'a ResolvedUtteranceConfig,
     pipeline: &'a PipelineConfig,
     runner: &'a PipelineRunner,
     injector: &'a MacosTextInjector,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveUtterance {
+    resolved: ResolvedUtteranceConfig,
+}
+
+#[derive(Debug, Clone)]
+struct InternalStepExecutor {
+    config: AppConfig,
+}
+
+impl InternalStepExecutor {
+    fn new(config: AppConfig) -> Self {
+        Self { config }
+    }
+}
+
+#[async_trait::async_trait]
+impl InProcessStepExecutor for InternalStepExecutor {
+    async fn try_execute(
+        &self,
+        step: &PipelineStepConfig,
+        input: &MuninnEnvelopeV1,
+    ) -> Option<Result<MuninnEnvelopeV1, InProcessStepError>> {
+        let tool = internal_tools::canonical_tool_name(&step.cmd)?;
+        let result = match tool {
+            "stt_openai" => stt_openai_tool::process_input_in_process(input, &self.config)
+                .await
+                .map_err(map_internal_tool_error),
+            "stt_google" => stt_google_tool::process_input_in_process(input, &self.config)
+                .await
+                .map_err(map_internal_tool_error),
+            "refine" => refine::process_input_in_process(input, &self.config)
+                .await
+                .map_err(map_internal_tool_error),
+            _ => return None,
+        };
+        Some(result)
+    }
+}
+
+fn map_internal_tool_error(error: impl InternalToolError) -> InProcessStepError {
+    InProcessStepError {
+        kind: muninn::StepFailureKind::NonZeroExit,
+        message: error.message().to_string(),
+        stderr: error.to_stderr_json(),
+        exit_status: Some(1),
+    }
+}
+
+trait InternalToolError {
+    fn message(&self) -> &str;
+    fn to_stderr_json(&self) -> String;
+}
+
+impl InternalToolError for stt_openai_tool::CliError {
+    fn message(&self) -> &str {
+        stt_openai_tool::CliError::message(self)
+    }
+
+    fn to_stderr_json(&self) -> String {
+        stt_openai_tool::CliError::to_stderr_json(self)
+    }
+}
+
+impl InternalToolError for stt_google_tool::CliError {
+    fn message(&self) -> &str {
+        stt_google_tool::CliError::message(self)
+    }
+
+    fn to_stderr_json(&self) -> String {
+        stt_google_tool::CliError::to_stderr_json(self)
+    }
+}
+
+impl InternalToolError for refine::CliError {
+    fn message(&self) -> &str {
+        refine::CliError::message(self)
+    }
+
+    fn to_stderr_json(&self) -> String {
+        refine::CliError::to_stderr_json(self)
+    }
 }
 
 impl<I> RuntimeWorker<I>
@@ -617,10 +1100,11 @@ where
     ) -> Result<()> {
         let mut hotkeys = MacosHotkeyEventSource::from_config(&self.config.hotkeys)
             .context("initializing hotkeys")?;
-        let mut recorder = MacosAudioRecorder::new();
+        let mut recorder = MacosAudioRecorder::new(self.config.recording.clone());
         let injector = MacosTextInjector::new();
         let mut pipeline = resolve_pipeline_config(&self.config)?;
-        let mut runner = PipelineRunner::new(self.config.app.strict_step_contract);
+        let mut runner = build_pipeline_runner(&self.config);
+        let mut active_utterance: Option<ActiveUtterance> = None;
         let mut state = AppState::Idle;
 
         self.indicator
@@ -671,6 +1155,7 @@ where
                                 &mut runner,
                                 *new_config,
                             )?;
+                            recorder.set_recording_config(self.config.recording.clone());
                             continue;
                         }
                         None => return Err(anyhow!("runtime event channel closed")),
@@ -679,6 +1164,9 @@ where
             };
 
             let next = state.on_event(app_event);
+            if next != state {
+                debug!(from = ?state, event = ?app_event, to = ?next, "runtime state transition");
+            }
             if next == state {
                 continue;
             }
@@ -689,10 +1177,24 @@ where
                         .await
                         .context("refreshing permissions before push-to-talk recording")?;
                     ensure_recording_can_start(self.preflight)?;
+                    let resolved = self
+                        .config
+                        .resolve_effective_config(capture_frontmost_target_context());
+                    if let Some(reason) = resolved.fallback_reason.as_deref() {
+                        info!(
+                            profile = %resolved.profile_id,
+                            reason,
+                            "using default contextual profile"
+                        );
+                    }
+                    recorder.set_recording_config(resolved.effective_config.recording.clone());
                     self.indicator
-                        .set_state(IndicatorState::Recording {
-                            mode: RecordingMode::PushToTalk,
-                        })
+                        .set_state_with_glyph(
+                            IndicatorState::Recording {
+                                mode: RecordingMode::PushToTalk,
+                            },
+                            resolved.voice_glyph,
+                        )
                         .await
                         .context("setting push-to-talk recording indicator")?;
                     let started = std::time::Instant::now();
@@ -700,6 +1202,7 @@ where
                         let _ = self.indicator.set_state(IndicatorState::Idle).await;
                         return Err(error).context("starting push-to-talk recording");
                     }
+                    active_utterance = Some(ActiveUtterance { resolved });
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
                         "push-to-talk recording started"
@@ -711,10 +1214,24 @@ where
                         .await
                         .context("refreshing permissions before done-mode recording")?;
                     ensure_recording_can_start(self.preflight)?;
+                    let resolved = self
+                        .config
+                        .resolve_effective_config(capture_frontmost_target_context());
+                    if let Some(reason) = resolved.fallback_reason.as_deref() {
+                        info!(
+                            profile = %resolved.profile_id,
+                            reason,
+                            "using default contextual profile"
+                        );
+                    }
+                    recorder.set_recording_config(resolved.effective_config.recording.clone());
                     self.indicator
-                        .set_state(IndicatorState::Recording {
-                            mode: RecordingMode::DoneMode,
-                        })
+                        .set_state_with_glyph(
+                            IndicatorState::Recording {
+                                mode: RecordingMode::DoneMode,
+                            },
+                            resolved.voice_glyph,
+                        )
                         .await
                         .context("setting done-mode recording indicator")?;
                     let started = std::time::Instant::now();
@@ -722,6 +1239,7 @@ where
                         let _ = self.indicator.set_state(IndicatorState::Idle).await;
                         return Err(error).context("starting done-mode recording");
                     }
+                    active_utterance = Some(ActiveUtterance { resolved });
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
                         "done-mode recording started"
@@ -733,18 +1251,24 @@ where
                     AppEvent::CancelPressed,
                     AppState::Idle,
                 ) => {
+                    let glyph = active_utterance
+                        .as_ref()
+                        .and_then(|utterance| utterance.resolved.voice_glyph);
                     recorder
                         .cancel_recording()
                         .await
                         .context("canceling recording")?;
                     self.indicator
-                        .set_temporary_state(
+                        .set_temporary_state_with_glyph(
                             IndicatorState::Cancelled,
+                            glyph,
                             OUTPUT_INDICATOR_MIN_DURATION,
                             IndicatorState::Idle,
+                            None,
                         )
                         .await
                         .context("setting cancelled indicator after cancel")?;
+                    active_utterance = None;
                     state = next;
                 }
                 (
@@ -752,8 +1276,20 @@ where
                     AppEvent::PttReleased | AppEvent::DoneTogglePressed,
                     AppState::Processing,
                 ) => {
+                    let resolved = active_utterance
+                        .take()
+                        .map(|utterance| utterance.resolved)
+                        .unwrap_or_else(|| {
+                            self.config
+                                .resolve_effective_config(capture_frontmost_target_context())
+                        });
+                    let effective_pipeline = resolve_pipeline_config(&resolved.effective_config)?;
+                    let effective_runner = build_pipeline_runner(&resolved.effective_config);
                     self.indicator
-                        .set_state(initial_processing_indicator(&pipeline))
+                        .set_state_with_glyph(
+                            initial_processing_indicator(&effective_pipeline),
+                            resolved.voice_glyph,
+                        )
                         .await
                         .context("setting initial processing indicator")?;
                     let stopped = std::time::Instant::now();
@@ -772,9 +1308,9 @@ where
 
                     if let Err(error) = process_and_inject(
                         ProcessingContext {
-                            config: &self.config,
-                            pipeline: &pipeline,
-                            runner: &runner,
+                            resolved: &resolved,
+                            pipeline: &effective_pipeline,
+                            runner: &effective_runner,
                             injector: &injector,
                         },
                         &mut self.indicator,
@@ -813,38 +1349,50 @@ where
     I: IndicatorAdapter,
 {
     let result = async {
-        let envelope = build_envelope(context.config, recorded);
-        let outcome = run_pipeline_with_indicator_stages(
+        let envelope = build_envelope(&context.resolved.effective_config, recorded);
+        let mut outcome = run_pipeline_with_indicator_stages(
             context.pipeline,
             context.runner,
             indicator,
+            context.resolved.voice_glyph,
             envelope.clone(),
         )
         .await?;
+        let _ = muninn::scoring::apply_scored_replacements_to_outcome(
+            &mut outcome,
+            &context.resolved.effective_config.scoring,
+        );
         let route = Orchestrator::route_injection(&outcome);
         log_pipeline_outcome_diagnostics(&outcome);
+        let replay_config = context
+            .resolved
+            .effective_config
+            .logging
+            .replay_enabled
+            .then(|| context.resolved.clone());
+        let replay_recorded = recorded.clone();
+        let injection_text = route.target.text().map(ToOwned::to_owned);
+        let route_reason = route.reason.clone();
+        let route_pipeline_stop_reason = route.pipeline_stop_reason.clone();
+        let missing_credentials_feedback = should_show_missing_credentials_feedback(&outcome);
 
-        spawn_replay_persist(
-            context.config.clone(),
-            envelope.clone(),
-            outcome.clone(),
-            route.clone(),
-            recorded.clone(),
-        );
+        spawn_replay_persist(replay_config, envelope, outcome, route, replay_recorded);
 
         *state = state.on_event(AppEvent::ProcessingFinished);
 
-        if let Some(text) = route.target.text() {
+        if let Some(text) = injection_text.as_deref() {
             ensure_injection_allowed(
                 refresh_permissions_status()
                     .await
                     .context("refreshing permissions before injection")?,
             )?;
             indicator
-                .set_temporary_state(
+                .set_temporary_state_with_glyph(
                     IndicatorState::Output,
+                    context.resolved.voice_glyph,
                     OUTPUT_INDICATOR_MIN_DURATION,
                     IndicatorState::Idle,
+                    None,
                 )
                 .await
                 .context("setting output indicator")?;
@@ -854,15 +1402,31 @@ where
                 .await
                 .context("injecting final text")?;
             info!(
-                route_reason = ?route.reason,
-                pipeline_stop_reason = ?route.pipeline_stop_reason,
+                profile = %context.resolved.profile_id,
+                voice = ?context.resolved.voice_id,
+                route_reason = ?route_reason,
+                pipeline_stop_reason = ?route_pipeline_stop_reason,
                 injected_len = text.len(),
                 "injected dictation text"
             );
         } else {
+            if missing_credentials_feedback {
+                indicator
+                    .set_temporary_state_with_glyph(
+                        IndicatorState::MissingCredentials,
+                        context.resolved.voice_glyph,
+                        MISSING_CREDENTIALS_INDICATOR_DURATION,
+                        IndicatorState::Idle,
+                        None,
+                    )
+                    .await
+                    .context("setting missing credentials indicator")?;
+            }
             warn!(
-                route_reason = ?route.reason,
-                pipeline_stop_reason = ?route.pipeline_stop_reason,
+                profile = %context.resolved.profile_id,
+                voice = ?context.resolved.voice_id,
+                route_reason = ?route_reason,
+                pipeline_stop_reason = ?route_pipeline_stop_reason,
                 "pipeline completed without injectable text"
             );
         }
@@ -894,6 +1458,7 @@ async fn run_pipeline_with_indicator_stages<I>(
     pipeline: &PipelineConfig,
     runner: &PipelineRunner,
     indicator: &mut I,
+    active_glyph: Option<char>,
     envelope: MuninnEnvelopeV1,
 ) -> Result<PipelineOutcome>
 where
@@ -903,7 +1468,7 @@ where
         split_pipeline_for_indicator(pipeline)
     else {
         indicator
-            .set_state(IndicatorState::Pipeline)
+            .set_state_with_glyph(IndicatorState::Pipeline, active_glyph)
             .await
             .context("setting pipeline indicator")?;
         return Ok(runner.run(envelope, pipeline).await);
@@ -911,7 +1476,7 @@ where
 
     let pipeline_started = Instant::now();
     indicator
-        .set_state(IndicatorState::Transcribing)
+        .set_state_with_glyph(IndicatorState::Transcribing, active_glyph)
         .await
         .context("setting transcribing indicator")?;
     let transcription_outcome = runner.run(envelope, &transcription_pipeline).await;
@@ -940,7 +1505,7 @@ where
 
             remaining_pipeline.deadline_ms = remaining_deadline_ms;
             indicator
-                .set_state(IndicatorState::Pipeline)
+                .set_state_with_glyph(IndicatorState::Pipeline, active_glyph)
                 .await
                 .context("setting pipeline indicator")?;
             let pipeline_outcome = runner.run(envelope, &remaining_pipeline).await;
@@ -1048,6 +1613,16 @@ fn log_pipeline_outcome_diagnostics(outcome: &PipelineOutcome) {
         | PipelineOutcome::Aborted { trace, .. } => trace,
     };
 
+    for entry in trace {
+        if entry.policy_applied == muninn::PipelinePolicyApplied::ContractBypass {
+            warn!(
+                step_id = %entry.id,
+                exit_status = ?entry.exit_status,
+                "pipeline step bypassed envelope contract in non-strict mode"
+            );
+        }
+    }
+
     let Some(last_step) = trace.last() else {
         return;
     };
@@ -1083,6 +1658,62 @@ fn resolve_pipeline_config(config: &AppConfig) -> Result<PipelineConfig> {
     Ok(pipeline)
 }
 
+fn build_pipeline_runner(config: &AppConfig) -> PipelineRunner {
+    PipelineRunner::with_in_process_step_executor(
+        config.app.strict_step_contract,
+        Arc::new(InternalStepExecutor::new(config.clone())),
+    )
+}
+
+fn should_show_missing_credentials_feedback(outcome: &PipelineOutcome) -> bool {
+    outcome_contains_missing_credential_error(outcome)
+        || outcome_trace_contains_missing_credential_error(outcome)
+}
+
+fn outcome_contains_missing_credential_error(outcome: &PipelineOutcome) -> bool {
+    let errors = match outcome {
+        PipelineOutcome::Completed { envelope, .. }
+        | PipelineOutcome::FallbackRaw { envelope, .. } => &envelope.errors,
+        PipelineOutcome::Aborted { .. } => return false,
+    };
+
+    errors.iter().any(value_contains_missing_credential_error)
+}
+
+fn outcome_trace_contains_missing_credential_error(outcome: &PipelineOutcome) -> bool {
+    let trace = match outcome {
+        PipelineOutcome::Completed { trace, .. }
+        | PipelineOutcome::FallbackRaw { trace, .. }
+        | PipelineOutcome::Aborted { trace, .. } => trace,
+    };
+
+    trace
+        .iter()
+        .any(|entry| stderr_contains_missing_credential_error(&entry.stderr))
+}
+
+fn stderr_contains_missing_credential_error(stderr: &str) -> bool {
+    serde_json::from_str::<Value>(stderr)
+        .ok()
+        .as_ref()
+        .is_some_and(value_contains_missing_credential_error)
+}
+
+fn value_contains_missing_credential_error(value: &Value) -> bool {
+    value
+        .pointer("/error/code")
+        .or_else(|| value.get("code"))
+        .and_then(Value::as_str)
+        .is_some_and(is_missing_credential_error_code)
+}
+
+fn is_missing_credential_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        "missing_openai_api_key" | "missing_google_credentials"
+    )
+}
+
 fn apply_live_config_reload(
     current_config: &mut AppConfig,
     pipeline: &mut PipelineConfig,
@@ -1096,7 +1727,7 @@ fn apply_live_config_reload(
     }
 
     *pipeline = resolve_pipeline_config(&new_config)?;
-    *runner = PipelineRunner::new(new_config.app.strict_step_contract);
+    *runner = build_pipeline_runner(&new_config);
     *current_config = new_config;
     info!(
         old_profile = %old_profile,
@@ -1106,6 +1737,36 @@ fn apply_live_config_reload(
     );
 
     Ok(())
+}
+
+fn sync_os_autostart(config_path: &Path, config: &AppConfig) {
+    match autostart::sync_autostart(config_path, config) {
+        Ok(autostart::AutostartSyncStatus::Enabled {
+            plist_path,
+            launch_path,
+            changed,
+        }) => {
+            info!(
+                plist_path = %plist_path.display(),
+                launch_path = %launch_path.display(),
+                changed,
+                "synced macOS autostart launch agent"
+            );
+        }
+        Ok(autostart::AutostartSyncStatus::Disabled {
+            plist_path,
+            removed,
+        }) => {
+            info!(
+                plist_path = %plist_path.display(),
+                removed,
+                "disabled macOS autostart launch agent"
+            );
+        }
+        Err(error) => {
+            warn!(error = %error, "failed to sync macOS autostart");
+        }
+    }
 }
 
 fn resolve_step_command(cmd: &str) -> Result<String> {
@@ -1132,13 +1793,44 @@ fn cleanup_recording_file(path: &Path) {
 }
 
 fn maybe_load_dotenv() {
-    if std::env::var("MUNINN_LOAD_DOTENV")
-        .ok()
-        .as_deref()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"))
-    {
-        let _ = dotenvy::dotenv();
+    if !should_load_dotenv(std::env::var("MUNINN_LOAD_DOTENV").ok().as_deref()) {
+        return;
     }
+
+    let dotenv_path = match std::env::current_dir() {
+        Ok(current_dir) => dotenv_path_for_dir(&current_dir),
+        Err(error) => {
+            warn!(%error, "failed to resolve current working directory for .env loading");
+            return;
+        }
+    };
+
+    if !dotenv_path.is_file() {
+        debug!(path = %dotenv_path.display(), "no .env file found in current working directory");
+        return;
+    }
+
+    match dotenvy::from_path(&dotenv_path) {
+        Ok(_) => {
+            debug!(path = %dotenv_path.display(), "loaded .env from current working directory");
+        }
+        Err(error) => {
+            warn!(path = %dotenv_path.display(), %error, "failed to load .env file");
+        }
+    }
+}
+
+fn should_load_dotenv(flag: Option<&str>) -> bool {
+    !flag.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no"
+        )
+    })
+}
+
+fn dotenv_path_for_dir(dir: &Path) -> PathBuf {
+    dir.join(".env")
 }
 
 fn flush_pending_config_reload(
@@ -1217,14 +1909,17 @@ fn drain_busy_input_backlog(
 }
 
 fn spawn_replay_persist(
-    config: AppConfig,
+    resolved: Option<ResolvedUtteranceConfig>,
     envelope: MuninnEnvelopeV1,
     outcome: PipelineOutcome,
     route: muninn::InjectionRoute,
     recorded: muninn::RecordedAudio,
 ) {
+    let Some(resolved) = resolved else {
+        return;
+    };
     drop(tokio::task::spawn_blocking(
-        move || match replay::persist_replay(&config, &envelope, &outcome, &route, &recorded) {
+        move || match replay::persist_replay(resolved, envelope, outcome, route, recorded) {
             Ok(Some(path)) => {
                 info!(replay_dir = %path.display(), "persisted replay artifact");
             }
@@ -1332,10 +2027,21 @@ fn map_tray_event(event: &TrayIconEvent) -> Option<AppEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_live_config_reload, map_tray_event, resolve_pipeline_config};
+    use super::{
+        apply_live_config_reload, build_pipeline_runner, dotenv_path_for_dir, map_tray_event,
+        preview_context_key, read_config_fingerprint, resolve_pipeline_config,
+        resolved_indicator_glyph, should_load_dotenv, should_show_missing_credentials_feedback,
+        ConfigFingerprint, IndicatorGlyph, DEFAULT_INDICATOR_GLYPH,
+    };
     use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
-    use muninn::AppEvent;
-    use muninn::PipelineRunner;
+    use muninn::{
+        AppEvent, IndicatorState, MuninnEnvelopeV1, PipelineOutcome, PipelinePolicyApplied,
+        PipelineStopReason, PipelineTraceEntry, StepFailureKind,
+    };
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tray_icon::{
         dpi::{PhysicalPosition, PhysicalSize},
         MouseButton, MouseButtonState, Rect, TrayIconEvent, TrayIconId,
@@ -1352,6 +2058,61 @@ mod tests {
             button: MouseButton::Left,
             button_state,
         }
+    }
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let unique_suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before UNIX_EPOCH")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique_suffix}", std::process::id()))
+    }
+
+    fn baseline_envelope() -> MuninnEnvelopeV1 {
+        MuninnEnvelopeV1::new("utt-123", "2026-03-06T10:00:00Z")
+    }
+
+    #[test]
+    fn idle_indicator_prefers_preview_glyph_and_busy_states_use_active_glyph() {
+        assert_eq!(
+            resolved_indicator_glyph(IndicatorState::Idle, Some('T'), Some('C')),
+            IndicatorGlyph::Letter('C')
+        );
+        assert_eq!(
+            resolved_indicator_glyph(IndicatorState::Pipeline, Some('T'), Some('C')),
+            IndicatorGlyph::Letter('T')
+        );
+        assert_eq!(
+            resolved_indicator_glyph(IndicatorState::Cancelled, None, Some('C')),
+            IndicatorGlyph::Letter(DEFAULT_INDICATOR_GLYPH)
+        );
+    }
+
+    #[test]
+    fn missing_credentials_indicator_always_uses_question_glyph() {
+        assert_eq!(
+            resolved_indicator_glyph(IndicatorState::MissingCredentials, Some('T'), Some('C')),
+            IndicatorGlyph::Question
+        );
+    }
+
+    #[test]
+    fn preview_context_key_ignores_capture_timestamp_noise() {
+        let snapshot = muninn::TargetContextSnapshot {
+            bundle_id: Some("com.openai.codex".to_string()),
+            app_name: Some("Codex".to_string()),
+            window_title: Some("muninn".to_string()),
+            captured_at: "2026-03-06T10:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            preview_context_key(&snapshot),
+            (
+                Some("com.openai.codex".to_string()),
+                Some("Codex".to_string()),
+                Some("muninn".to_string())
+            )
+        );
     }
 
     #[test]
@@ -1385,7 +2146,7 @@ mod tests {
 
         let mut pipeline =
             resolve_pipeline_config(&current).expect("initial pipeline should resolve");
-        let mut runner = PipelineRunner::new(current.app.strict_step_contract);
+        let mut runner = build_pipeline_runner(&current);
 
         let mut reloaded = current.clone();
         reloaded.hotkeys.push_to_talk.chord = vec!["cmd".to_string()];
@@ -1404,5 +2165,142 @@ mod tests {
         assert_eq!(current.hotkeys, original_hotkeys);
         assert_eq!(current.pipeline.steps[0].id, "uppercase");
         assert_eq!(pipeline.steps[0].cmd, "/bin/cat");
+    }
+
+    #[test]
+    fn config_fingerprint_changes_when_file_metadata_changes() {
+        let path = unique_temp_path("muninn-config-fingerprint");
+        fs::write(&path, "alpha").expect("write initial config file");
+        let initial = read_config_fingerprint(&path);
+        fs::write(&path, "beta-updated").expect("rewrite config file");
+        let updated = read_config_fingerprint(&path);
+        fs::remove_file(&path).expect("remove temp config file");
+
+        assert_ne!(initial, updated);
+    }
+
+    #[test]
+    fn config_fingerprint_surfaces_read_errors() {
+        let path = unique_temp_path("muninn-config-fingerprint-missing");
+
+        let fingerprint = read_config_fingerprint(&path);
+
+        assert!(matches!(fingerprint, ConfigFingerprint::ReadError(_)));
+    }
+
+    #[test]
+    fn dotenv_loading_is_enabled_by_default() {
+        assert!(should_load_dotenv(None));
+        assert!(should_load_dotenv(Some("1")));
+        assert!(should_load_dotenv(Some("true")));
+    }
+
+    #[test]
+    fn dotenv_loading_can_be_explicitly_disabled() {
+        assert!(!should_load_dotenv(Some("0")));
+        assert!(!should_load_dotenv(Some("false")));
+        assert!(!should_load_dotenv(Some("no")));
+    }
+
+    #[test]
+    fn dotenv_path_uses_current_working_directory_only() {
+        let dir = PathBuf::from("/tmp/muninn-start-dir");
+
+        let path = dotenv_path_for_dir(&dir);
+
+        assert_eq!(path, PathBuf::from("/tmp/muninn-start-dir/.env"));
+    }
+
+    #[test]
+    fn missing_credentials_feedback_triggers_for_completed_envelope_errors() {
+        let outcome = PipelineOutcome::Completed {
+            envelope: baseline_envelope().push_error(json!({
+                "code": "missing_openai_api_key",
+                "message": "missing OpenAI API key"
+            })),
+            trace: Vec::new(),
+        };
+
+        assert!(should_show_missing_credentials_feedback(&outcome));
+    }
+
+    #[test]
+    fn missing_credentials_feedback_triggers_for_trace_stderr_json() {
+        let outcome = PipelineOutcome::Aborted {
+            trace: vec![PipelineTraceEntry {
+                id: "stt-google".to_string(),
+                duration_ms: 42,
+                timed_out: false,
+                exit_status: Some(1),
+                policy_applied: PipelinePolicyApplied::Abort,
+                stderr: json!({
+                    "error": {
+                        "code": "missing_google_credentials",
+                        "message": "missing Google credentials"
+                    }
+                })
+                .to_string(),
+            }],
+            reason: PipelineStopReason::StepFailed {
+                step_id: "stt-google".to_string(),
+                failure: StepFailureKind::NonZeroExit,
+                message: "step exited non-zero with status 1".to_string(),
+            },
+        };
+
+        assert!(should_show_missing_credentials_feedback(&outcome));
+    }
+
+    #[test]
+    fn missing_credentials_feedback_ignores_unrelated_errors() {
+        let outcome = PipelineOutcome::FallbackRaw {
+            envelope: baseline_envelope().push_error(json!({
+                "code": "provider_warning",
+                "message": "something else happened"
+            })),
+            trace: vec![PipelineTraceEntry {
+                id: "refine".to_string(),
+                duration_ms: 12,
+                timed_out: false,
+                exit_status: Some(0),
+                policy_applied: PipelinePolicyApplied::Continue,
+                stderr: "{}".to_string(),
+            }],
+            reason: PipelineStopReason::StepFailed {
+                step_id: "refine".to_string(),
+                failure: StepFailureKind::InvalidStdout,
+                message: "not a credentials issue".to_string(),
+            },
+        };
+
+        assert!(!should_show_missing_credentials_feedback(&outcome));
+    }
+
+    #[test]
+    fn idle_indicator_prefers_preview_voice_glyph() {
+        assert_eq!(
+            resolved_indicator_glyph(IndicatorState::Idle, Some('C'), Some('T')),
+            IndicatorGlyph::Letter('T')
+        );
+    }
+
+    #[test]
+    fn active_indicator_prefers_frozen_utterance_glyph() {
+        assert_eq!(
+            resolved_indicator_glyph(IndicatorState::Pipeline, Some('C'), Some('T')),
+            IndicatorGlyph::Letter('C')
+        );
+    }
+
+    #[test]
+    fn missing_credentials_indicator_always_uses_reserved_question_glyph() {
+        assert_eq!(
+            resolved_indicator_glyph(
+                IndicatorState::MissingCredentials,
+                Some('C'),
+                Some('T')
+            ),
+            IndicatorGlyph::Question
+        );
     }
 }

@@ -61,6 +61,13 @@ mod tests {
     }
 
     #[test]
+    fn env_value_is_used_when_config_is_missing() {
+        let resolved = resolve_secret(Some("env-secret-token".to_string()), None);
+
+        assert_eq!(resolved.as_deref(), Some("env-secret-token"));
+    }
+
+    #[test]
     fn empty_env_value_falls_back_to_config_value() {
         let resolved = resolve_secret(
             Some("   ".to_string()),

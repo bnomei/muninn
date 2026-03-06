@@ -19,11 +19,14 @@ pub mod runner;
 pub mod scoring;
 pub mod secrets;
 pub mod state;
+pub mod target_context;
 
 pub use audio::MacosAudioRecorder;
 pub use config::{
     resolve_config_path, AppConfig, ConfigError, ConfigValidationError, OnErrorPolicy,
-    PayloadFormat, TriggerType,
+    PayloadFormat, ProfileConfig, ProfileRuleConfig, RecordingConfig, RefineOverrides,
+    ResolvedProfileSelection, ResolvedUtteranceConfig, TranscriptOverrides, TriggerType,
+    VoiceConfig,
 };
 pub use envelope::MuninnEnvelopeV1;
 pub use error::{MacosAdapterError, MacosAdapterResult, PermissionKind};
@@ -37,14 +40,15 @@ pub use orchestrator::{InjectionRoute, InjectionRouteReason, InjectionTarget, Or
 pub use permissions::MacosPermissionsAdapter;
 pub use platform::{detect_platform, ensure_supported_platform, is_supported_platform, Platform};
 pub use runner::{
-    PipelineOutcome, PipelinePolicyApplied, PipelineRunner, PipelineStopReason, PipelineTraceEntry,
-    StepFailureKind,
+    InProcessStepError, InProcessStepExecutor, PipelineOutcome, PipelinePolicyApplied,
+    PipelineRunner, PipelineStopReason, PipelineTraceEntry, StepFailureKind,
 };
 pub use scoring::{
     DecisionReason, ReplacementDecision, ReplacementDecisionInput, SpanMetadata, Thresholds,
 };
 pub use secrets::{resolve_secret, resolve_secret_from_env};
 pub use state::{AppEvent, AppState};
+pub use target_context::{capture_frontmost_target_context, TargetContextSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {
@@ -59,6 +63,7 @@ pub enum IndicatorState {
     Transcribing,
     Pipeline,
     Output,
+    MissingCredentials,
     Cancelled,
 }
 
@@ -232,6 +237,14 @@ impl RecordedAudio {
 pub trait IndicatorAdapter: Send + Sync {
     async fn initialize(&mut self) -> MacosAdapterResult<()>;
     async fn set_state(&mut self, state: IndicatorState) -> MacosAdapterResult<()>;
+    async fn set_state_with_glyph(
+        &mut self,
+        state: IndicatorState,
+        glyph: Option<char>,
+    ) -> MacosAdapterResult<()> {
+        let _ = glyph;
+        self.set_state(state).await
+    }
     async fn set_temporary_state(
         &mut self,
         state: IndicatorState,
@@ -242,7 +255,22 @@ pub trait IndicatorAdapter: Send + Sync {
         let _ = fallback_state;
         self.set_state(state).await
     }
+    async fn set_temporary_state_with_glyph(
+        &mut self,
+        state: IndicatorState,
+        glyph: Option<char>,
+        min_duration: Duration,
+        fallback_state: IndicatorState,
+        fallback_glyph: Option<char>,
+    ) -> MacosAdapterResult<()> {
+        let _ = glyph;
+        let _ = fallback_glyph;
+        self.set_temporary_state(state, min_duration, fallback_state).await
+    }
     async fn state(&self) -> MacosAdapterResult<IndicatorState>;
+    async fn indicator_glyph(&self) -> MacosAdapterResult<Option<char>> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -291,6 +319,7 @@ mod tests {
         assert!(IndicatorState::Transcribing.is_processing());
         assert!(IndicatorState::Pipeline.is_processing());
         assert!(!IndicatorState::Output.is_processing());
+        assert!(!IndicatorState::MissingCredentials.is_processing());
         assert!(!IndicatorState::Cancelled.is_processing());
     }
 

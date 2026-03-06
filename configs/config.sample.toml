@@ -4,6 +4,7 @@
 [app]
 profile = "default"
 strict_step_contract = true
+autostart = false
 
 [hotkeys.push_to_talk]
 trigger = "double_tap"
@@ -32,6 +33,10 @@ cancelled = "#FF453A"
 outline = "#2C2C2E"
 glyph = "#FFFFFF"
 
+[recording]
+mono = true
+sample_rate_khz = 16
+
 [pipeline]
 deadline_ms = 40000
 payload_format = "json_object"
@@ -50,7 +55,7 @@ cmd = "stt_google"
 timeout_ms = 18000
 on_error = "abort"
 
-# Built-in minimal refine step (active)
+# Built-in refine step (active)
 [[pipeline.steps]]
 id = "refine"
 cmd = "refine"
@@ -81,6 +86,8 @@ acronym_min_top_score = 0.90
 acronym_min_margin = 0.15
 
 [transcript]
+# Give refine a light voice/style hint.
+# Keep it conservative, or tune it to your own editorial style.
 system_prompt = "Prefer minimal corrections. Focus on technical terms, developer tools, package names, commands, flags, file names, paths, env vars, acronyms, and obvious dictation errors. If uncertain, keep the original wording."
 
 [refine]
@@ -93,8 +100,59 @@ max_length_delta_ratio = 0.25
 max_token_change_ratio = 0.60
 max_new_word_count = 2
 
+# Optional contextual voices and profiles.
+# Voice means refine behavior plus an optional one-letter tray glyph, not audio voice.
+# Rules are matched top to bottom. Put the most specific rules first.
+# Muninn starts from the base config, applies the matched voice, then applies the matched
+# profile last so profile-specific overrides win.
+#
+# [voices.codex]
+# indicator_glyph = "C"
+# system_prompt = "Prefer terse developer dictation. Keep code tokens, commands, file names, flags, and package names intact."
+#
+# [voices.terminal]
+# indicator_glyph = "T"
+# system_prompt = "Preserve shell commands exactly. Prefer minimal punctuation changes."
+#
+# [voices.mail]
+# indicator_glyph = "E"
+# system_prompt = "Prefer polished email prose while preserving names, dates, and quoted text."
+#
+# [profiles.codex]
+# voice = "codex"
+#
+# [profiles.terminal]
+# voice = "terminal"
+#
+# [profiles.mail]
+# voice = "mail"
+#
+# [[profile_rules]]
+# id = "codex-app"
+# profile = "codex"
+# app_name = "Codex"
+#
+# [[profile_rules]]
+# id = "terminal-app"
+# profile = "terminal"
+# bundle_id = "com.apple.Terminal"
+#
+# [[profile_rules]]
+# id = "alacritty-app"
+# profile = "terminal"
+# bundle_id = "org.alacritty"
+#
+# [[profile_rules]]
+# id = "mail-app"
+# profile = "mail"
+# bundle_id_prefix = "com.apple.mail"
+#
+# If no rule matches, Muninn falls back to app.profile. If that profile has no voice,
+# the idle tray glyph stays at the default M.
+
 [logging]
 replay_enabled = false
+replay_retain_audio = true
 replay_dir = "~/.local/state/muninn/replay"
 replay_retention_days = 7
 replay_max_bytes = 52_428_800

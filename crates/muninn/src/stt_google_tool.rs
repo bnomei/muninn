@@ -1,19 +1,22 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use base64::Engine;
 use muninn::resolve_secret;
 use muninn::AppConfig;
 use muninn::MuninnEnvelopeV1;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Url;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::fs;
+use std::io::ErrorKind;
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 const DEFAULT_LANGUAGE_CODE: &str = "en-US";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CliError {
+pub(crate) struct CliError {
     code: &'static str,
     message: String,
 }
@@ -26,7 +29,7 @@ impl CliError {
         }
     }
 
-    fn to_stderr_json(&self) -> String {
+    pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
                 "code": self.code,
@@ -34,6 +37,10 @@ impl CliError {
             }
         })
         .to_string()
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -77,6 +84,18 @@ struct WavMetadata {
     channels: u16,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleRecognitionConfig<'a> {
+    encoding: &'static str,
+    sample_rate_hertz: u32,
+    language_code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_channel_count: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+}
+
 pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -99,64 +118,52 @@ fn run() -> Result<(), CliError> {
         })?;
 
     runtime.block_on(async {
-        let mut input = String::new();
-        io::stdin().read_to_string(&mut input).map_err(|source| {
-            CliError::new(
-                "stdin_read_failed",
-                format!("failed to read stdin: {source}"),
-            )
-        })?;
+        let envelope = read_envelope_from_reader(io::stdin().lock())?;
 
         let config = load_google_config_from_config();
         let env_lookup = |key: &str| std::env::var(key).ok();
-        let output = process_input(&input, &env_lookup, &config).await?;
+        let output = process_input(envelope, &env_lookup, &config).await?;
 
-        io::stdout()
-            .write_all(output.as_bytes())
-            .map_err(|source| {
-                CliError::new(
-                    "stdout_write_failed",
-                    format!("failed to write stdout: {source}"),
-                )
-            })?;
+        write_envelope_to_writer(io::stdout().lock(), &output)?;
 
         Ok(())
     })
 }
 
 async fn process_input<F>(
-    input: &str,
+    input: MuninnEnvelopeV1,
     get_env: &F,
     config: &GoogleResolvedConfig,
-) -> Result<String, CliError>
+) -> Result<MuninnEnvelopeV1, CliError>
 where
     F: Fn(&str) -> Option<String>,
 {
     match prepare_envelope(input, get_env, config)? {
-        PreparedEnvelope::Ready(envelope) => serialize_envelope(&envelope),
+        PreparedEnvelope::Ready(envelope) => Ok(envelope),
         PreparedEnvelope::NeedsTranscription(request) => {
             let transcript = transcribe_with_google(&request).await?;
-            let envelope = apply_google_transcript(request.envelope, transcript);
-            serialize_envelope(&envelope)
+            Ok(apply_google_transcript(request.envelope, transcript))
         }
     }
 }
 
+pub(crate) async fn process_input_in_process(
+    input: &MuninnEnvelopeV1,
+    config: &AppConfig,
+) -> Result<MuninnEnvelopeV1, CliError> {
+    let env_lookup = |key: &str| std::env::var(key).ok();
+    let resolved = resolved_config_from_app_config(config);
+    process_input(input.clone(), &env_lookup, &resolved).await
+}
+
 fn prepare_envelope<F>(
-    input: &str,
+    mut envelope: MuninnEnvelopeV1,
     get_env: &F,
     config: &GoogleResolvedConfig,
 ) -> Result<PreparedEnvelope, CliError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let mut envelope: MuninnEnvelopeV1 = serde_json::from_str(input).map_err(|source| {
-        CliError::new(
-            "invalid_envelope_json",
-            format!("stdin must be valid MuninnEnvelopeV1 JSON: {source}"),
-        )
-    })?;
-
     if has_non_empty_raw_text(&envelope) {
         return Ok(PreparedEnvelope::Ready(envelope));
     }
@@ -202,17 +209,8 @@ where
 async fn transcribe_with_google(
     request: &PreparedTranscriptionRequest,
 ) -> Result<String, CliError> {
-    let audio_bytes = fs::read(&request.wav_path).map_err(|source| {
-        CliError::new(
-            "audio_file_read_failed",
-            format!(
-                "failed to read audio file at {}: {source}",
-                request.wav_path.display()
-            ),
-        )
-    })?;
     let wav = load_wav_metadata(&request.wav_path)?;
-    let body = google_request_body(&audio_bytes, wav, request.model.as_deref());
+    let body = google_request_body(&request.wav_path, wav, request.model.as_deref())?;
 
     let mut endpoint = Url::parse(&request.endpoint).map_err(|source| {
         CliError::new(
@@ -226,8 +224,10 @@ async fn transcribe_with_google(
         }
     }
 
-    let client = reqwest::Client::new();
-    let mut builder = client.post(endpoint).json(&body);
+    let mut builder = http_client()
+        .post(endpoint)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body);
     if let Some(token) = request.credentials.token.as_deref() {
         builder = builder.bearer_auth(token);
     }
@@ -261,26 +261,149 @@ async fn transcribe_with_google(
     extract_google_transcript_text(&body)
 }
 
-fn google_request_body(audio_bytes: &[u8], wav: WavMetadata, model: Option<&str>) -> Value {
-    let mut config = json!({
-        "encoding": "LINEAR16",
-        "sampleRateHertz": wav.sample_rate_hz,
-        "languageCode": DEFAULT_LANGUAGE_CODE,
-    });
+fn http_client() -> &'static reqwest::Client {
+    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    HTTP_CLIENT.get_or_init(reqwest::Client::new)
+}
 
-    if wav.channels > 1 {
-        config["audioChannelCount"] = json!(wav.channels);
-    }
-    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
-        config["model"] = json!(model);
-    }
-
-    json!({
-        "config": config,
-        "audio": {
-            "content": BASE64_STANDARD.encode(audio_bytes),
-        }
+fn google_request_body(
+    wav_path: &Path,
+    wav: WavMetadata,
+    model: Option<&str>,
+) -> Result<String, CliError> {
+    let config_json = serde_json::to_string(&GoogleRecognitionConfig {
+        encoding: "LINEAR16",
+        sample_rate_hertz: wav.sample_rate_hz,
+        language_code: DEFAULT_LANGUAGE_CODE,
+        audio_channel_count: (wav.channels > 1).then_some(wav.channels),
+        model: model.filter(|value| !value.trim().is_empty()),
     })
+    .map_err(|source| {
+        CliError::new(
+            "request_body_build_failed",
+            format!("failed to serialize Google request config: {source}"),
+        )
+    })?;
+
+    let prefix = format!(r#"{{"config":{config_json},"audio":{{"content":""#);
+    let suffix = r#""}}"#;
+    let mut body = String::with_capacity(google_request_body_capacity(wav_path, &prefix, suffix)?);
+    body.push_str(&prefix);
+    append_base64_audio_to_string(&mut body, wav_path)?;
+    body.push_str(suffix);
+
+    Ok(body)
+}
+
+fn google_request_body_capacity(
+    wav_path: &Path,
+    prefix: &str,
+    suffix: &str,
+) -> Result<usize, CliError> {
+    let file_len = fs::metadata(wav_path)
+        .map_err(|source| {
+            CliError::new(
+                "audio_file_read_failed",
+                format!(
+                    "failed to read audio file metadata at {}: {source}",
+                    wav_path.display()
+                ),
+            )
+        })?
+        .len();
+    let encoded_len = file_len
+        .checked_add(2)
+        .and_then(|value| value.checked_div(3))
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| {
+            CliError::new(
+                "request_body_build_failed",
+                format!(
+                    "audio file too large to encode safely: {}",
+                    wav_path.display()
+                ),
+            )
+        })?;
+
+    let total = u64::try_from(prefix.len())
+        .ok()
+        .and_then(|value| value.checked_add(encoded_len))
+        .and_then(|value| value.checked_add(u64::try_from(suffix.len()).ok()?))
+        .ok_or_else(|| {
+            CliError::new(
+                "request_body_build_failed",
+                format!(
+                    "request body too large to allocate safely: {}",
+                    wav_path.display()
+                ),
+            )
+        })?;
+
+    usize::try_from(total).map_err(|_| {
+        CliError::new(
+            "request_body_build_failed",
+            format!(
+                "request body too large to allocate safely: {}",
+                wav_path.display()
+            ),
+        )
+    })
+}
+
+fn append_base64_audio_to_string(output: &mut String, wav_path: &Path) -> Result<(), CliError> {
+    let mut file = fs::File::open(wav_path).map_err(|source| {
+        CliError::new(
+            "audio_file_read_failed",
+            format!(
+                "failed to open audio file at {}: {source}",
+                wav_path.display()
+            ),
+        )
+    })?;
+    let mut encoder =
+        base64::write::EncoderWriter::new(AsciiStringWriter::new(output), &BASE64_STANDARD);
+    io::copy(&mut file, &mut encoder).map_err(|source| {
+        CliError::new(
+            "audio_file_read_failed",
+            format!(
+                "failed to read audio file while encoding {}: {source}",
+                wav_path.display()
+            ),
+        )
+    })?;
+    encoder.finish().map_err(|source| {
+        CliError::new(
+            "request_body_build_failed",
+            format!(
+                "failed to finalize base64 request body for {}: {source}",
+                wav_path.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
+struct AsciiStringWriter<'a> {
+    output: &'a mut String,
+}
+
+impl<'a> AsciiStringWriter<'a> {
+    fn new(output: &'a mut String) -> Self {
+        Self { output }
+    }
+}
+
+impl Write for AsciiStringWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let chunk = std::str::from_utf8(buf)
+            .map_err(|source| io::Error::new(ErrorKind::InvalidData, source))?;
+        self.output.push_str(chunk);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn load_wav_metadata(path: &PathBuf) -> Result<WavMetadata, CliError> {
@@ -372,8 +495,23 @@ fn summarize_error_body(body: &[u8]) -> String {
     String::from_utf8_lossy(body).trim().to_string()
 }
 
-fn serialize_envelope(envelope: &MuninnEnvelopeV1) -> Result<String, CliError> {
-    serde_json::to_string(envelope).map_err(|source| {
+fn read_envelope_from_reader<R>(reader: R) -> Result<MuninnEnvelopeV1, CliError>
+where
+    R: Read,
+{
+    serde_json::from_reader(reader).map_err(|source| {
+        CliError::new(
+            "stdin_read_failed",
+            format!("failed to read stdin envelope JSON: {source}"),
+        )
+    })
+}
+
+fn write_envelope_to_writer<W>(writer: W, envelope: &MuninnEnvelopeV1) -> Result<(), CliError>
+where
+    W: Write,
+{
+    serde_json::to_writer(writer, envelope).map_err(|source| {
         CliError::new(
             "serialize_failed",
             format!("failed to serialize envelope to stdout JSON: {source}"),
@@ -431,14 +569,7 @@ fn load_google_config_from_config() -> GoogleResolvedConfig {
 
     AppConfig::load()
         .ok()
-        .map(|config| GoogleResolvedConfig {
-            credentials: GoogleCredentials {
-                api_key: resolve_secret(None, config.providers.google.api_key),
-                token: resolve_secret(None, config.providers.google.token),
-            },
-            endpoint: config.providers.google.endpoint,
-            model: config.providers.google.model,
-        })
+        .map(|config| resolved_config_from_app_config(&config))
         .unwrap_or_else(|| GoogleResolvedConfig {
             credentials: GoogleCredentials {
                 api_key: resolve_secret(None, defaults.api_key),
@@ -447,6 +578,17 @@ fn load_google_config_from_config() -> GoogleResolvedConfig {
             endpoint: defaults.endpoint,
             model: defaults.model,
         })
+}
+
+fn resolved_config_from_app_config(config: &AppConfig) -> GoogleResolvedConfig {
+    GoogleResolvedConfig {
+        credentials: GoogleCredentials {
+            api_key: resolve_secret(None, config.providers.google.api_key.clone()),
+            token: resolve_secret(None, config.providers.google.token.clone()),
+        },
+        endpoint: config.providers.google.endpoint.clone(),
+        model: config.providers.google.model.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -532,12 +674,8 @@ mod tests {
         input.transcript.raw_text = Some("existing transcript".to_string());
         input.transcript.provider = Some("legacy".to_string());
 
-        let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
-            &env_lookup(&[]),
-            &config(),
-        )
-        .expect("prepare envelope");
+        let prepared =
+            prepare_envelope(input, &env_lookup(&[]), &config()).expect("prepare envelope");
 
         match prepared {
             PreparedEnvelope::Ready(envelope) => {
@@ -557,7 +695,7 @@ mod tests {
     fn fills_missing_raw_text_from_stub_without_requiring_credentials() {
         let input = baseline_envelope();
         let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
+            input,
             &env_lookup(&[("MUNINN_GOOGLE_STUB_TEXT", "stub transcript")]),
             &config(),
         )
@@ -582,12 +720,8 @@ mod tests {
         let mut input = baseline_envelope();
         input.audio.wav_path = None;
 
-        let error = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
-            &env_lookup(&[]),
-            &config(),
-        )
-        .expect_err("missing audio path should fail");
+        let error = prepare_envelope(input, &env_lookup(&[]), &config())
+            .expect_err("missing audio path should fail");
 
         assert_eq!(error.code, "missing_audio_wav_path");
     }
@@ -597,7 +731,7 @@ mod tests {
         let input = baseline_envelope();
 
         let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
+            input,
             &env_lookup(&[
                 ("GOOGLE_STT_TOKEN", "env-token"),
                 (
@@ -634,7 +768,7 @@ mod tests {
         let input = baseline_envelope();
 
         let error = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
+            input,
             &env_lookup(&[]),
             &GoogleResolvedConfig {
                 credentials: GoogleCredentials::default(),
@@ -759,6 +893,43 @@ mod tests {
 
         assert_eq!(rendered["error"]["code"], json!("example_code"));
         assert_eq!(rendered["error"]["message"], json!("example message"));
+    }
+
+    #[test]
+    fn google_request_body_serializes_json_without_raw_audio_buffer_input() {
+        let wav_path = make_wav_file(16_000, 1);
+        let body = google_request_body(
+            &wav_path,
+            WavMetadata {
+                sample_rate_hz: 16_000,
+                channels: 1,
+            },
+            Some("latest_short"),
+        )
+        .expect("request body");
+        let value: Value = serde_json::from_str(&body).expect("request body json");
+
+        assert_eq!(value["config"]["encoding"], json!("LINEAR16"));
+        assert_eq!(value["config"]["sampleRateHertz"], json!(16_000));
+        assert_eq!(
+            value["config"]["languageCode"],
+            json!(DEFAULT_LANGUAGE_CODE)
+        );
+        assert_eq!(value["config"]["model"], json!("latest_short"));
+        assert!(value["audio"]["content"].as_str().is_some());
+
+        let _ = std::fs::remove_file(wav_path);
+    }
+
+    #[test]
+    fn reader_and_writer_roundtrip_envelope_json() {
+        let envelope = baseline_envelope().with_transcript_raw_text("hello from stdin");
+        let mut output = Vec::new();
+
+        write_envelope_to_writer(&mut output, &envelope).expect("write envelope");
+        let decoded = read_envelope_from_reader(output.as_slice()).expect("read envelope");
+
+        assert_eq!(decoded, envelope);
     }
 
     struct CapturedRequest {

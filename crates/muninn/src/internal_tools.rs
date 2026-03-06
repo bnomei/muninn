@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use muninn::config::{PipelineStepConfig, StepIoMode};
 
 use crate::{refine, stt_google_tool, stt_openai_tool};
@@ -26,11 +26,7 @@ pub fn rewrite_internal_tool_step(step: &mut PipelineStepConfig) -> Result<bool>
         return Ok(false);
     };
 
-    let current_exe = std::env::current_exe().context("resolving current executable path")?;
-    let mut args = vec![INTERNAL_STEP_MARKER.to_string(), tool.to_string()];
-    args.extend(step.args.clone());
-    step.cmd = current_exe.display().to_string();
-    step.args = args;
+    step.cmd = tool.to_string();
     step.io_mode = StepIoMode::EnvelopeJson;
     Ok(true)
 }
@@ -67,10 +63,9 @@ fn step_tool_name(step: &PipelineStepConfig) -> Option<&'static str> {
 mod tests {
     use super::*;
     use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
-    use std::path::PathBuf;
 
     #[test]
-    fn rewrites_internal_tool_step_to_current_executable() {
+    fn normalizes_internal_tool_step_to_canonical_builtin_name() {
         let mut step = PipelineStepConfig {
             id: "refine".to_string(),
             cmd: "refine".to_string(),
@@ -83,10 +78,8 @@ mod tests {
         let rewritten = rewrite_internal_tool_step(&mut step).expect("rewrite should succeed");
 
         assert!(rewritten);
-        assert!(PathBuf::from(&step.cmd).is_absolute());
-        assert_eq!(step.args[0], "__internal_step");
-        assert_eq!(step.args[1], "refine");
-        assert_eq!(step.args[2], "--example");
+        assert_eq!(step.cmd, "refine");
+        assert_eq!(step.args, vec!["--example"]);
         assert_eq!(step.io_mode, StepIoMode::EnvelopeJson);
     }
 
@@ -110,19 +103,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_aliases_are_not_rewritten() {
-        let mut step = PipelineStepConfig {
-            id: "legacy".to_string(),
-            cmd: "muninn-stt-openai".to_string(),
-            args: Vec::new(),
-            io_mode: StepIoMode::Auto,
-            timeout_ms: 100,
-            on_error: OnErrorPolicy::Continue,
-        };
-
-        let rewritten = rewrite_internal_tool_step(&mut step).expect("rewrite should succeed");
-
-        assert!(!rewritten);
-        assert_eq!(step.cmd, "muninn-stt-openai");
+    fn canonical_tool_name_accepts_only_current_builtin_names() {
+        assert_eq!(canonical_tool_name("stt_openai"), Some("stt_openai"));
+        assert_eq!(canonical_tool_name("stt_google"), Some("stt_google"));
+        assert_eq!(canonical_tool_name("refine"), Some("refine"));
+        assert_eq!(canonical_tool_name("muninn-stt-openai"), None);
+        assert_eq!(canonical_tool_name("muninn-stt-google"), None);
+        assert_eq!(canonical_tool_name("muninn-refine"), None);
     }
 }

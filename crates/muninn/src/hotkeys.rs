@@ -1,8 +1,10 @@
-use std::time::{Duration, SystemTime};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::{HotkeyBinding, HotkeysConfig, TriggerType};
 use async_trait::async_trait;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tracing::warn;
 
 use crate::{
     HotkeyAction, HotkeyEvent, HotkeyEventKind, HotkeyEventSource, MacosAdapterError,
@@ -30,6 +32,7 @@ pub struct MacosHotkeyEventSource {
 }
 
 const HOTKEY_EVENT_BUFFER_CAPACITY: usize = 32;
+const HOTKEY_DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Default)]
 struct ModifierSet {
@@ -47,6 +50,17 @@ struct HotkeyRuntimeState {
     last_modifier_taps: ModifierTapTimes,
 }
 
+#[derive(Debug, Default)]
+struct HotkeyDropDiagnostics {
+    dropped_since_last_warning: u64,
+    last_warning_at: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HotkeyDropWarning {
+    dropped_events: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ModifierTapTimes {
     control: Option<SystemTime>,
@@ -54,6 +68,8 @@ struct ModifierTapTimes {
     option: Option<SystemTime>,
     command: Option<SystemTime>,
 }
+
+static HOTKEY_DROP_DIAGNOSTICS: OnceLock<Mutex<HotkeyDropDiagnostics>> = OnceLock::new();
 
 impl MacosHotkeyBindings {
     pub fn from_config(config: &HotkeysConfig) -> MacosAdapterResult<Self> {
@@ -286,12 +302,63 @@ fn try_send_hotkey_result(
     sender: &Sender<MacosAdapterResult<HotkeyEvent>>,
     result: MacosAdapterResult<HotkeyEvent>,
 ) -> MacosAdapterResult<()> {
+    let payload_kind = if result.is_ok() { "event" } else { "error" };
+
     match sender.try_send(result) {
-        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Ok(()) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            record_hotkey_queue_drop(payload_kind);
+            Ok(())
+        }
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
             Err(MacosAdapterError::HotkeyEventStreamClosed)
         }
     }
+}
+
+impl HotkeyDropDiagnostics {
+    fn record_drop_at(&mut self, now: Instant) -> Option<HotkeyDropWarning> {
+        self.dropped_since_last_warning = self.dropped_since_last_warning.saturating_add(1);
+
+        let should_warn = match self.last_warning_at {
+            Some(last_warning_at) => {
+                now.duration_since(last_warning_at) >= HOTKEY_DROP_WARN_INTERVAL
+            }
+            None => true,
+        };
+
+        if !should_warn {
+            return None;
+        }
+
+        let warning = HotkeyDropWarning {
+            dropped_events: self.dropped_since_last_warning,
+        };
+        self.dropped_since_last_warning = 0;
+        self.last_warning_at = Some(now);
+        Some(warning)
+    }
+}
+
+fn record_hotkey_queue_drop(payload_kind: &'static str) {
+    let Some(warning) = hotkey_drop_diagnostics()
+        .lock()
+        .ok()
+        .and_then(|mut diagnostics| diagnostics.record_drop_at(Instant::now()))
+    else {
+        return;
+    };
+
+    warn!(
+        payload_kind,
+        dropped_events = warning.dropped_events,
+        queue_capacity = HOTKEY_EVENT_BUFFER_CAPACITY,
+        "dropping hotkey listener payload because hotkey event queue is full"
+    );
+}
+
+fn hotkey_drop_diagnostics() -> &'static Mutex<HotkeyDropDiagnostics> {
+    HOTKEY_DROP_DIAGNOSTICS.get_or_init(|| Mutex::new(HotkeyDropDiagnostics::default()))
 }
 
 fn parse_binding(
@@ -617,5 +684,64 @@ mod tests {
         .expect("late second ctrl press");
 
         assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod drop_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn hotkey_drop_diagnostics_warns_on_first_drop_then_rate_limits() {
+        let start = Instant::now();
+        let mut diagnostics = HotkeyDropDiagnostics::default();
+
+        assert_eq!(
+            diagnostics.record_drop_at(start),
+            Some(HotkeyDropWarning { dropped_events: 1 })
+        );
+        assert_eq!(
+            diagnostics.record_drop_at(start + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            diagnostics.record_drop_at(start + HOTKEY_DROP_WARN_INTERVAL),
+            Some(HotkeyDropWarning { dropped_events: 2 })
+        );
+    }
+
+    #[test]
+    fn full_queue_hotkey_drop_remains_non_fatal() {
+        let (sender, mut receiver) = channel(1);
+        sender
+            .try_send(Ok(HotkeyEvent::new(
+                HotkeyAction::PushToTalk,
+                HotkeyEventKind::Pressed,
+            )))
+            .expect("seed queue with one event");
+
+        let result = try_send_hotkey_result(
+            &sender,
+            Ok(HotkeyEvent::new(
+                HotkeyAction::PushToTalk,
+                HotkeyEventKind::Released,
+            )),
+        );
+
+        assert!(
+            result.is_ok(),
+            "queue backpressure should still drop instead of fail"
+        );
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("original event should remain queued")
+                .expect("queued event should be ok"),
+            HotkeyEvent::new(HotkeyAction::PushToTalk, HotkeyEventKind::Pressed)
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "full-queue drop should not enqueue the second event"
+        );
     }
 }

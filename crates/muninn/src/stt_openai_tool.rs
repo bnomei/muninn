@@ -6,9 +6,10 @@ use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CliError {
+pub(crate) struct CliError {
     code: &'static str,
     message: String,
 }
@@ -21,7 +22,7 @@ impl CliError {
         }
     }
 
-    fn to_stderr_json(&self) -> String {
+    pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
                 "code": self.code,
@@ -29,6 +30,10 @@ impl CliError {
             }
         })
         .to_string()
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -76,64 +81,52 @@ fn run() -> Result<(), CliError> {
         })?;
 
     runtime.block_on(async {
-        let mut input = String::new();
-        io::stdin().read_to_string(&mut input).map_err(|source| {
-            CliError::new(
-                "stdin_read_failed",
-                format!("failed to read stdin: {source}"),
-            )
-        })?;
+        let envelope = read_envelope_from_reader(io::stdin().lock())?;
 
         let config = load_openai_config_from_config();
         let env_lookup = |key: &str| std::env::var(key).ok();
-        let output = process_input(&input, &env_lookup, &config).await?;
+        let output = process_input(envelope, &env_lookup, &config).await?;
 
-        io::stdout()
-            .write_all(output.as_bytes())
-            .map_err(|source| {
-                CliError::new(
-                    "stdout_write_failed",
-                    format!("failed to write stdout: {source}"),
-                )
-            })?;
+        write_envelope_to_writer(io::stdout().lock(), &output)?;
 
         Ok(())
     })
 }
 
 async fn process_input<F>(
-    input: &str,
+    input: MuninnEnvelopeV1,
     get_env: &F,
     config: &OpenAiResolvedConfig,
-) -> Result<String, CliError>
+) -> Result<MuninnEnvelopeV1, CliError>
 where
     F: Fn(&str) -> Option<String>,
 {
     match prepare_envelope(input, get_env, config)? {
-        PreparedEnvelope::Ready(envelope) => serialize_envelope(&envelope),
+        PreparedEnvelope::Ready(envelope) => Ok(envelope),
         PreparedEnvelope::NeedsTranscription(request) => {
             let transcript = transcribe_with_openai(&request).await?;
-            let envelope = apply_openai_transcript(request.envelope, transcript);
-            serialize_envelope(&envelope)
+            Ok(apply_openai_transcript(request.envelope, transcript))
         }
     }
 }
 
+pub(crate) async fn process_input_in_process(
+    input: &MuninnEnvelopeV1,
+    config: &AppConfig,
+) -> Result<MuninnEnvelopeV1, CliError> {
+    let env_lookup = |key: &str| std::env::var(key).ok();
+    let resolved = resolved_config_from_app_config(config);
+    process_input(input.clone(), &env_lookup, &resolved).await
+}
+
 fn prepare_envelope<F>(
-    input: &str,
+    mut envelope: MuninnEnvelopeV1,
     get_env: &F,
     config: &OpenAiResolvedConfig,
 ) -> Result<PreparedEnvelope, CliError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let mut envelope: MuninnEnvelopeV1 = serde_json::from_str(input).map_err(|source| {
-        CliError::new(
-            "invalid_envelope_json",
-            format!("stdin must be valid MuninnEnvelopeV1 JSON: {source}"),
-        )
-    })?;
-
     if has_non_empty_raw_text(&envelope) {
         return Ok(PreparedEnvelope::Ready(envelope));
     }
@@ -145,6 +138,10 @@ where
     }
 
     let Some(api_key) = resolve_openai_api_key(get_env, config.api_key.clone()) else {
+        envelope.errors.push(json!({
+            "code": "missing_openai_api_key",
+            "message": "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in config"
+        }));
         return Ok(PreparedEnvelope::Ready(envelope));
     };
 
@@ -178,24 +175,17 @@ where
 async fn transcribe_with_openai(
     request: &PreparedTranscriptionRequest,
 ) -> Result<String, CliError> {
-    let audio_bytes = std::fs::read(&request.wav_path).map_err(|source| {
-        CliError::new(
-            "audio_file_read_failed",
-            format!(
-                "failed to read audio file at {}: {source}",
-                request.wav_path.display()
-            ),
-        )
-    })?;
-
-    let file_name = request
-        .wav_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("audio.wav")
-        .to_string();
-    let file_part = Part::bytes(audio_bytes)
-        .file_name(file_name)
+    let file_part = Part::file(&request.wav_path)
+        .await
+        .map_err(|source| {
+            CliError::new(
+                "audio_file_read_failed",
+                format!(
+                    "failed to open audio file at {}: {source}",
+                    request.wav_path.display()
+                ),
+            )
+        })?
         .mime_str(mime_for_audio_path(&request.wav_path))
         .map_err(|source| {
             CliError::new(
@@ -209,7 +199,7 @@ async fn transcribe_with_openai(
         .text("response_format", "json")
         .part("file", file_part);
 
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(&request.endpoint)
         .bearer_auth(&request.api_key)
         .multipart(form)
@@ -242,6 +232,11 @@ async fn transcribe_with_openai(
     }
 
     extract_transcript_text(&body)
+}
+
+fn http_client() -> &'static reqwest::Client {
+    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    HTTP_CLIENT.get_or_init(reqwest::Client::new)
 }
 
 fn apply_openai_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -> MuninnEnvelopeV1 {
@@ -299,8 +294,23 @@ fn summarize_error_body(body: &[u8]) -> String {
     String::from_utf8_lossy(body).trim().to_string()
 }
 
-fn serialize_envelope(envelope: &MuninnEnvelopeV1) -> Result<String, CliError> {
-    serde_json::to_string(envelope).map_err(|source| {
+fn read_envelope_from_reader<R>(reader: R) -> Result<MuninnEnvelopeV1, CliError>
+where
+    R: Read,
+{
+    serde_json::from_reader(reader).map_err(|source| {
+        CliError::new(
+            "stdin_read_failed",
+            format!("failed to read stdin envelope JSON: {source}"),
+        )
+    })
+}
+
+fn write_envelope_to_writer<W>(writer: W, envelope: &MuninnEnvelopeV1) -> Result<(), CliError>
+where
+    W: Write,
+{
+    serde_json::to_writer(writer, envelope).map_err(|source| {
         CliError::new(
             "serialize_failed",
             format!("failed to serialize envelope to stdout JSON: {source}"),
@@ -346,16 +356,20 @@ fn load_openai_config_from_config() -> OpenAiResolvedConfig {
 
     AppConfig::load()
         .ok()
-        .map(|config| OpenAiResolvedConfig {
-            api_key: resolve_secret(None, config.providers.openai.api_key),
-            endpoint: config.providers.openai.endpoint,
-            model: config.providers.openai.model,
-        })
+        .map(|config| resolved_config_from_app_config(&config))
         .unwrap_or_else(|| OpenAiResolvedConfig {
             api_key: resolve_secret(None, defaults.api_key),
             endpoint: defaults.endpoint,
             model: defaults.model,
         })
+}
+
+fn resolved_config_from_app_config(config: &AppConfig) -> OpenAiResolvedConfig {
+    OpenAiResolvedConfig {
+        api_key: resolve_secret(None, config.providers.openai.api_key.clone()),
+        endpoint: config.providers.openai.endpoint.clone(),
+        model: config.providers.openai.model.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -392,12 +406,7 @@ mod tests {
         input.transcript.raw_text = Some("existing transcript".to_string());
         input.transcript.provider = Some("legacy".to_string());
 
-        let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
-            &|_| None,
-            &config(),
-        )
-        .expect("prepare envelope");
+        let prepared = prepare_envelope(input, &|_| None, &config()).expect("prepare envelope");
 
         match prepared {
             PreparedEnvelope::Ready(envelope) => {
@@ -417,7 +426,7 @@ mod tests {
     fn fills_missing_raw_text_from_stub_without_requiring_credentials() {
         let input = baseline_envelope();
         let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
+            input,
             &|key| (key == "MUNINN_OPENAI_STUB_TEXT").then(|| "stub transcript".to_string()),
             &config(),
         )
@@ -441,7 +450,7 @@ mod tests {
     fn missing_credentials_pass_through_for_later_stt_steps() {
         let input = baseline_envelope();
         let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
+            input.clone(),
             &|_| None,
             &OpenAiResolvedConfig {
                 api_key: None,
@@ -453,7 +462,10 @@ mod tests {
 
         match prepared {
             PreparedEnvelope::Ready(envelope) => {
-                assert_eq!(envelope, input);
+                assert_eq!(envelope.audio, input.audio);
+                assert_eq!(envelope.output, input.output);
+                assert_eq!(envelope.errors.len(), 2);
+                assert_eq!(envelope.errors[1]["code"], json!("missing_openai_api_key"));
             }
             PreparedEnvelope::NeedsTranscription(_) => {
                 panic!("missing credentials should not attempt transcription")
@@ -466,12 +478,8 @@ mod tests {
         let mut input = baseline_envelope();
         input.audio.wav_path = None;
 
-        let error = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
-            &|_| None,
-            &config(),
-        )
-        .expect_err("missing audio path should fail");
+        let error = prepare_envelope(input, &|_| None, &config())
+            .expect_err("missing audio path should fail");
 
         assert_eq!(error.code, "missing_audio_wav_path");
     }
@@ -547,7 +555,7 @@ mod tests {
             .insert("openai_model".to_string(), json!("attacker-model"));
 
         let prepared = prepare_envelope(
-            &serde_json::to_string(&input).expect("serialize input"),
+            input,
             &|key| (key == "OPENAI_API_KEY").then(|| "env-openai-key".to_string()),
             &config(),
         )
@@ -572,5 +580,16 @@ mod tests {
 
         assert_eq!(rendered["error"]["code"], json!("example_code"));
         assert_eq!(rendered["error"]["message"], json!("example message"));
+    }
+
+    #[test]
+    fn reader_and_writer_roundtrip_envelope_json() {
+        let envelope = baseline_envelope().with_transcript_raw_text("hello from stdin");
+        let mut output = Vec::new();
+
+        write_envelope_to_writer(&mut output, &envelope).expect("write envelope");
+        let decoded = read_envelope_from_reader(output.as_slice()).expect("read envelope");
+
+        assert_eq!(decoded, envelope);
     }
 }

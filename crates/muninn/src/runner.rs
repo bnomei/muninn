@@ -1,9 +1,11 @@
 use std::io;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::config::{OnErrorPolicy, PipelineConfig, PipelineStepConfig, StepIoMode};
 use crate::envelope::MuninnEnvelopeV1;
+use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -15,15 +17,34 @@ const MAX_STEP_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_STEP_STDERR_BYTES: usize = 16 * 1024;
 const TRUNCATION_SUFFIX: &str = "\n[truncated]";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PipelineRunner {
     strict_step_contract: bool,
+    in_process_step_executor: Option<Arc<dyn InProcessStepExecutor>>,
+}
+
+#[async_trait]
+pub trait InProcessStepExecutor: Send + Sync {
+    async fn try_execute(
+        &self,
+        step: &PipelineStepConfig,
+        input: &MuninnEnvelopeV1,
+    ) -> Option<Result<MuninnEnvelopeV1, InProcessStepError>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InProcessStepError {
+    pub kind: StepFailureKind,
+    pub message: String,
+    pub stderr: String,
+    pub exit_status: Option<i32>,
 }
 
 impl Default for PipelineRunner {
     fn default() -> Self {
         Self {
             strict_step_contract: true,
+            in_process_step_executor: None,
         }
     }
 }
@@ -32,6 +53,17 @@ impl PipelineRunner {
     pub fn new(strict_step_contract: bool) -> Self {
         Self {
             strict_step_contract,
+            in_process_step_executor: None,
+        }
+    }
+
+    pub fn with_in_process_step_executor(
+        strict_step_contract: bool,
+        in_process_step_executor: Arc<dyn InProcessStepExecutor>,
+    ) -> Self {
+        Self {
+            strict_step_contract,
+            in_process_step_executor: Some(in_process_step_executor),
         }
     }
 
@@ -62,7 +94,7 @@ impl PipelineRunner {
             let started = Instant::now();
 
             match self
-                .run_step(step, &current_envelope, effective_timeout)
+                .run_step(step, current_envelope, effective_timeout)
                 .await
             {
                 Ok(success) => {
@@ -71,21 +103,30 @@ impl PipelineRunner {
                         duration_ms: elapsed_ms(started.elapsed()),
                         timed_out: false,
                         exit_status: Some(success.exit_status),
-                        policy_applied: PipelinePolicyApplied::None,
+                        policy_applied: success.policy_applied,
                         stderr: success.stderr,
                     });
                     current_envelope = success.envelope;
                 }
                 Err(failure) => {
-                    let hit_global_deadline = failure.timed_out && remaining_budget <= step_budget;
+                    let StepFailure {
+                        envelope,
+                        kind,
+                        timed_out,
+                        exit_status,
+                        stderr,
+                        message,
+                    } = failure;
+                    let hit_global_deadline = timed_out && remaining_budget <= step_budget;
                     let mut trace_entry = PipelineTraceEntry {
                         id: step.id.clone(),
                         duration_ms: elapsed_ms(started.elapsed()),
-                        timed_out: failure.timed_out,
-                        exit_status: failure.exit_status,
+                        timed_out,
+                        exit_status,
                         policy_applied: PipelinePolicyApplied::None,
-                        stderr: failure.stderr.clone(),
+                        stderr: stderr.clone(),
                     };
+                    current_envelope = envelope;
 
                     if hit_global_deadline {
                         trace_entry.policy_applied = PipelinePolicyApplied::GlobalDeadlineFallback;
@@ -102,8 +143,8 @@ impl PipelineRunner {
 
                     let reason = PipelineStopReason::StepFailed {
                         step_id: step.id.clone(),
-                        failure: failure.kind,
-                        message: failure.message,
+                        failure: kind,
+                        message,
                     };
 
                     match step.on_error {
@@ -139,10 +180,30 @@ impl PipelineRunner {
     async fn run_step(
         &self,
         step: &PipelineStepConfig,
-        input_envelope: &MuninnEnvelopeV1,
+        input_envelope: MuninnEnvelopeV1,
         timeout_budget: Duration,
     ) -> Result<StepSuccess, StepFailure> {
-        let input = serialize_input_for_step(step, input_envelope)?;
+        if let Some(executor) = &self.in_process_step_executor {
+            match self
+                .run_in_process_step(step, &input_envelope, timeout_budget, executor)
+                .await
+            {
+                Some(Ok(success)) => return Ok(success),
+                Some(Err(failure)) => {
+                    return Err(StepFailure {
+                        kind: failure.kind,
+                        envelope: input_envelope,
+                        timed_out: failure.timed_out,
+                        exit_status: failure.exit_status,
+                        stderr: failure.stderr,
+                        message: failure.message,
+                    });
+                }
+                None => {}
+            }
+        }
+
+        let mut input_envelope = Some(input_envelope);
 
         let mut command = Command::new(&step.cmd);
         command.args(&step.args);
@@ -154,52 +215,89 @@ impl PipelineRunner {
 
         let mut child = command.spawn().map_err(|source| StepFailure {
             kind: StepFailureKind::SpawnFailed,
+            envelope: input_envelope
+                .take()
+                .expect("step input envelope available"),
             timed_out: false,
             exit_status: None,
             stderr: String::new(),
             message: format!("failed to spawn step command: {source}"),
         })?;
 
-        let mut stdin = child.stdin.take().ok_or_else(|| StepFailure {
-            kind: StepFailureKind::IoFailed,
-            timed_out: false,
-            exit_status: None,
-            stderr: String::new(),
-            message: "failed to open child stdin".to_string(),
-        })?;
-        stdin
-            .write_all(&input)
-            .await
-            .map_err(|source| StepFailure {
+        let envelope_ref = input_envelope
+            .as_ref()
+            .expect("step input envelope available");
+        let mut stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                return Err(StepFailure {
+                    kind: StepFailureKind::IoFailed,
+                    envelope: input_envelope
+                        .take()
+                        .expect("step input envelope available"),
+                    timed_out: false,
+                    exit_status: None,
+                    stderr: String::new(),
+                    message: "failed to open child stdin".to_string(),
+                });
+            }
+        };
+        if let Err(message) = write_input_for_step(step, envelope_ref, &mut stdin).await {
+            return Err(StepFailure {
                 kind: StepFailureKind::IoFailed,
+                envelope: input_envelope
+                    .take()
+                    .expect("step input envelope available"),
                 timed_out: false,
                 exit_status: None,
                 stderr: String::new(),
-                message: format!("failed to write envelope JSON to step stdin: {source}"),
-            })?;
-        stdin.shutdown().await.map_err(|source| StepFailure {
-            kind: StepFailureKind::IoFailed,
-            timed_out: false,
-            exit_status: None,
-            stderr: String::new(),
-            message: format!("failed to close step stdin after write: {source}"),
-        })?;
+                message,
+            });
+        }
+        if let Err(source) = stdin.shutdown().await {
+            return Err(StepFailure {
+                kind: StepFailureKind::IoFailed,
+                envelope: input_envelope
+                    .take()
+                    .expect("step input envelope available"),
+                timed_out: false,
+                exit_status: None,
+                stderr: String::new(),
+                message: format!("failed to close step stdin after write: {source}"),
+            });
+        }
         drop(stdin);
 
-        let stdout = child.stdout.take().ok_or_else(|| StepFailure {
-            kind: StepFailureKind::IoFailed,
-            timed_out: false,
-            exit_status: None,
-            stderr: String::new(),
-            message: "failed to open child stdout".to_string(),
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| StepFailure {
-            kind: StepFailureKind::IoFailed,
-            timed_out: false,
-            exit_status: None,
-            stderr: String::new(),
-            message: "failed to open child stderr".to_string(),
-        })?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                return Err(StepFailure {
+                    kind: StepFailureKind::IoFailed,
+                    envelope: input_envelope
+                        .take()
+                        .expect("step input envelope available"),
+                    timed_out: false,
+                    exit_status: None,
+                    stderr: String::new(),
+                    message: "failed to open child stdout".to_string(),
+                });
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                return Err(StepFailure {
+                    kind: StepFailureKind::IoFailed,
+                    envelope: input_envelope
+                        .take()
+                        .expect("step input envelope available"),
+                    timed_out: false,
+                    exit_status: None,
+                    stderr: String::new(),
+                    message: "failed to open child stderr".to_string(),
+                });
+            }
+        };
 
         let stdout_reader =
             tokio::spawn(async move { read_to_end_capped(stdout, MAX_STEP_STDOUT_BYTES).await });
@@ -215,6 +313,9 @@ impl PipelineRunner {
                 let stderr = render_stderr(drain_reader(stderr_reader).await.unwrap_or_default());
                 return Err(StepFailure {
                     kind: StepFailureKind::IoFailed,
+                    envelope: input_envelope
+                        .take()
+                        .expect("step input envelope available"),
                     timed_out: false,
                     exit_status: None,
                     stderr,
@@ -228,6 +329,9 @@ impl PipelineRunner {
                 let stderr = render_stderr(drain_reader(stderr_reader).await.unwrap_or_default());
                 return Err(StepFailure {
                     kind: StepFailureKind::Timeout,
+                    envelope: input_envelope
+                        .take()
+                        .expect("step input envelope available"),
                     timed_out: true,
                     exit_status: None,
                     stderr,
@@ -243,6 +347,9 @@ impl PipelineRunner {
             .await
             .map_err(|source| StepFailure {
                 kind: StepFailureKind::IoFailed,
+                envelope: input_envelope
+                    .take()
+                    .expect("step input envelope available"),
                 timed_out: false,
                 exit_status: status.code(),
                 stderr: String::new(),
@@ -252,6 +359,9 @@ impl PipelineRunner {
             .await
             .map_err(|source| StepFailure {
                 kind: StepFailureKind::IoFailed,
+                envelope: input_envelope
+                    .take()
+                    .expect("step input envelope available"),
                 timed_out: false,
                 exit_status: status.code(),
                 stderr: String::new(),
@@ -260,10 +370,14 @@ impl PipelineRunner {
 
         let stderr_text = render_stderr(stderr);
         let exit_status = status.code().unwrap_or(-1);
+        let input_envelope = input_envelope
+            .take()
+            .expect("step input envelope available");
 
         if !status.success() {
             return Err(StepFailure {
                 kind: StepFailureKind::NonZeroExit,
+                envelope: input_envelope,
                 timed_out: false,
                 exit_status: Some(exit_status),
                 stderr: stderr_text,
@@ -274,6 +388,7 @@ impl PipelineRunner {
         if stdout.truncated {
             return Err(StepFailure {
                 kind: StepFailureKind::InvalidStdout,
+                envelope: input_envelope,
                 timed_out: false,
                 exit_status: Some(exit_status),
                 stderr: stderr_text,
@@ -298,29 +413,77 @@ impl PipelineRunner {
             StepIoMode::Auto => unreachable!("effective_io_mode never returns Auto"),
         }
     }
-}
 
-fn serialize_input_for_step(
-    step: &PipelineStepConfig,
-    input_envelope: &MuninnEnvelopeV1,
-) -> Result<Vec<u8>, StepFailure> {
-    match effective_io_mode(step) {
-        StepIoMode::EnvelopeJson => {
-            serde_json::to_vec(input_envelope).map_err(|source| StepFailure {
-                kind: StepFailureKind::SerializeInput,
+    async fn run_in_process_step(
+        &self,
+        step: &PipelineStepConfig,
+        input_envelope: &MuninnEnvelopeV1,
+        timeout_budget: Duration,
+        executor: &Arc<dyn InProcessStepExecutor>,
+    ) -> Option<Result<StepSuccess, InProcessStepFailure>> {
+        match timeout(timeout_budget, executor.try_execute(step, input_envelope)).await {
+            Ok(Some(Ok(envelope))) => Some(Ok(StepSuccess {
+                envelope,
+                exit_status: 0,
+                stderr: String::new(),
+                policy_applied: PipelinePolicyApplied::None,
+            })),
+            Ok(Some(Err(error))) => Some(Err(InProcessStepFailure {
+                kind: error.kind,
                 timed_out: false,
+                exit_status: error.exit_status,
+                stderr: error.stderr,
+                message: error.message,
+            })),
+            Ok(None) => None,
+            Err(_) => Some(Err(InProcessStepFailure {
+                kind: StepFailureKind::Timeout,
+                timed_out: true,
                 exit_status: None,
                 stderr: String::new(),
-                message: format!("failed to serialize envelope for step input: {source}"),
-            })
+                message: format!(
+                    "step exceeded timeout budget ({}ms)",
+                    timeout_budget.as_millis()
+                ),
+            })),
         }
-        StepIoMode::TextFilter => Ok(current_text_for_filter(input_envelope).as_bytes().to_vec()),
+    }
+}
+
+async fn write_input_for_step<W>(
+    step: &PipelineStepConfig,
+    input_envelope: &MuninnEnvelopeV1,
+    stdin: &mut W,
+) -> Result<(), String>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    match effective_io_mode(step) {
+        StepIoMode::EnvelopeJson => {
+            let input = serde_json::to_vec(input_envelope).map_err(|source| {
+                format!("failed to serialize envelope for step input: {source}")
+            })?;
+            // JSON mode still needs a serialized buffer before stdin write.
+            stdin
+                .write_all(&input)
+                .await
+                .map_err(|source| format!("failed to write envelope JSON to step stdin: {source}"))
+        }
+        StepIoMode::TextFilter => {
+            use tokio::io::AsyncWriteExt;
+            stdin
+                .write_all(current_text_for_filter(input_envelope).as_bytes())
+                .await
+                .map_err(|source| {
+                    format!("failed to write text filter input to step stdin: {source}")
+                })
+        }
         StepIoMode::Auto => unreachable!("effective_io_mode never returns Auto"),
     }
 }
 
 fn decode_envelope_json_output(
-    input_envelope: &MuninnEnvelopeV1,
+    input_envelope: MuninnEnvelopeV1,
     stdout: Vec<u8>,
     stderr_text: String,
     exit_status: i32,
@@ -328,16 +491,17 @@ fn decode_envelope_json_output(
 ) -> Result<StepSuccess, StepFailure> {
     let output_value: Value = match serde_json::from_slice(&stdout) {
         Ok(value) => value,
-        Err(source) if !strict_step_contract => {
-            return Ok(StepSuccess {
-                envelope: input_envelope.clone(),
+        Err(_) if !strict_step_contract => {
+            return Ok(contract_bypass_success(
+                input_envelope,
                 exit_status,
-                stderr: stderr_text,
-            });
+                stderr_text,
+            ));
         }
         Err(source) => {
             return Err(StepFailure {
                 kind: StepFailureKind::InvalidStdout,
+                envelope: input_envelope,
                 timed_out: false,
                 exit_status: Some(exit_status),
                 stderr: stderr_text,
@@ -350,6 +514,7 @@ fn decode_envelope_json_output(
         if strict_step_contract {
             return Err(StepFailure {
                 kind: StepFailureKind::InvalidStdout,
+                envelope: input_envelope,
                 timed_out: false,
                 exit_status: Some(exit_status),
                 stderr: stderr_text,
@@ -357,73 +522,82 @@ fn decode_envelope_json_output(
             });
         }
 
-        return Ok(StepSuccess {
-            envelope: input_envelope.clone(),
+        return Ok(contract_bypass_success(
+            input_envelope,
             exit_status,
-            stderr: stderr_text,
-        });
+            stderr_text,
+        ));
     }
 
-    let envelope = serde_json::from_value::<MuninnEnvelopeV1>(output_value).map_err(|source| {
-        if strict_step_contract {
-            StepFailure {
-                kind: StepFailureKind::InvalidEnvelope,
-                timed_out: false,
-                exit_status: Some(exit_status),
-                stderr: stderr_text.clone(),
-                message: format!("step JSON object was not a valid MuninnEnvelopeV1: {source}"),
-            }
-        } else {
-            StepFailure {
-                kind: StepFailureKind::InvalidEnvelope,
-                timed_out: false,
-                exit_status: Some(exit_status),
-                stderr: stderr_text.clone(),
-                message: String::new(),
-            }
-        }
-    });
-
-    match envelope {
+    match serde_json::from_value::<MuninnEnvelopeV1>(output_value) {
         Ok(envelope) => Ok(StepSuccess {
             envelope,
             exit_status,
             stderr: stderr_text,
+            policy_applied: PipelinePolicyApplied::None,
         }),
-        Err(_) if !strict_step_contract => Ok(StepSuccess {
-            envelope: input_envelope.clone(),
+        Err(_) if !strict_step_contract => Ok(contract_bypass_success(
+            input_envelope,
             exit_status,
+            stderr_text,
+        )),
+        Err(source) => Err(StepFailure {
+            kind: StepFailureKind::InvalidEnvelope,
+            envelope: input_envelope,
+            timed_out: false,
+            exit_status: Some(exit_status),
             stderr: stderr_text,
+            message: format!("step JSON object was not a valid MuninnEnvelopeV1: {source}"),
         }),
-        Err(failure) => Err(failure),
     }
 }
 
 fn decode_text_filter_output(
-    input_envelope: &MuninnEnvelopeV1,
+    mut input_envelope: MuninnEnvelopeV1,
     stdout: Vec<u8>,
     stderr_text: String,
     exit_status: i32,
 ) -> Result<StepSuccess, StepFailure> {
-    let output_text = String::from_utf8(stdout).map_err(|source| StepFailure {
-        kind: StepFailureKind::InvalidStdout,
-        timed_out: false,
-        exit_status: Some(exit_status),
-        stderr: stderr_text.clone(),
-        message: format!("step stdout was not valid UTF-8 text: {source}"),
-    })?;
+    let output_text = match String::from_utf8(stdout) {
+        Ok(output_text) => output_text,
+        Err(source) => {
+            return Err(StepFailure {
+                kind: StepFailureKind::InvalidStdout,
+                envelope: input_envelope,
+                timed_out: false,
+                exit_status: Some(exit_status),
+                stderr: stderr_text,
+                message: format!("step stdout was not valid UTF-8 text: {source}"),
+            });
+        }
+    };
 
-    let mut envelope = input_envelope.clone();
-    match text_filter_target(input_envelope) {
-        TextFilterTarget::OutputFinalText => envelope.output.final_text = Some(output_text),
-        TextFilterTarget::TranscriptRawText => envelope.transcript.raw_text = Some(output_text),
+    match text_filter_target(&input_envelope) {
+        TextFilterTarget::OutputFinalText => input_envelope.output.final_text = Some(output_text),
+        TextFilterTarget::TranscriptRawText => {
+            input_envelope.transcript.raw_text = Some(output_text)
+        }
     }
 
     Ok(StepSuccess {
-        envelope,
+        envelope: input_envelope,
         exit_status,
         stderr: stderr_text,
+        policy_applied: PipelinePolicyApplied::None,
     })
+}
+
+fn contract_bypass_success(
+    envelope: MuninnEnvelopeV1,
+    exit_status: i32,
+    stderr: String,
+) -> StepSuccess {
+    StepSuccess {
+        envelope,
+        exit_status,
+        stderr,
+        policy_applied: PipelinePolicyApplied::ContractBypass,
+    }
 }
 
 fn effective_io_mode(step: &PipelineStepConfig) -> StepIoMode {
@@ -506,6 +680,7 @@ pub struct PipelineTraceEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PipelinePolicyApplied {
     None,
+    ContractBypass,
     Continue,
     FallbackRaw,
     Abort,
@@ -528,11 +703,22 @@ struct StepSuccess {
     envelope: MuninnEnvelopeV1,
     exit_status: i32,
     stderr: String,
+    policy_applied: PipelinePolicyApplied,
+}
+
+#[derive(Debug)]
+struct InProcessStepFailure {
+    kind: StepFailureKind,
+    timed_out: bool,
+    exit_status: Option<i32>,
+    stderr: String,
+    message: String,
 }
 
 #[derive(Debug)]
 struct StepFailure {
     kind: StepFailureKind,
+    envelope: MuninnEnvelopeV1,
     timed_out: bool,
     exit_status: Option<i32>,
     stderr: String,
@@ -617,6 +803,8 @@ fn render_stderr(output: CapturedOutput) -> String {
 mod tests {
     use super::*;
     use crate::config::{PayloadFormat, PipelineStepConfig, StepIoMode};
+    use async_trait::async_trait;
+    use std::sync::{Arc, Mutex};
 
     #[tokio::test]
     async fn completes_when_steps_succeed() {
@@ -949,10 +1137,213 @@ mod tests {
                 assert_eq!(envelope, input);
                 assert_eq!(trace.len(), 2);
                 assert_eq!(trace[0].exit_status, Some(0));
-                assert_eq!(trace[0].policy_applied, PipelinePolicyApplied::None);
+                assert_eq!(
+                    trace[0].policy_applied,
+                    PipelinePolicyApplied::ContractBypass
+                );
                 assert_eq!(trace[1].exit_status, Some(0));
             }
             other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_strict_contract_marks_non_object_json_as_contract_bypass() {
+        let runner = PipelineRunner::new(false);
+        let config = config_with_steps(
+            1_000,
+            vec![step(
+                "array-json",
+                "/bin/sh",
+                &["-c", "cat >/dev/null; echo '[1,2,3]'"],
+                1_000,
+                OnErrorPolicy::Abort,
+            )],
+        );
+        let input = sample_envelope();
+
+        let outcome = runner.run(input.clone(), &config).await;
+
+        match outcome {
+            PipelineOutcome::Completed { envelope, trace } => {
+                assert_eq!(envelope, input);
+                assert_eq!(trace.len(), 1);
+                assert_eq!(
+                    trace[0].policy_applied,
+                    PipelinePolicyApplied::ContractBypass
+                );
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_strict_contract_marks_invalid_envelope_json_as_contract_bypass() {
+        let runner = PipelineRunner::new(false);
+        let config = config_with_steps(
+            1_000,
+            vec![step(
+                "bad-envelope",
+                "/bin/sh",
+                &[
+                    "-c",
+                    "cat >/dev/null; echo '{\"schema\":\"muninn.envelope.v1\",\"utterance_id\":\"utt\"}'",
+                ],
+                1_000,
+                OnErrorPolicy::Abort,
+            )],
+        );
+        let input = sample_envelope();
+
+        let outcome = runner.run(input.clone(), &config).await;
+
+        match outcome {
+            PipelineOutcome::Completed { envelope, trace } => {
+                assert_eq!(envelope, input);
+                assert_eq!(trace.len(), 1);
+                assert_eq!(
+                    trace[0].policy_applied,
+                    PipelinePolicyApplied::ContractBypass
+                );
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeInProcessExecutor {
+        handled_step_ids: Mutex<Vec<String>>,
+    }
+
+    impl FakeInProcessExecutor {
+        fn handled_step_ids(&self) -> Vec<String> {
+            self.handled_step_ids
+                .lock()
+                .expect("handled steps mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl InProcessStepExecutor for FakeInProcessExecutor {
+        async fn try_execute(
+            &self,
+            step: &PipelineStepConfig,
+            input: &MuninnEnvelopeV1,
+        ) -> Option<Result<MuninnEnvelopeV1, InProcessStepError>> {
+            if step.cmd != "stt_openai" {
+                return None;
+            }
+
+            self.handled_step_ids
+                .lock()
+                .expect("handled steps mutex should not be poisoned")
+                .push(step.id.clone());
+
+            let mut envelope = input.clone();
+            envelope.transcript.raw_text = Some("handled in process".to_string());
+            Some(Ok(envelope))
+        }
+    }
+
+    struct SlowInProcessExecutor;
+
+    #[async_trait]
+    impl InProcessStepExecutor for SlowInProcessExecutor {
+        async fn try_execute(
+            &self,
+            step: &PipelineStepConfig,
+            input: &MuninnEnvelopeV1,
+        ) -> Option<Result<MuninnEnvelopeV1, InProcessStepError>> {
+            if step.cmd != "stt_openai" {
+                return None;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Some(Ok(input.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn in_process_executor_handles_builtin_steps_without_spawning() {
+        let executor = Arc::new(FakeInProcessExecutor::default());
+        let runner = PipelineRunner::with_in_process_step_executor(true, executor.clone());
+        let config = config_with_steps(
+            1_000,
+            vec![step(
+                "builtin",
+                "stt_openai",
+                &[],
+                500,
+                OnErrorPolicy::Abort,
+            )],
+        );
+
+        let outcome = runner.run(sample_envelope(), &config).await;
+
+        match outcome {
+            PipelineOutcome::Completed { envelope, trace } => {
+                assert_eq!(
+                    envelope.transcript.raw_text.as_deref(),
+                    Some("handled in process")
+                );
+                assert_eq!(trace.len(), 1);
+                assert_eq!(trace[0].exit_status, Some(0));
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+
+        assert_eq!(executor.handled_step_ids(), vec!["builtin".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn in_process_executor_leaves_external_steps_to_subprocess_execution() {
+        let executor = Arc::new(FakeInProcessExecutor::default());
+        let runner = PipelineRunner::with_in_process_step_executor(true, executor.clone());
+        let config = config_with_steps(
+            1_000,
+            vec![step("echo", "cat", &[], 500, OnErrorPolicy::Abort)],
+        );
+        let input = sample_envelope();
+
+        let outcome = runner.run(input.clone(), &config).await;
+
+        match outcome {
+            PipelineOutcome::Completed { envelope, .. } => {
+                assert_eq!(envelope, input);
+            }
+            other => panic!("expected completed outcome, got {other:?}"),
+        }
+
+        assert!(executor.handled_step_ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn in_process_executor_preserves_timeout_behavior() {
+        let runner =
+            PipelineRunner::with_in_process_step_executor(true, Arc::new(SlowInProcessExecutor));
+        let config = config_with_steps(
+            1_000,
+            vec![step("builtin", "stt_openai", &[], 10, OnErrorPolicy::Abort)],
+        );
+
+        let outcome = runner.run(sample_envelope(), &config).await;
+
+        match outcome {
+            PipelineOutcome::Aborted { trace, reason } => {
+                assert_eq!(trace.len(), 1);
+                assert!(trace[0].timed_out);
+                assert_eq!(trace[0].policy_applied, PipelinePolicyApplied::Abort);
+                assert_eq!(
+                    reason,
+                    PipelineStopReason::StepFailed {
+                        step_id: "builtin".to_string(),
+                        failure: StepFailureKind::Timeout,
+                        message: "step exceeded timeout budget (10ms)".to_string(),
+                    }
+                );
+            }
+            other => panic!("expected aborted outcome, got {other:?}"),
         }
     }
 

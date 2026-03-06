@@ -1,6 +1,8 @@
 use std::env;
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -11,10 +13,13 @@ use muninn::MuninnEnvelopeV1;
 use muninn::PipelineOutcome;
 use muninn::PipelineTraceEntry;
 use muninn::RecordedAudio;
+use muninn::ResolvedUtteranceConfig;
+use muninn::TargetContextSnapshot;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 const REDACTED_VALUE: &str = "[redacted]";
+const REPLAY_PRUNE_THROTTLE_SECS: u64 = 60;
 const SECRET_KEYS: &[&str] = &[
     "api_key",
     "openai_api_key",
@@ -22,6 +27,7 @@ const SECRET_KEYS: &[&str] = &[
     "token",
     "google_stt_token",
 ];
+static LAST_REPLAY_PRUNE_AT_SECS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize)]
 struct ReplayRecord {
@@ -32,6 +38,7 @@ struct ReplayRecord {
     copied_audio_file: Option<String>,
     warnings: Vec<String>,
     redacted_config: Value,
+    resolution: ReplayResolutionContext,
     refine_context: Option<ReplayRefineContext>,
     input_envelope: MuninnEnvelopeV1,
     pipeline_outcome: PipelineOutcome,
@@ -43,6 +50,16 @@ struct ReplayRefineContext {
     system_prompt: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ReplayResolutionContext {
+    target_context: TargetContextSnapshot,
+    matched_rule_id: Option<String>,
+    profile_id: String,
+    voice_id: Option<String>,
+    voice_glyph: Option<char>,
+    fallback_reason: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct ReplayEntryMeta {
     path: PathBuf,
@@ -51,12 +68,13 @@ struct ReplayEntryMeta {
 }
 
 pub fn persist_replay(
-    config: &AppConfig,
-    input_envelope: &MuninnEnvelopeV1,
-    outcome: &PipelineOutcome,
-    route: &InjectionRoute,
-    recorded: &RecordedAudio,
+    resolved: ResolvedUtteranceConfig,
+    input_envelope: MuninnEnvelopeV1,
+    outcome: PipelineOutcome,
+    route: InjectionRoute,
+    recorded: RecordedAudio,
 ) -> Result<Option<PathBuf>> {
+    let config = &resolved.effective_config;
     if !config.logging.replay_enabled {
         return Ok(None);
     }
@@ -66,17 +84,33 @@ pub fn persist_replay(
     fs::create_dir_all(&replay_root)
         .with_context(|| format!("creating replay root {}", replay_root.display()))?;
 
-    let artifact_dir = replay_root.join(artifact_dir_name(input_envelope));
+    let artifact_dir = replay_root.join(artifact_dir_name(&input_envelope));
     fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("creating replay artifact dir {}", artifact_dir.display()))?;
 
     let mut warnings = Vec::new();
-    let copied_audio_file = match copy_audio_if_available(&artifact_dir, recorded) {
+    let copied_audio_file = match retain_audio_if_available(
+        &artifact_dir,
+        &recorded,
+        config.logging.replay_retain_audio,
+    ) {
         Ok(path) => path,
         Err(error) => {
-            warnings.push(format!("audio_copy_failed: {error:#}"));
+            warnings.push(format!("audio_retention_failed: {error:#}"));
             None
         }
+    };
+    let replay_retention_days = config.logging.replay_retention_days;
+    let replay_max_bytes = config.logging.replay_max_bytes;
+    let refine_context = replay_refine_context(&config);
+    let redacted_config = redacted_config_snapshot(config.clone());
+    let resolution = ReplayResolutionContext {
+        target_context: resolved.target_context,
+        matched_rule_id: resolved.matched_rule_id,
+        profile_id: resolved.profile_id,
+        voice_id: resolved.voice_id,
+        voice_glyph: resolved.voice_glyph,
+        fallback_reason: resolved.fallback_reason,
     };
 
     let record = ReplayRecord {
@@ -86,33 +120,39 @@ pub fn persist_replay(
         started_at: input_envelope.started_at.clone(),
         copied_audio_file,
         warnings,
-        redacted_config: redacted_config_snapshot(config),
-        refine_context: replay_refine_context(config),
+        redacted_config,
+        resolution,
+        refine_context,
         input_envelope: sanitized_envelope_for_replay(input_envelope),
         pipeline_outcome: sanitized_pipeline_outcome_for_replay(outcome),
-        injection_route: route.clone(),
+        injection_route: route,
     };
 
-    let record_json =
-        serde_json::to_vec_pretty(&record).context("serializing replay record to JSON")?;
-    fs::write(artifact_dir.join("record.json"), record_json)
-        .with_context(|| format!("writing replay record in {}", artifact_dir.display()))?;
+    let record_path = artifact_dir.join("record.json");
+    let file = fs::File::create(&record_path)
+        .with_context(|| format!("creating replay record at {}", record_path.display()))?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &record)
+        .context("serializing replay record to JSON")?;
+    writer
+        .flush()
+        .with_context(|| format!("flushing replay record at {}", record_path.display()))?;
 
-    prune_replay_root(
+    maybe_prune_replay_root(
         &replay_root,
-        config.logging.replay_retention_days,
-        config.logging.replay_max_bytes,
+        replay_retention_days,
+        replay_max_bytes,
+        SystemTime::now(),
     )?;
 
     Ok(Some(artifact_dir))
 }
 
-fn redacted_config_snapshot(config: &AppConfig) -> Value {
-    let mut snapshot = config.clone();
-    snapshot.providers.openai.api_key = None;
-    snapshot.providers.google.api_key = None;
-    snapshot.providers.google.token = None;
-    let mut value = serde_json::to_value(snapshot).expect("AppConfig should serialize to JSON");
+fn redacted_config_snapshot(mut config: AppConfig) -> Value {
+    config.providers.openai.api_key = None;
+    config.providers.google.api_key = None;
+    config.providers.google.token = None;
+    let mut value = serde_json::to_value(config).expect("AppConfig should serialize to JSON");
     if let Some(transcript) = value.get_mut("transcript").and_then(Value::as_object_mut) {
         transcript.remove("system_prompt");
     }
@@ -135,53 +175,61 @@ fn replay_refine_context(config: &AppConfig) -> Option<ReplayRefineContext> {
     })
 }
 
-fn sanitized_envelope_for_replay(envelope: &MuninnEnvelopeV1) -> MuninnEnvelopeV1 {
+fn sanitized_envelope_for_replay(envelope: MuninnEnvelopeV1) -> MuninnEnvelopeV1 {
     sanitize_envelope(envelope, true)
 }
 
-fn sanitized_pipeline_outcome_for_replay(outcome: &PipelineOutcome) -> PipelineOutcome {
-    match outcome {
-        PipelineOutcome::Completed { envelope, trace } => PipelineOutcome::Completed {
-            envelope: sanitized_envelope_for_replay(envelope),
-            trace: sanitized_trace_for_replay(trace),
-        },
+fn sanitized_pipeline_outcome_for_replay(mut outcome: PipelineOutcome) -> PipelineOutcome {
+    match &mut outcome {
+        PipelineOutcome::Completed { envelope, trace } => {
+            sanitize_trace_for_replay(trace);
+            sanitize_envelope_in_place(envelope, true);
+        }
         PipelineOutcome::FallbackRaw {
-            envelope,
-            trace,
-            reason,
-        } => PipelineOutcome::FallbackRaw {
-            envelope: sanitized_envelope_for_replay(envelope),
-            trace: sanitized_trace_for_replay(trace),
-            reason: reason.clone(),
-        },
-        PipelineOutcome::Aborted { trace, reason } => PipelineOutcome::Aborted {
-            trace: sanitized_trace_for_replay(trace),
-            reason: reason.clone(),
-        },
+            envelope, trace, ..
+        } => {
+            sanitize_trace_for_replay(trace);
+            sanitize_envelope_in_place(envelope, true);
+        }
+        PipelineOutcome::Aborted { trace, .. } => {
+            sanitize_trace_for_replay(trace);
+        }
+    }
+    outcome
+}
+
+fn sanitize_trace_for_replay(trace: &mut [PipelineTraceEntry]) {
+    for entry in trace {
+        entry.stderr.clear();
     }
 }
 
-fn sanitized_trace_for_replay(trace: &[PipelineTraceEntry]) -> Vec<PipelineTraceEntry> {
-    trace
-        .iter()
-        .cloned()
-        .map(|mut entry| {
-            entry.stderr.clear();
-            entry
-        })
-        .collect()
+fn sanitize_envelope(
+    mut envelope: MuninnEnvelopeV1,
+    clear_system_prompt: bool,
+) -> MuninnEnvelopeV1 {
+    sanitize_envelope_in_place(&mut envelope, clear_system_prompt);
+    envelope
 }
 
-fn sanitize_envelope(envelope: &MuninnEnvelopeV1, clear_system_prompt: bool) -> MuninnEnvelopeV1 {
-    let mut value = serde_json::to_value(envelope).expect("MuninnEnvelopeV1 should serialize");
-    sanitize_value(&mut value);
-
-    let mut sanitized: MuninnEnvelopeV1 =
-        serde_json::from_value(value).expect("sanitized envelope should deserialize");
+fn sanitize_envelope_in_place(envelope: &mut MuninnEnvelopeV1, clear_system_prompt: bool) {
+    sanitize_object(&mut envelope.audio.extra);
+    sanitize_object(&mut envelope.transcript.extra);
+    sanitize_object(&mut envelope.output.extra);
+    sanitize_object(&mut envelope.extra);
+    sanitize_values(&mut envelope.uncertain_spans);
+    sanitize_values(&mut envelope.candidates);
+    sanitize_values(&mut envelope.replacements);
+    sanitize_values(&mut envelope.errors);
     if clear_system_prompt {
-        sanitized.transcript.system_prompt = None;
+        envelope.transcript.system_prompt = None;
     }
-    sanitized
+}
+
+fn sanitize_values(values: &mut [Value]) {
+    for value in values {
+        sanitize_value(value);
+    }
 }
 
 fn sanitize_value(value: &mut Value) {
@@ -248,10 +296,15 @@ fn sanitize_component(value: &str) -> String {
         .collect()
 }
 
-fn copy_audio_if_available(
+fn retain_audio_if_available(
     artifact_dir: &Path,
     recorded: &RecordedAudio,
+    replay_retain_audio: bool,
 ) -> Result<Option<String>> {
+    if !replay_retain_audio {
+        return Ok(None);
+    }
+
     if !recorded.wav_path.exists() {
         return Ok(None);
     }
@@ -264,15 +317,59 @@ fn copy_audio_if_available(
     let file_name = format!("audio.{extension}");
     let target = artifact_dir.join(&file_name);
 
-    fs::copy(&recorded.wav_path, &target).with_context(|| {
-        format!(
-            "copying recorded audio from {} to {}",
-            recorded.wav_path.display(),
-            target.display()
-        )
-    })?;
+    retain_audio_file(&recorded.wav_path, &target)?;
 
     Ok(Some(file_name))
+}
+
+fn retain_audio_file(source: &Path, target: &Path) -> Result<()> {
+    match fs::hard_link(source, target) {
+        Ok(()) => Ok(()),
+        Err(link_error) => {
+            fs::copy(source, target).with_context(|| {
+                format!(
+                    "retaining recorded audio from {} to {} after hard_link failed: {}",
+                    source.display(),
+                    target.display(),
+                    link_error
+                )
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn maybe_prune_replay_root(
+    root: &Path,
+    retention_days: u32,
+    max_bytes: u64,
+    now: SystemTime,
+) -> Result<()> {
+    let now_secs = seconds_since_epoch(now);
+    let last_prune_secs = LAST_REPLAY_PRUNE_AT_SECS.load(Ordering::Relaxed);
+    if !should_prune_replay(last_prune_secs, now_secs, REPLAY_PRUNE_THROTTLE_SECS) {
+        return Ok(());
+    }
+
+    match LAST_REPLAY_PRUNE_AT_SECS.compare_exchange(
+        last_prune_secs,
+        now_secs,
+        Ordering::SeqCst,
+        Ordering::SeqCst,
+    ) {
+        Ok(_) => prune_replay_root(root, retention_days, max_bytes),
+        Err(_) => Ok(()),
+    }
+}
+
+fn should_prune_replay(last_prune_secs: u64, now_secs: u64, interval_secs: u64) -> bool {
+    last_prune_secs == 0 || now_secs.saturating_sub(last_prune_secs) >= interval_secs
+}
+
+fn seconds_since_epoch(now: SystemTime) -> u64 {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn prune_replay_root(root: &Path, retention_days: u32, max_bytes: u64) -> Result<()> {
@@ -375,8 +472,13 @@ mod tests {
     use super::*;
     use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
     use muninn::PipelineOutcome;
-    use muninn::{InjectionRoute, InjectionRouteReason, InjectionTarget, PipelinePolicyApplied};
+    use muninn::{
+        InjectionRoute, InjectionRouteReason, InjectionTarget, PipelinePolicyApplied,
+        ResolvedUtteranceConfig, TargetContextSnapshot,
+    };
     use serde_json::Value;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
 
     fn temp_dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -392,6 +494,7 @@ mod tests {
     fn sample_config(root: &Path) -> AppConfig {
         let mut config = AppConfig::launchable_default();
         config.logging.replay_enabled = true;
+        config.logging.replay_retain_audio = true;
         config.logging.replay_dir = root.to_path_buf();
         config.logging.replay_retention_days = 7;
         config.logging.replay_max_bytes = 10_000_000;
@@ -407,6 +510,23 @@ mod tests {
             on_error: OnErrorPolicy::Continue,
         }];
         config
+    }
+
+    fn sample_resolved(root: &Path) -> ResolvedUtteranceConfig {
+        ResolvedUtteranceConfig {
+            target_context: TargetContextSnapshot {
+                bundle_id: Some("com.openai.codex".to_string()),
+                app_name: Some("Codex".to_string()),
+                window_title: Some("muninn".to_string()),
+                captured_at: "2026-03-06T10:00:00Z".to_string(),
+            },
+            matched_rule_id: Some("codex".to_string()),
+            profile_id: "default".to_string(),
+            voice_id: Some("codex_focus".to_string()),
+            voice_glyph: Some('C'),
+            fallback_reason: None,
+            effective_config: sample_config(root),
+        }
     }
 
     fn sample_envelope() -> MuninnEnvelopeV1 {
@@ -473,7 +593,7 @@ mod tests {
     #[test]
     fn redacts_provider_secrets_from_replay_snapshot() {
         let config = sample_config(Path::new("/tmp/replay"));
-        let snapshot = redacted_config_snapshot(&config);
+        let snapshot = redacted_config_snapshot(config);
 
         assert_eq!(snapshot["providers"]["openai"]["api_key"], Value::Null);
         assert_eq!(snapshot["providers"]["google"]["api_key"], Value::Null);
@@ -505,7 +625,7 @@ mod tests {
             }),
         );
 
-        let sanitized = sanitized_envelope_for_replay(&envelope);
+        let sanitized = sanitized_envelope_for_replay(envelope);
 
         assert_eq!(
             sanitized.extra["providers"]["openai"]["api_key"],
@@ -558,19 +678,19 @@ mod tests {
     }
 
     #[test]
-    fn persist_replay_writes_record_and_audio_copy() {
+    fn persist_replay_writes_record_and_audio_retention_artifact() {
         let root = temp_dir("persist");
-        let config = sample_config(&root);
+        let resolved = sample_resolved(&root);
         let source_audio = root.join("source.wav");
         fs::write(&source_audio, b"wave").expect("write source audio");
         let recorded = RecordedAudio::new(&source_audio, 1450);
 
         let artifact_dir = persist_replay(
-            &config,
-            &sample_envelope(),
-            &sample_outcome(),
-            &sample_route(),
-            &recorded,
+            resolved,
+            sample_envelope(),
+            sample_outcome(),
+            sample_route(),
+            recorded,
         )
         .expect("persist replay should succeed")
         .expect("replay should be written");
@@ -613,6 +733,84 @@ mod tests {
             record["copied_audio_file"],
             Value::String("audio.wav".to_string())
         );
+        assert_eq!(
+            record["resolution"]["target_context"]["bundle_id"],
+            Value::String("com.openai.codex".to_string())
+        );
+        assert_eq!(
+            record["resolution"]["matched_rule_id"],
+            Value::String("codex".to_string())
+        );
+        assert_eq!(
+            record["resolution"]["voice_glyph"],
+            Value::String("C".to_string())
+        );
+    }
+
+    #[test]
+    fn persist_replay_skips_audio_retention_when_disabled() {
+        let root = temp_dir("persist-no-audio");
+        let mut resolved = sample_resolved(&root);
+        resolved.effective_config.logging.replay_retain_audio = false;
+        let source_audio = root.join("source.wav");
+        fs::write(&source_audio, b"wave").expect("write source audio");
+        let recorded = RecordedAudio::new(&source_audio, 1450);
+
+        let artifact_dir = persist_replay(
+            resolved,
+            sample_envelope(),
+            sample_outcome(),
+            sample_route(),
+            recorded,
+        )
+        .expect("persist replay should succeed")
+        .expect("replay should be written");
+
+        let record: Value = serde_json::from_str(
+            &fs::read_to_string(artifact_dir.join("record.json")).expect("read replay record"),
+        )
+        .expect("parse replay record");
+
+        assert!(!artifact_dir.join("audio.wav").exists());
+        assert_eq!(record["copied_audio_file"], Value::Null);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn replay_audio_retention_prefers_hard_link() {
+        let root = temp_dir("retain-link");
+        let source_audio = root.join("source.wav");
+        let artifact_dir = root.join("artifact");
+        fs::create_dir_all(&artifact_dir).expect("create artifact dir");
+        fs::write(&source_audio, b"wave").expect("write source audio");
+        let recorded = RecordedAudio::new(&source_audio, 1450);
+
+        let retained = retain_audio_if_available(&artifact_dir, &recorded, true)
+            .expect("audio retention should succeed")
+            .expect("audio file should be retained");
+        let retained_path = artifact_dir.join(retained);
+        let source_metadata = fs::metadata(&source_audio).expect("source metadata");
+        let retained_metadata = fs::metadata(&retained_path).expect("retained metadata");
+
+        assert_eq!(source_metadata.dev(), retained_metadata.dev());
+        assert_eq!(source_metadata.ino(), retained_metadata.ino());
+    }
+
+    #[test]
+    fn replay_audio_retention_falls_back_to_copy_when_link_fails() {
+        let root = temp_dir("retain-copy");
+        let source_audio = root.join("source.wav");
+        let target_audio = root.join("artifact").join("audio.wav");
+        fs::create_dir_all(target_audio.parent().expect("target parent")).expect("artifact dir");
+        fs::write(&source_audio, b"wave").expect("write source audio");
+        fs::write(&target_audio, b"stale").expect("seed target to force hard_link failure");
+
+        retain_audio_file(&source_audio, &target_audio).expect("copy fallback should succeed");
+
+        assert_eq!(
+            fs::read(&target_audio).expect("read retained audio"),
+            b"wave".to_vec()
+        );
     }
 
     #[test]
@@ -627,13 +825,27 @@ mod tests {
         let source_audio = root.join("source.wav");
         fs::write(&source_audio, b"wave").expect("write source audio");
         let recorded = RecordedAudio::new(&source_audio, 1450);
+        let resolved = ResolvedUtteranceConfig {
+            target_context: TargetContextSnapshot {
+                bundle_id: Some("com.apple.Terminal".to_string()),
+                app_name: Some("Terminal".to_string()),
+                window_title: Some("cargo test".to_string()),
+                captured_at: "2026-03-06T11:00:00Z".to_string(),
+            },
+            matched_rule_id: Some("terminal".to_string()),
+            profile_id: "default".to_string(),
+            voice_id: Some("terminal_terse".to_string()),
+            voice_glyph: Some('T'),
+            fallback_reason: None,
+            effective_config: config.clone(),
+        };
 
         let artifact_dir = persist_replay(
-            &config,
-            &sample_envelope(),
-            &sample_outcome(),
-            &sample_route(),
-            &recorded,
+            resolved,
+            sample_envelope(),
+            sample_outcome(),
+            sample_route(),
+            recorded,
         )
         .expect("persist replay should succeed")
         .expect("replay should be written");
@@ -660,7 +872,7 @@ mod tests {
     #[test]
     fn persist_replay_redacts_envelope_secret_fields() {
         let root = temp_dir("persist-envelope-secrets");
-        let config = sample_config(&root);
+        let resolved = sample_resolved(&root);
         let source_audio = root.join("source.wav");
         fs::write(&source_audio, b"wave").expect("write source audio");
         let recorded = RecordedAudio::new(&source_audio, 1450);
@@ -677,15 +889,10 @@ mod tests {
             }),
         );
 
-        let artifact_dir = persist_replay(
-            &config,
-            &envelope,
-            &sample_outcome(),
-            &sample_route(),
-            &recorded,
-        )
-        .expect("persist replay should succeed")
-        .expect("replay should be written");
+        let artifact_dir =
+            persist_replay(resolved, envelope, sample_outcome(), sample_route(), recorded)
+                .expect("persist replay should succeed")
+                .expect("replay should be written");
 
         let record: Value = serde_json::from_str(
             &fs::read_to_string(artifact_dir.join("record.json")).expect("read replay record"),
@@ -696,5 +903,12 @@ mod tests {
             record["input_envelope"]["config"]["providers"]["google"]["token"],
             Value::String(REDACTED_VALUE.to_string())
         );
+    }
+
+    #[test]
+    fn prune_throttle_requires_interval_gap() {
+        assert!(should_prune_replay(0, 10, 60));
+        assert!(!should_prune_replay(100, 120, 60));
+        assert!(should_prune_replay(100, 160, 60));
     }
 }

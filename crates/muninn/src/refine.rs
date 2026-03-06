@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::sync::OnceLock;
 
 use muninn::config::{RefineConfig, RefineProvider};
 use muninn::resolve_secret;
@@ -41,7 +42,7 @@ If the transcript is already acceptable, return it unchanged.
 Return only the corrected transcript text."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CliError {
+pub(crate) struct CliError {
     code: &'static str,
     message: String,
 }
@@ -54,7 +55,7 @@ impl CliError {
         }
     }
 
-    fn to_stderr_json(&self) -> String {
+    pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
                 "code": self.code,
@@ -62,6 +63,10 @@ impl CliError {
             }
         })
         .to_string()
+    }
+
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -115,49 +120,29 @@ fn run_cli() -> Result<(), CliError> {
         })?;
 
     runtime.block_on(async {
-        let mut input = String::new();
-        io::stdin().read_to_string(&mut input).map_err(|source| {
-            CliError::new(
-                "stdin_read_failed",
-                format!("failed to read stdin: {source}"),
-            )
-        })?;
+        let envelope = read_envelope_from_reader(io::stdin().lock())?;
 
         let config = load_refine_config_from_config();
         let env_lookup = |key: &str| std::env::var(key).ok();
-        let output = process_input(&input, &env_lookup, &config).await?;
+        let output = process_input(envelope, &env_lookup, &config).await?;
 
-        io::stdout()
-            .write_all(output.as_bytes())
-            .map_err(|source| {
-                CliError::new(
-                    "stdout_write_failed",
-                    format!("failed to write stdout: {source}"),
-                )
-            })?;
+        write_envelope_to_writer(io::stdout().lock(), &output)?;
 
         Ok(())
     })
 }
 
 async fn process_input<F>(
-    input: &str,
+    mut envelope: MuninnEnvelopeV1,
     get_env: &F,
     config: &ResolvedRefineConfig,
-) -> Result<String, CliError>
+) -> Result<MuninnEnvelopeV1, CliError>
 where
     F: Fn(&str) -> Option<String>,
 {
-    let mut envelope: MuninnEnvelopeV1 = serde_json::from_str(input).map_err(|source| {
-        CliError::new(
-            "invalid_envelope_json",
-            format!("stdin must be valid MuninnEnvelopeV1 JSON: {source}"),
-        )
-    })?;
-
     let Some(raw_text) = non_empty_text(&envelope.transcript.raw_text).map(ToOwned::to_owned)
     else {
-        return serialize_envelope(&envelope);
+        return Ok(envelope);
     };
 
     let candidate = if let Some(stub_text) =
@@ -180,7 +165,16 @@ where
     };
 
     apply_refinement(&mut envelope, &raw_text, &candidate, config);
-    serialize_envelope(&envelope)
+    Ok(envelope)
+}
+
+pub(crate) async fn process_input_in_process(
+    input: &MuninnEnvelopeV1,
+    config: &AppConfig,
+) -> Result<MuninnEnvelopeV1, CliError> {
+    let env_lookup = |key: &str| std::env::var(key).ok();
+    let resolved = resolved_config_from_app_config(config);
+    process_input(input.clone(), &env_lookup, &resolved).await
 }
 
 async fn refine_with_openai(
@@ -189,7 +183,7 @@ async fn refine_with_openai(
     hint_prompt: &str,
     raw_text: &str,
 ) -> Result<String, CliError> {
-    let response = reqwest::Client::new()
+    let response = http_client()
         .post(&config.endpoint)
         .bearer_auth(api_key)
         .json(&json!({
@@ -240,6 +234,11 @@ async fn refine_with_openai(
     }
 
     extract_chat_completion_text(&body)
+}
+
+fn http_client() -> &'static reqwest::Client {
+    static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    HTTP_CLIENT.get_or_init(reqwest::Client::new)
 }
 
 fn extract_chat_completion_text(body: &[u8]) -> Result<String, CliError> {
@@ -446,8 +445,23 @@ const fn min3(a: usize, b: usize, c: usize) -> usize {
     }
 }
 
-fn serialize_envelope(envelope: &MuninnEnvelopeV1) -> Result<String, CliError> {
-    serde_json::to_string(envelope).map_err(|source| {
+fn read_envelope_from_reader<R>(reader: R) -> Result<MuninnEnvelopeV1, CliError>
+where
+    R: Read,
+{
+    serde_json::from_reader(reader).map_err(|source| {
+        CliError::new(
+            "stdin_read_failed",
+            format!("failed to read stdin envelope JSON: {source}"),
+        )
+    })
+}
+
+fn write_envelope_to_writer<W>(writer: W, envelope: &MuninnEnvelopeV1) -> Result<(), CliError>
+where
+    W: Write,
+{
+    serde_json::to_writer(writer, envelope).map_err(|source| {
         CliError::new(
             "envelope_serialize_failed",
             format!("failed to serialize output envelope: {source}"),
@@ -460,18 +474,7 @@ fn load_refine_config_from_config() -> ResolvedRefineConfig {
 
     AppConfig::load()
         .ok()
-        .map(|config| ResolvedRefineConfig {
-            provider: config.refine.provider,
-            hint_prompt: config.transcript.system_prompt,
-            endpoint: config.refine.endpoint,
-            model: config.refine.model,
-            temperature: config.refine.temperature,
-            max_output_tokens: config.refine.max_output_tokens,
-            max_length_delta_ratio: config.refine.max_length_delta_ratio,
-            max_token_change_ratio: config.refine.max_token_change_ratio,
-            max_new_word_count: config.refine.max_new_word_count,
-            api_key: resolve_secret(None, config.providers.openai.api_key),
-        })
+        .map(|config| resolved_config_from_app_config(&config))
         .unwrap_or_else(|| {
             let mut resolved = ResolvedRefineConfig::from_config(
                 &defaults.refine,
@@ -480,6 +483,13 @@ fn load_refine_config_from_config() -> ResolvedRefineConfig {
             resolved.hint_prompt = defaults.transcript.system_prompt;
             resolved
         })
+}
+
+fn resolved_config_from_app_config(config: &AppConfig) -> ResolvedRefineConfig {
+    let mut resolved =
+        ResolvedRefineConfig::from_config(&config.refine, config.providers.openai.api_key.clone());
+    resolved.hint_prompt = config.transcript.system_prompt.clone();
+    resolved
 }
 
 impl ResolvedRefineConfig {
@@ -546,23 +556,20 @@ mod tests {
     async fn missing_raw_text_is_noop() {
         let mut envelope = baseline_envelope();
         envelope.transcript.raw_text = None;
-        let input = serde_json::to_string(&envelope).expect("serialize");
 
-        let output = process_input(&input, &|_| Some("unused".to_string()), &config())
+        let output = process_input(envelope.clone(), &|_| Some("unused".to_string()), &config())
             .await
             .expect("process");
-        let actual: MuninnEnvelopeV1 = serde_json::from_str(&output).expect("decode");
 
-        assert_eq!(actual, envelope);
+        assert_eq!(output, envelope);
     }
 
     #[tokio::test]
     async fn stub_refinement_sets_output_final_text_and_preserves_raw() {
         let envelope = baseline_envelope().with_output_final_text("");
-        let input = serde_json::to_string(&envelope).expect("serialize");
 
         let output = process_input(
-            &input,
+            envelope,
             &|key| match key {
                 "MUNINN_REFINE_STUB_TEXT" => Some("PostHog env variable path .env".to_string()),
                 _ => None,
@@ -571,26 +578,24 @@ mod tests {
         )
         .await
         .expect("process");
-        let actual: MuninnEnvelopeV1 = serde_json::from_str(&output).expect("decode");
 
         assert_eq!(
-            actual.transcript.raw_text.as_deref(),
+            output.transcript.raw_text.as_deref(),
             Some("post gog env variable path dot env")
         );
         assert_eq!(
-            actual.output.final_text.as_deref(),
+            output.output.final_text.as_deref(),
             Some("PostHog env variable path .env")
         );
-        assert_eq!(actual.extra.get("keep"), Some(&json!({"ok": true})));
+        assert_eq!(output.extra.get("keep"), Some(&json!({"ok": true})));
     }
 
     #[tokio::test]
     async fn rejected_rewrite_preserves_text_and_records_error() {
         let envelope = baseline_envelope().with_output_final_text("");
-        let input = serde_json::to_string(&envelope).expect("serialize");
 
         let output = process_input(
-            &input,
+            envelope,
             &|key| match key {
                 "MUNINN_REFINE_STUB_TEXT" => Some(
                     "This is a completely rewritten sentence with many extra tokens added"
@@ -602,16 +607,15 @@ mod tests {
         )
         .await
         .expect("process");
-        let actual: MuninnEnvelopeV1 = serde_json::from_str(&output).expect("decode");
 
         assert_eq!(
-            actual.transcript.raw_text.as_deref(),
+            output.transcript.raw_text.as_deref(),
             Some("post gog env variable path dot env")
         );
-        assert_eq!(actual.output.final_text.as_deref(), Some(""));
-        assert_eq!(actual.errors.len(), 1);
+        assert_eq!(output.output.final_text.as_deref(), Some(""));
+        assert_eq!(output.errors.len(), 1);
         assert_eq!(
-            actual.errors[0].get("code").and_then(Value::as_str),
+            output.errors[0].get("code").and_then(Value::as_str),
             Some("refine_rejected")
         );
     }
@@ -619,9 +623,8 @@ mod tests {
     #[tokio::test]
     async fn missing_api_key_errors_without_stub() {
         let envelope = baseline_envelope().with_output_final_text("");
-        let input = serde_json::to_string(&envelope).expect("serialize");
 
-        let error = process_input(&input, &|_| None, &config())
+        let error = process_input(envelope, &|_| None, &config())
             .await
             .expect_err("missing key must fail");
 
@@ -659,5 +662,16 @@ mod tests {
         .expect("extract text");
 
         assert_eq!(text, "Ship it to PostHog");
+    }
+
+    #[test]
+    fn reader_and_writer_roundtrip_envelope_json() {
+        let envelope = baseline_envelope();
+        let mut output = Vec::new();
+
+        write_envelope_to_writer(&mut output, &envelope).expect("write envelope");
+        let decoded = read_envelope_from_reader(output.as_slice()).expect("read envelope");
+
+        assert_eq!(decoded, envelope);
     }
 }
