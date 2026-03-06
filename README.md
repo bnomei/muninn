@@ -129,7 +129,7 @@ system_prompt = "Preserve shell commands exactly. Prefer minimal punctuation cha
 
 [voices.mail]
 indicator_glyph = "E"
-system_prompt = "Prefer polished email prose while preserving names and quoted text."
+system_prompt = "Correct spelling and obvious grammar in the language already being used. Preserve the intended language, names, quoted text, URLs, and code. Do not translate."
 
 [profiles.codex]
 voice = "codex"
@@ -159,6 +159,11 @@ bundle_id = "org.alacritty"
 id = "mail-app"
 profile = "mail"
 bundle_id_prefix = "com.apple.mail"
+
+[[profile_rules]]
+id = "proton-mail-app"
+profile = "mail"
+bundle_id = "ch.protonmail.desktop"
 ```
 
 Resolution order is:

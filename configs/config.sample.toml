@@ -116,7 +116,7 @@ max_new_word_count = 2
 #
 # [voices.mail]
 # indicator_glyph = "E"
-# system_prompt = "Prefer polished email prose while preserving names, dates, and quoted text."
+# system_prompt = "Correct spelling and obvious grammar in the language already being used. Preserve the intended language, names, quoted text, URLs, and code. Do not translate."
 #
 # [profiles.codex]
 # voice = "codex"
@@ -146,6 +146,11 @@ max_new_word_count = 2
 # id = "mail-app"
 # profile = "mail"
 # bundle_id_prefix = "com.apple.mail"
+#
+# [[profile_rules]]
+# id = "proton-mail-app"
+# profile = "mail"
+# bundle_id = "ch.protonmail.desktop"
 #
 # If no rule matches, Muninn falls back to app.profile. If that profile has no voice,
 # the idle tray glyph stays at the default M.
