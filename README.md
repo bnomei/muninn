@@ -183,7 +183,7 @@ This is the shortest path to a working local setup.
 ### 1) Build the app
 
 ```bash
-cargo build -p muninn-speach-to-text
+cargo build
 ```
 
 ### 2) Resolve the config path
@@ -227,7 +227,7 @@ Muninn now tries to load `./.env` from the current working directory by default.
 ### 4) Run the tray app
 
 ```bash
-MUNINN_CONFIG="$PWD/configs/config.sample.toml" cargo run -p muninn-speach-to-text
+MUNINN_CONFIG="$PWD/configs/config.sample.toml" cargo run
 ```
 
 Optional macOS autostart:
@@ -247,10 +247,10 @@ macOS permissions required:
 Optional. Built-ins can be run directly with:
 
 ```bash
-cargo run -q -p muninn-speach-to-text -- __internal_step <stt_openai|stt_google|refine>
+cargo run -q -- __internal_step <stt_openai|stt_google|refine>
 ```
 
-Use the fixtures in `crates/muninn/tests/fixtures/` when you want example input.
+Use the fixtures in `tests/fixtures/` when you want example input.
 
 ## Built-In Step Behavior
 

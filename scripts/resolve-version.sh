@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_NAME="${PACKAGE_NAME:-muninn-speach-to-text}"
-
 if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
   version="${GITHUB_REF_NAME#v}"
 else
@@ -14,14 +12,11 @@ meta = json.loads(
     subprocess.check_output(["cargo", "metadata", "--no-deps", "--format-version", "1"])
 )
 
-package_name = __import__("os").environ["PACKAGE_NAME"]
+packages = meta["packages"]
+if len(packages) != 1:
+    raise SystemExit(f"expected exactly one package, found {len(packages)}")
 
-for package in meta["packages"]:
-    if package["name"] == package_name:
-        print(package["version"])
-        break
-else:
-    raise SystemExit(f"{package_name} package not found in cargo metadata")
+print(packages[0]["version"])
 PY
 )"
 fi

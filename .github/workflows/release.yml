@@ -10,7 +10,6 @@ permissions:
   contents: write
 
 env:
-  PACKAGE_NAME: muninn-speach-to-text
   BIN_NAME: muninn
 
 jobs:
@@ -40,7 +39,7 @@ jobs:
         run: scripts/resolve-version.sh
 
       - name: Build
-        run: TARGET=${{ matrix.target }} PACKAGE_NAME=${{ env.PACKAGE_NAME }} BIN_NAME=${{ env.BIN_NAME }} scripts/build-release.sh
+        run: TARGET=${{ matrix.target }} BIN_NAME=${{ env.BIN_NAME }} scripts/build-release.sh
 
       - name: Package
         run: TARGET=${{ matrix.target }} VERSION=${{ steps.version.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/package-release.sh
