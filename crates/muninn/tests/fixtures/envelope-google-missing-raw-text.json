@@ -1,0 +1,58 @@
+{
+  "schema": "muninn.envelope.v1",
+  "utterance_id": "utt-google-fixture-missing-raw",
+  "started_at": "2026-03-05T17:35:00Z",
+  "audio": {
+    "wav_path": "/tmp/utt-google-missing.wav",
+    "duration_ms": 870,
+    "codec": "pcm_s16le",
+    "sample_rate_hz": 16000
+  },
+  "transcript": {
+    "system_prompt": "Keep capitalization and punctuation.",
+    "provider": "legacy-stt",
+    "language": "en-US",
+    "domain": "support"
+  },
+  "uncertain_spans": [
+    {
+      "start": 0,
+      "end": 6,
+      "text": "googel",
+      "score": 0.53
+    }
+  ],
+  "candidates": [
+    {
+      "value": "Google",
+      "score": 0.88
+    }
+  ],
+  "replacements": [
+    {
+      "from": "googel",
+      "to": "Google",
+      "score": 0.88
+    }
+  ],
+  "output": {
+    "tone": "neutral"
+  },
+  "errors": [
+    {
+      "code": "preexisting_warning",
+      "message": "fixture warning"
+    }
+  ],
+  "metadata": {
+    "source": "fixture",
+    "trace_id": "trace-google-002"
+  },
+  "providers": {
+    "google": {
+      "api_key": "fixture-google-key",
+      "token": "fixture-google-token",
+      "model": "latest_long"
+    }
+  }
+}

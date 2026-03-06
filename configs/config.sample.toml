@@ -1,0 +1,113 @@
+# Muninn sample config. Copy this file to your resolved config path.
+# Path precedence: MUNINN_CONFIG -> $XDG_CONFIG_HOME/muninn/config.toml -> ~/.config/muninn/config.toml
+
+[app]
+profile = "default"
+strict_step_contract = true
+
+[hotkeys.push_to_talk]
+trigger = "double_tap"
+chord = ["ctrl"]
+double_tap_timeout_ms = 300
+
+[hotkeys.done_mode_toggle]
+trigger = "press"
+chord = ["ctrl", "shift", "d"]
+
+[hotkeys.cancel_current_capture]
+trigger = "press"
+chord = ["ctrl", "shift", "x"]
+
+[indicator]
+show_recording = true
+show_processing = true
+
+[indicator.colors]
+idle = "#636366"
+recording = "#FF9F0A"
+transcribing = "#0A84FF"
+pipeline = "#BF5AF2"
+output = "#30D158"
+cancelled = "#FF453A"
+outline = "#2C2C2E"
+glyph = "#FFFFFF"
+
+[pipeline]
+deadline_ms = 20000
+payload_format = "json_object"
+
+# OpenAI wrapper example (active)
+[[pipeline.steps]]
+id = "stt_openai"
+cmd = "stt_openai"
+timeout_ms = 18000
+on_error = "abort"
+
+# Built-in minimal refine step (active)
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 2500
+on_error = "continue"
+
+# External text filter example (optional)
+# [[pipeline.steps]]
+# id = "uppercase"
+# cmd = "/usr/bin/tr"
+# args = ["[:lower:]", "[:upper:]"]
+# timeout_ms = 250
+# on_error = "continue"
+#
+# External JSON-envelope step (opt-in)
+# [[pipeline.steps]]
+# id = "json_transform"
+# cmd = "/opt/homebrew/bin/jq"
+# args = ["-c", ".output.final_text |= ascii_upcase"]
+# io_mode = "envelope_json"
+# timeout_ms = 250
+# on_error = "continue"
+
+# Google wrapper example (alternative)
+# [[pipeline.steps]]
+# id = "stt_google"
+# cmd = "stt_google"
+# timeout_ms = 18000
+# on_error = "abort"
+
+[scoring]
+min_top_score = 0.84
+min_margin = 0.10
+acronym_min_top_score = 0.90
+acronym_min_margin = 0.15
+
+[transcript]
+system_prompt = "Prefer minimal corrections. Focus on technical terms, developer tools, package names, commands, flags, file names, paths, env vars, acronyms, and obvious dictation errors. If uncertain, keep the original wording."
+
+[refine]
+provider = "openai"
+endpoint = "https://api.openai.com/v1/chat/completions"
+model = "gpt-4.1-mini"
+temperature = 0.0
+max_output_tokens = 512
+max_length_delta_ratio = 0.25
+max_token_change_ratio = 0.60
+max_new_word_count = 2
+
+[logging]
+replay_enabled = false
+replay_dir = "~/.local/state/muninn/replay"
+replay_retention_days = 7
+replay_max_bytes = 52_428_800
+
+[providers.openai]
+# api_key = "set via OPENAI_API_KEY"
+endpoint = "https://api.openai.com/v1/audio/transcriptions"
+model = "gpt-4o-mini-transcribe"
+
+[providers.google]
+# api_key = "set via GOOGLE_API_KEY"
+# token = "set via GOOGLE_STT_TOKEN"
+# endpoint can also be overridden with GOOGLE_STT_ENDPOINT
+endpoint = "https://speech.googleapis.com/v1/speech:recognize"
+# model = "latest_short"
+# model can also be overridden with GOOGLE_STT_MODEL

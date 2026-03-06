@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PACKAGE_NAME: muninn-voice-to-text
+  BIN_NAME: muninn
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: scripts/resolve-version.sh
+
+      - name: Build
+        run: TARGET=${{ matrix.target }} PACKAGE_NAME=${{ env.PACKAGE_NAME }} BIN_NAME=${{ env.BIN_NAME }} scripts/build-release.sh
+
+      - name: Package
+        run: TARGET=${{ matrix.target }} VERSION=${{ steps.version.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/package-release.sh
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+      - name: Upload GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

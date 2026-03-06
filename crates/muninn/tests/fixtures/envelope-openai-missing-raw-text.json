@@ -1,0 +1,57 @@
+{
+  "schema": "muninn.envelope.v1",
+  "utterance_id": "utt-openai-fixture-missing-raw",
+  "started_at": "2026-03-05T17:35:00Z",
+  "audio": {
+    "wav_path": "/tmp/utt-openai-missing.wav",
+    "duration_ms": 900,
+    "codec": "pcm_s16le",
+    "sample_rate_hz": 16000
+  },
+  "transcript": {
+    "system_prompt": "Keep capitalization and punctuation.",
+    "provider": "legacy-stt",
+    "language": "en-US",
+    "domain": "support"
+  },
+  "uncertain_spans": [
+    {
+      "start": 0,
+      "end": 4,
+      "text": "ship",
+      "score": 0.58
+    }
+  ],
+  "candidates": [
+    {
+      "value": "ship",
+      "score": 0.85
+    }
+  ],
+  "replacements": [
+    {
+      "from": "ship",
+      "to": "ship",
+      "score": 1.0
+    }
+  ],
+  "output": {
+    "tone": "neutral"
+  },
+  "errors": [
+    {
+      "code": "preexisting_warning",
+      "message": "fixture warning"
+    }
+  ],
+  "metadata": {
+    "source": "fixture",
+    "trace_id": "trace-openai-002"
+  },
+  "providers": {
+    "openai": {
+      "api_key": "fixture-openai-key",
+      "model": "gpt-4o-mini-transcribe"
+    }
+  }
+}
