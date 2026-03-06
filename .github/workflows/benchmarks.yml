@@ -3,9 +3,29 @@ name: Benchmarks
 on:
   push:
     branches: [main]
+    paths:
+      - '**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'benches/**'
+      - 'scripts/**'
+      - '.github/workflows/benchmarks.yml'
   pull_request:
     branches: [main]
+    paths:
+      - '**/*.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/**'
+      - 'benches/**'
+      - 'scripts/**'
+      - '.github/workflows/benchmarks.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -14,11 +34,18 @@ permissions:
 jobs:
   bench-compile:
     name: Benchmark Build
+    if: github.event_name != 'pull_request'
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
       - name: Build benchmark suite
         run: cargo bench --bench runtime_bottlenecks --no-run
 
@@ -31,12 +58,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev
-      - name: Install Rust + cargo-codspeed
-        uses: moonrepo/setup-rust@v0
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
         with:
-          channel: stable
-          cache-target: release
-          bins: cargo-codspeed
+          shared-key: bench-${{ runner.os }}-${{ runner.arch }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
+      - name: Install cargo-codspeed
+        run: cargo install cargo-codspeed
       - name: Build benchmarks
         run: cargo codspeed build --bench runtime_bottlenecks
       - name: Run benchmarks

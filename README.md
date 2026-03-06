@@ -318,3 +318,15 @@ cargo bench --bench runtime_bottlenecks replay_persist
 ```
 
 CodSpeed runs the same benchmark target in CI so regressions in these paths show up on PRs.
+
+## Local Pre-commit
+
+This repo ships a native `prek.toml` for fast local gates before you commit.
+
+```bash
+prek validate-config
+prek run --all-files
+prek install
+```
+
+The hooks stay intentionally small: `cargo fmt --all -- --check` and `cargo clippy --all-targets --all-features -- -D warnings`.

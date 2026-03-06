@@ -34,6 +34,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
@@ -44,6 +50,12 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
       - name: Run tests
         run: cargo test --all-targets
 
@@ -52,7 +64,6 @@ jobs:
     needs: [fmt, clippy, test]
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false
       matrix:
         include:
           - os: macos-15-intel
@@ -67,6 +78,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}-${{ matrix.target }}
+          save-if: ${{ github.event_name != 'pull_request' }}
+          cache-on-failure: true
 
       - name: Resolve version
         id: version
