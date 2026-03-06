@@ -1,10 +1,10 @@
 # muninn
 
-[![Crates.io Version](https://img.shields.io/crates/v/muninn-voice-to-text)](https://crates.io/crates/muninn-voice-to-text)
+[![Crates.io Version](https://img.shields.io/crates/v/muninn-speach-to-text)](https://crates.io/crates/muninn-speach-to-text)
 [![CI](https://img.shields.io/github/actions/workflow/status/bnomei/muninn/ci.yml?branch=main)](https://github.com/bnomei/muninn/actions/workflows/ci.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json&style=flat)](https://codspeed.io/bnomei/muninn?utm_source=badge)
-[![Crates.io Downloads](https://img.shields.io/crates/d/muninn-voice-to-text)](https://crates.io/crates/muninn-voice-to-text)
-[![License](https://img.shields.io/crates/l/muninn-voice-to-text)](https://crates.io/crates/muninn-voice-to-text)
+[![Crates.io Downloads](https://img.shields.io/crates/d/muninn-speach-to-text)](https://crates.io/crates/muninn-speach-to-text)
+[![License](https://img.shields.io/crates/l/muninn-speach-to-text)](https://crates.io/crates/muninn-speach-to-text)
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
@@ -61,6 +61,12 @@ Example shape:
 id = "stt_openai"
 cmd = "stt_openai"
 timeout_ms = 18000
+on_error = "continue"
+
+[[pipeline.steps]]
+id = "stt_google"
+cmd = "stt_google"
+timeout_ms = 18000
 on_error = "abort"
 
 [[pipeline.steps]]
@@ -82,8 +88,8 @@ on_error = "continue"
 Muninn reads provider credentials from your environment or config and uses them directly for its built-in steps. Environment variables override config values.
 
 Setup:
-- OpenAI: set `OPENAI_API_KEY`, then use `stt_openai` and `refine`
-- Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, then enable `stt_google`
+- OpenAI: set `OPENAI_API_KEY` for the first default STT provider and for `refine`
+- Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the second default STT provider
 - optional provider settings such as endpoints and models live in the config you control
 
 Replay artifacts redact provider secrets before they are written.
@@ -95,7 +101,7 @@ This is the shortest path to a working local setup.
 ### 1) Build the app
 
 ```bash
-cargo build -p muninn-voice-to-text
+cargo build -p muninn-speach-to-text
 ```
 
 ### 2) Resolve the config path
@@ -121,7 +127,7 @@ cp configs/config.sample.toml "$CONFIG_PATH"
 echo "Using config: $CONFIG_PATH"
 ```
 
-The sample enables `stt_openai` and `refine`. It also includes commented examples for external steps and `stt_google`.
+The sample enables `stt_openai`, `stt_google`, and `refine`, with OpenAI first and Google second.
 
 ### 3) Set provider env vars
 
@@ -136,7 +142,7 @@ Muninn loads `.env` only when `MUNINN_LOAD_DOTENV=1` is set. Otherwise export va
 ### 4) Run the tray app
 
 ```bash
-MUNINN_CONFIG="$PWD/configs/config.sample.toml" cargo run -p muninn-voice-to-text
+MUNINN_CONFIG="$PWD/configs/config.sample.toml" cargo run -p muninn-speach-to-text
 ```
 
 macOS permissions required:
@@ -149,14 +155,15 @@ macOS permissions required:
 Optional. Built-ins can be run directly with:
 
 ```bash
-cargo run -q -p muninn-voice-to-text -- __internal_step <stt_openai|stt_google|refine>
+cargo run -q -p muninn-speach-to-text -- __internal_step <stt_openai|stt_google|refine>
 ```
 
 Use the fixtures in `crates/muninn/tests/fixtures/` when you want example input.
 
 ## Built-In Step Behavior
 
-- `stt_openai` and `stt_google` populate `transcript.raw_text`
+- `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it passes the envelope through unchanged
+- `stt_google` fills `transcript.raw_text` when Google is configured, and fails if no STT step produced text by then
 - `refine` lightly corrects the transcript and writes `output.final_text`
 - recommended order: `stt_* -> refine -> optional external filters`
 

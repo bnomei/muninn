@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PACKAGE_NAME="${PACKAGE_NAME:-muninn-voice-to-text}"
+PACKAGE_NAME="${PACKAGE_NAME:-muninn-speach-to-text}"
 
 if [[ "${GITHUB_REF_NAME:-}" == v* ]]; then
   version="${GITHUB_REF_NAME#v}"

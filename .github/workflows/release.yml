@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  PACKAGE_NAME: muninn-voice-to-text
+  PACKAGE_NAME: muninn-speach-to-text
   BIN_NAME: muninn
 
 jobs:

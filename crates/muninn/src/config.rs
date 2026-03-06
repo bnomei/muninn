@@ -61,11 +61,19 @@ impl AppConfig {
 
     pub fn launchable_default() -> Self {
         let mut config = Self::default();
-        config.pipeline.deadline_ms = 20_000;
+        config.pipeline.deadline_ms = 40_000;
         config.pipeline.steps = vec![
             PipelineStepConfig {
                 id: "stt_openai".to_string(),
                 cmd: "stt_openai".to_string(),
+                args: Vec::new(),
+                io_mode: StepIoMode::Auto,
+                timeout_ms: 18_000,
+                on_error: OnErrorPolicy::Continue,
+            },
+            PipelineStepConfig {
+                id: "stt_google".to_string(),
+                cmd: "stt_google".to_string(),
                 args: Vec::new(),
                 io_mode: StepIoMode::Auto,
                 timeout_ms: 18_000,
@@ -680,8 +688,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        resolve_config_path_with, AppConfig, ConfigError, ConfigValidationError, PayloadFormat,
-        RefineProvider, TriggerType,
+        resolve_config_path_with, AppConfig, ConfigError, ConfigValidationError, OnErrorPolicy,
+        PayloadFormat, RefineProvider, TriggerType,
     };
 
     #[test]
@@ -738,18 +746,23 @@ mod tests {
     }
 
     #[test]
-    fn launchable_default_is_valid_and_uses_openai_step() {
+    fn launchable_default_is_valid_and_uses_ordered_stt_fallback() {
         let config = AppConfig::launchable_default();
 
         config.validate().expect("launchable default must validate");
-        assert_eq!(config.pipeline.deadline_ms, 20_000);
-        assert_eq!(config.pipeline.steps.len(), 2);
+        assert_eq!(config.pipeline.deadline_ms, 40_000);
+        assert_eq!(config.pipeline.steps.len(), 3);
         assert_eq!(config.pipeline.steps[0].id, "stt_openai");
         assert_eq!(config.pipeline.steps[0].cmd, "stt_openai");
         assert_eq!(config.pipeline.steps[0].timeout_ms, 18_000);
-        assert_eq!(config.pipeline.steps[1].id, "refine");
-        assert_eq!(config.pipeline.steps[1].cmd, "refine");
-        assert_eq!(config.pipeline.steps[1].timeout_ms, 2_500);
+        assert_eq!(config.pipeline.steps[0].on_error, OnErrorPolicy::Continue);
+        assert_eq!(config.pipeline.steps[1].id, "stt_google");
+        assert_eq!(config.pipeline.steps[1].cmd, "stt_google");
+        assert_eq!(config.pipeline.steps[1].timeout_ms, 18_000);
+        assert_eq!(config.pipeline.steps[1].on_error, OnErrorPolicy::Abort);
+        assert_eq!(config.pipeline.steps[2].id, "refine");
+        assert_eq!(config.pipeline.steps[2].cmd, "refine");
+        assert_eq!(config.pipeline.steps[2].timeout_ms, 2_500);
     }
 
     #[test]

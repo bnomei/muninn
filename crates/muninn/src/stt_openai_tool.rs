@@ -135,7 +135,6 @@ where
     })?;
 
     if has_non_empty_raw_text(&envelope) {
-        envelope.transcript.provider = Some("openai".to_string());
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
@@ -145,14 +144,9 @@ where
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
-    let api_key = resolve_openai_api_key(get_env, config.api_key.clone()).ok_or_else(
-        || {
-            CliError::new(
-                "missing_openai_api_key",
-                "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in envelope/config",
-            )
-        },
-    )?;
+    let Some(api_key) = resolve_openai_api_key(get_env, config.api_key.clone()) else {
+        return Ok(PreparedEnvelope::Ready(envelope));
+    };
 
     let wav_path = envelope
         .audio
@@ -393,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_existing_raw_text_without_requiring_credentials() {
+    fn preserves_existing_raw_text_without_overwriting_provider() {
         let mut input = baseline_envelope();
         input.transcript.raw_text = Some("existing transcript".to_string());
         input.transcript.provider = Some("legacy".to_string());
@@ -407,7 +401,7 @@ mod tests {
 
         match prepared {
             PreparedEnvelope::Ready(envelope) => {
-                assert_eq!(envelope.transcript.provider.as_deref(), Some("openai"));
+                assert_eq!(envelope.transcript.provider.as_deref(), Some("legacy"));
                 assert_eq!(
                     envelope.transcript.raw_text.as_deref(),
                     Some("existing transcript")
@@ -439,6 +433,30 @@ mod tests {
             }
             PreparedEnvelope::NeedsTranscription(_) => {
                 panic!("stub text should skip live OpenAI transcription")
+            }
+        }
+    }
+
+    #[test]
+    fn missing_credentials_pass_through_for_later_stt_steps() {
+        let input = baseline_envelope();
+        let prepared = prepare_envelope(
+            &serde_json::to_string(&input).expect("serialize input"),
+            &|_| None,
+            &OpenAiResolvedConfig {
+                api_key: None,
+                endpoint: config().endpoint,
+                model: config().model,
+            },
+        )
+        .expect("missing credentials should pass through");
+
+        match prepared {
+            PreparedEnvelope::Ready(envelope) => {
+                assert_eq!(envelope, input);
+            }
+            PreparedEnvelope::NeedsTranscription(_) => {
+                panic!("missing credentials should not attempt transcription")
             }
         }
     }

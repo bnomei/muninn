@@ -158,7 +158,6 @@ where
     })?;
 
     if has_non_empty_raw_text(&envelope) {
-        envelope.transcript.provider = Some("google".to_string());
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
@@ -528,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_existing_raw_text_without_requiring_credentials() {
+    fn preserves_existing_raw_text_without_overwriting_provider() {
         let mut input = baseline_envelope();
         input.transcript.raw_text = Some("existing transcript".to_string());
         input.transcript.provider = Some("legacy".to_string());
@@ -542,7 +541,7 @@ mod tests {
 
         match prepared {
             PreparedEnvelope::Ready(envelope) => {
-                assert_eq!(envelope.transcript.provider.as_deref(), Some("google"));
+                assert_eq!(envelope.transcript.provider.as_deref(), Some("legacy"));
                 assert_eq!(
                     envelope.transcript.raw_text.as_deref(),
                     Some("existing transcript")

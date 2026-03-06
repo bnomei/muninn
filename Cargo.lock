@@ -1486,7 +1486,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "muninn-voice-to-text"
+name = "muninn-speach-to-text"
 version = "0.1.0"
 dependencies = [
  "anyhow",

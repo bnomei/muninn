@@ -33,13 +33,20 @@ outline = "#2C2C2E"
 glyph = "#FFFFFF"
 
 [pipeline]
-deadline_ms = 20000
+deadline_ms = 40000
 payload_format = "json_object"
 
-# OpenAI wrapper example (active)
+# OpenAI wrapper (active, first provider)
 [[pipeline.steps]]
 id = "stt_openai"
 cmd = "stt_openai"
+timeout_ms = 18000
+on_error = "continue"
+
+# Google wrapper (active, second provider)
+[[pipeline.steps]]
+id = "stt_google"
+cmd = "stt_google"
 timeout_ms = 18000
 on_error = "abort"
 
@@ -66,13 +73,6 @@ on_error = "continue"
 # io_mode = "envelope_json"
 # timeout_ms = 250
 # on_error = "continue"
-
-# Google wrapper example (alternative)
-# [[pipeline.steps]]
-# id = "stt_google"
-# cmd = "stt_google"
-# timeout_ms = 18000
-# on_error = "abort"
 
 [scoring]
 min_top_score = 0.84

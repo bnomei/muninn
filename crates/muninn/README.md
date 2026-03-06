@@ -1,4 +1,4 @@
-# muninn-voice-to-text
+# muninn-speach-to-text
 
 Hackable macOS menu bar dictation for developers.
 

@@ -623,7 +623,7 @@ mod tests {
         let runner = PipelineRunner::default();
         let config = config_with_steps(
             1_000,
-            vec![step("echo", "cat", &[], 200, OnErrorPolicy::Abort)],
+            vec![step("echo", "cat", &[], 500, OnErrorPolicy::Abort)],
         );
         let input = sample_envelope();
 
@@ -651,7 +651,7 @@ mod tests {
                 "uppercase",
                 "/usr/bin/tr",
                 &["[:lower:]", "[:upper:]"],
-                200,
+                500,
                 OnErrorPolicy::Abort,
             )],
         );
@@ -678,7 +678,7 @@ mod tests {
                 "suffix",
                 "/bin/sh",
                 &["-c", "sed 's/$/!/'"],
-                200,
+                500,
                 OnErrorPolicy::Abort,
             )],
         );
@@ -708,7 +708,7 @@ mod tests {
                     1_000,
                     OnErrorPolicy::Continue,
                 ),
-                step("echo", "cat", &[], 200, OnErrorPolicy::Abort),
+                step("echo", "cat", &[], 500, OnErrorPolicy::Abort),
             ],
         );
 
@@ -937,7 +937,7 @@ mod tests {
                     1_000,
                     OnErrorPolicy::Abort,
                 ),
-                step("echo", "cat", &[], 200, OnErrorPolicy::Abort),
+                step("echo", "cat", &[], 500, OnErrorPolicy::Abort),
             ],
         );
         let input = sample_envelope();
