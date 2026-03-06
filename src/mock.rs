@@ -144,6 +144,11 @@ pub struct MockPermissionsAdapter {
 struct PermissionsInner {
     preflight_result: MacosAdapterResult<PermissionPreflightStatus>,
     preflight_calls: usize,
+    request_input_monitoring_result: MacosAdapterResult<bool>,
+    request_input_monitoring_calls: usize,
+    request_accessibility_result: MacosAdapterResult<bool>,
+    request_accessibility_calls: usize,
+    preflight_result_after_request: Option<MacosAdapterResult<PermissionPreflightStatus>>,
 }
 
 impl Default for PermissionsInner {
@@ -151,6 +156,11 @@ impl Default for PermissionsInner {
         Self {
             preflight_result: Ok(PermissionPreflightStatus::default()),
             preflight_calls: 0,
+            request_input_monitoring_result: Ok(false),
+            request_input_monitoring_calls: 0,
+            request_accessibility_result: Ok(false),
+            request_accessibility_calls: 0,
+            preflight_result_after_request: None,
         }
     }
 }
@@ -190,6 +200,57 @@ impl MockPermissionsAdapter {
             .expect("permissions mutex poisoned")
             .preflight_calls
     }
+
+    pub fn set_request_input_monitoring_result(&self, granted: bool) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_input_monitoring_result = Ok(granted);
+    }
+
+    pub fn set_request_input_monitoring_error(&self, error: MacosAdapterError) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_input_monitoring_result = Err(error);
+    }
+
+    pub fn set_request_accessibility_result(&self, granted: bool) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_accessibility_result = Ok(granted);
+    }
+
+    pub fn set_request_accessibility_error(&self, error: MacosAdapterError) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_accessibility_result = Err(error);
+    }
+
+    pub fn set_post_request_preflight_status(&self, status: PermissionPreflightStatus) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .preflight_result_after_request = Some(Ok(status));
+    }
+
+    #[must_use]
+    pub fn request_input_monitoring_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_input_monitoring_calls
+    }
+
+    #[must_use]
+    pub fn request_accessibility_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_accessibility_calls
+    }
 }
 
 #[async_trait]
@@ -198,6 +259,30 @@ impl PermissionsAdapter for MockPermissionsAdapter {
         let mut inner = self.inner.lock().expect("permissions mutex poisoned");
         inner.preflight_calls += 1;
         inner.preflight_result.clone()
+    }
+
+    async fn request_input_monitoring_access(&self) -> MacosAdapterResult<bool> {
+        let mut inner = self.inner.lock().expect("permissions mutex poisoned");
+        inner.request_input_monitoring_calls += 1;
+        let result = inner.request_input_monitoring_result.clone();
+        if result.is_ok() {
+            if let Some(next_preflight) = inner.preflight_result_after_request.take() {
+                inner.preflight_result = next_preflight;
+            }
+        }
+        result
+    }
+
+    async fn request_accessibility_access(&self) -> MacosAdapterResult<bool> {
+        let mut inner = self.inner.lock().expect("permissions mutex poisoned");
+        inner.request_accessibility_calls += 1;
+        let result = inner.request_accessibility_result.clone();
+        if result.is_ok() {
+            if let Some(next_preflight) = inner.preflight_result_after_request.take() {
+                inner.preflight_result = next_preflight;
+            }
+        }
+        result
     }
 }
 
@@ -605,6 +690,37 @@ mod tests {
             MacosAdapterError::operation_failed("permissions", "boom")
         );
         assert_eq!(adapter.preflight_calls(), 2);
+
+        let requested_status = PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Denied,
+            input_monitoring: PermissionStatus::Granted,
+        };
+        adapter.set_request_input_monitoring_result(true);
+        adapter.set_post_request_preflight_status(requested_status);
+        assert!(block_on(adapter.request_input_monitoring_access())
+            .expect("request result should be returned"));
+        assert_eq!(adapter.request_input_monitoring_calls(), 1);
+        assert_eq!(
+            block_on(adapter.preflight()).expect("post-request status should be returned"),
+            requested_status
+        );
+
+        let accessibility_status = PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Granted,
+        };
+        adapter.set_request_accessibility_result(true);
+        adapter.set_post_request_preflight_status(accessibility_status);
+        assert!(block_on(adapter.request_accessibility_access())
+            .expect("accessibility request result should be returned"));
+        assert_eq!(adapter.request_accessibility_calls(), 1);
+        assert_eq!(
+            block_on(adapter.preflight())
+                .expect("post-request accessibility status should be returned"),
+            accessibility_status
+        );
     }
 
     #[test]

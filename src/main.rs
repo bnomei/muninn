@@ -20,7 +20,7 @@ use muninn::{
     AppEvent, AppState, AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind,
     HotkeyEventSource, InProcessStepError, InProcessStepExecutor, IndicatorAdapter, IndicatorState,
     MacosAudioRecorder, MacosHotkeyEventSource, MacosPermissionsAdapter, MacosTextInjector,
-    MuninnEnvelopeV1, Orchestrator, PermissionPreflightStatus, PermissionStatus,
+    MuninnEnvelopeV1, Orchestrator, PermissionKind, PermissionPreflightStatus, PermissionStatus,
     PermissionsAdapter, PipelineOutcome, PipelineRunner, PipelineStopReason, PipelineTraceEntry,
     Platform, RecordingMode, ResolvedUtteranceConfig, TargetContextSnapshot, TextInjector,
 };
@@ -108,10 +108,11 @@ fn run_debug_record(duration_arg: Option<&String>) -> Result<()> {
         .context("building tokio runtime for __debug_record")?;
 
     runtime.block_on(async move {
-        let preflight = refresh_permissions_status()
+        let permissions = MacosPermissionsAdapter::new();
+        let recording_permissions = refresh_recording_permissions_for_user_action(&permissions)
             .await
             .context("refreshing permissions for __debug_record")?;
-        ensure_recording_can_start(preflight)?;
+        ensure_recording_can_start(recording_permissions.preflight)?;
 
         let mut recorder = MacosAudioRecorder::new(config.recording.clone());
         recorder.warm_up().await.context("warming recorder")?;
@@ -1075,6 +1076,7 @@ where
             .context("initializing hotkeys")?;
         let mut recorder = MacosAudioRecorder::new(self.config.recording.clone());
         let injector = MacosTextInjector::new();
+        let permissions = MacosPermissionsAdapter::new();
         let mut pipeline = resolve_pipeline_config(&self.config)?;
         let mut runner = build_pipeline_runner(&self.config);
         let mut active_utterance: Option<ActiveUtterance> = None;
@@ -1146,10 +1148,17 @@ where
 
             match (state, app_event, next) {
                 (AppState::Idle, AppEvent::PttPressed, AppState::RecordingPushToTalk) => {
-                    self.preflight = refresh_permissions_status()
-                        .await
-                        .context("refreshing permissions before push-to-talk recording")?;
-                    ensure_recording_can_start(self.preflight)?;
+                    let recording_permissions =
+                        refresh_recording_permissions_for_user_action(&permissions)
+                            .await
+                            .context("refreshing permissions before push-to-talk recording")?;
+                    self.preflight = recording_permissions.preflight;
+                    if should_abort_recording_start(
+                        self.preflight,
+                        recording_permissions.requested_input_monitoring,
+                    ) {
+                        continue;
+                    }
                     let resolved = self
                         .config
                         .resolve_effective_config(capture_frontmost_target_context());
@@ -1183,10 +1192,17 @@ where
                     state = next;
                 }
                 (AppState::Idle, AppEvent::DoneTogglePressed, AppState::RecordingDone) => {
-                    self.preflight = refresh_permissions_status()
-                        .await
-                        .context("refreshing permissions before done-mode recording")?;
-                    ensure_recording_can_start(self.preflight)?;
+                    let recording_permissions =
+                        refresh_recording_permissions_for_user_action(&permissions)
+                            .await
+                            .context("refreshing permissions before done-mode recording")?;
+                    self.preflight = recording_permissions.preflight;
+                    if should_abort_recording_start(
+                        self.preflight,
+                        recording_permissions.requested_input_monitoring,
+                    ) {
+                        continue;
+                    }
                     let resolved = self
                         .config
                         .resolve_effective_config(capture_frontmost_target_context());
@@ -1348,17 +1364,22 @@ where
         let route_reason = route.reason;
         let route_pipeline_stop_reason = route.pipeline_stop_reason.clone();
         let missing_credentials_feedback = should_show_missing_credentials_feedback(&outcome);
+        let permissions = MacosPermissionsAdapter::new();
 
         spawn_replay_persist(replay_config, envelope, outcome, route, replay_recorded);
 
         *state = state.on_event(AppEvent::ProcessingFinished);
 
         if let Some(text) = injection_text.as_deref() {
-            ensure_injection_allowed(
-                refresh_permissions_status()
-                    .await
-                    .context("refreshing permissions before injection")?,
-            )?;
+            let injection_permissions = refresh_injection_permissions_for_user_action(&permissions)
+                .await
+                .context("refreshing permissions before injection")?;
+            if should_abort_injection(
+                injection_permissions.preflight,
+                injection_permissions.requested_accessibility,
+            ) {
+                return Ok(());
+            }
             indicator
                 .set_temporary_state_with_glyph(
                     IndicatorState::Output,
@@ -1826,11 +1847,162 @@ fn flush_pending_config_reload(
     }
 }
 
-async fn refresh_permissions_status() -> Result<PermissionPreflightStatus> {
-    MacosPermissionsAdapter::new()
+async fn refresh_permissions_status_with<A>(permissions: &A) -> Result<PermissionPreflightStatus>
+where
+    A: PermissionsAdapter,
+{
+    permissions
         .preflight()
         .await
         .map_err(|error| anyhow!(error))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordingPermissionRefresh {
+    preflight: PermissionPreflightStatus,
+    requested_input_monitoring: bool,
+}
+
+async fn refresh_recording_permissions_for_user_action<A>(
+    permissions: &A,
+) -> Result<RecordingPermissionRefresh>
+where
+    A: PermissionsAdapter,
+{
+    let mut preflight = refresh_permissions_status_with(permissions).await?;
+    let mut requested_input_monitoring = false;
+
+    if matches!(
+        preflight.input_monitoring,
+        PermissionStatus::Denied | PermissionStatus::NotDetermined
+    ) {
+        requested_input_monitoring = true;
+        let granted = permissions
+            .request_input_monitoring_access()
+            .await
+            .map_err(|error| anyhow!(error))?;
+        info!(granted, "requested Input Monitoring access");
+        preflight = refresh_permissions_status_with(permissions).await?;
+    }
+
+    Ok(RecordingPermissionRefresh {
+        preflight,
+        requested_input_monitoring,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InjectionPermissionRefresh {
+    preflight: PermissionPreflightStatus,
+    requested_accessibility: bool,
+}
+
+async fn refresh_injection_permissions_for_user_action<A>(
+    permissions: &A,
+) -> Result<InjectionPermissionRefresh>
+where
+    A: PermissionsAdapter,
+{
+    let mut preflight = refresh_permissions_status_with(permissions).await?;
+    let mut requested_accessibility = false;
+
+    if matches!(
+        preflight.accessibility,
+        PermissionStatus::Denied | PermissionStatus::NotDetermined
+    ) {
+        requested_accessibility = true;
+        let granted = permissions
+            .request_accessibility_access()
+            .await
+            .map_err(|error| anyhow!(error))?;
+        info!(granted, "requested Accessibility access");
+        preflight = refresh_permissions_status_with(permissions).await?;
+    }
+
+    Ok(InjectionPermissionRefresh {
+        preflight,
+        requested_accessibility,
+    })
+}
+
+fn should_abort_recording_start(
+    preflight: PermissionPreflightStatus,
+    requested_input_monitoring: bool,
+) -> bool {
+    match ensure_recording_can_start(preflight) {
+        Ok(()) if requested_input_monitoring => {
+            info!(
+                "Input Monitoring access changed during this interaction; retry the recording gesture"
+            );
+            true
+        }
+        Ok(()) => false,
+        Err(error) => {
+            log_recording_start_block(preflight, &error);
+            true
+        }
+    }
+}
+
+fn log_recording_start_block(preflight: PermissionPreflightStatus, error: &anyhow::Error) {
+    let missing = preflight.missing_for_recording();
+
+    if missing.contains(&PermissionKind::InputMonitoring) {
+        warn!(
+            ?preflight,
+            ?missing,
+            error = %error,
+            "recording blocked by missing Input Monitoring permission; enable Muninn in System Settings > Privacy & Security > Input Monitoring. If the prompt does not reappear, reset the service with `tccutil reset ListenEvent` and relaunch Muninn"
+        );
+        return;
+    }
+
+    if missing.contains(&PermissionKind::Microphone) {
+        warn!(
+            ?preflight,
+            ?missing,
+            error = %error,
+            "recording blocked by missing microphone permission; enable Muninn in System Settings > Privacy & Security > Microphone"
+        );
+        return;
+    }
+
+    warn!(?preflight, ?missing, error = %error, "recording blocked by missing permissions");
+}
+
+fn should_abort_injection(
+    preflight: PermissionPreflightStatus,
+    requested_accessibility: bool,
+) -> bool {
+    match ensure_injection_allowed(preflight) {
+        Ok(()) if requested_accessibility => {
+            info!(
+                "Accessibility access changed during this interaction; retry the injection action"
+            );
+            true
+        }
+        Ok(()) => false,
+        Err(error) => {
+            log_injection_block(preflight, &error);
+            true
+        }
+    }
+}
+
+fn log_injection_block(preflight: PermissionPreflightStatus, error: &anyhow::Error) {
+    let missing = preflight.missing_for_injection();
+
+    if missing.contains(&PermissionKind::Accessibility) {
+        warn!(
+            ?preflight,
+            ?missing,
+            error = %error,
+            "injection blocked by missing Accessibility permission; enable Muninn in System Settings > Privacy & Security > Accessibility. If the prompt does not reappear, reset the service with `tccutil reset Accessibility` and relaunch Muninn"
+        );
+        return;
+    }
+
+    warn!(?preflight, ?missing, error = %error, "injection blocked by missing permissions");
 }
 
 fn drain_busy_input_backlog(
@@ -2002,13 +2174,17 @@ fn map_tray_event(event: &TrayIconEvent) -> Option<AppEvent> {
 mod tests {
     use super::{
         apply_live_config_reload, build_pipeline_runner, dotenv_path_for_dir, map_tray_event,
-        preview_context_key, read_config_fingerprint, resolve_pipeline_config,
-        resolved_indicator_glyph, should_load_dotenv, should_show_missing_credentials_feedback,
-        ConfigFingerprint, IndicatorGlyph, DEFAULT_INDICATOR_GLYPH,
+        preview_context_key, read_config_fingerprint,
+        refresh_injection_permissions_for_user_action,
+        refresh_recording_permissions_for_user_action, resolve_pipeline_config,
+        resolved_indicator_glyph, should_abort_injection, should_abort_recording_start,
+        should_load_dotenv, should_show_missing_credentials_feedback, ConfigFingerprint,
+        IndicatorGlyph, DEFAULT_INDICATOR_GLYPH,
     };
     use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
     use muninn::{
-        AppEvent, IndicatorState, MuninnEnvelopeV1, PipelineOutcome, PipelinePolicyApplied,
+        AppEvent, IndicatorState, MockPermissionsAdapter, MuninnEnvelopeV1,
+        PermissionPreflightStatus, PermissionStatus, PipelineOutcome, PipelinePolicyApplied,
         PipelineStopReason, PipelineTraceEntry, StepFailureKind,
     };
     use serde_json::json;
@@ -2102,6 +2278,86 @@ mod tests {
             map_tray_event(&left_tray_click(MouseButtonState::Up)),
             Some(AppEvent::PttReleased)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recording_permission_refresh_requests_input_monitoring_and_rechecks_status() {
+        let permissions = MockPermissionsAdapter::new();
+        permissions.set_preflight_status(PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Denied,
+        });
+        permissions.set_request_input_monitoring_result(true);
+        permissions.set_post_request_preflight_status(PermissionPreflightStatus::all_granted());
+
+        let refreshed = refresh_recording_permissions_for_user_action(&permissions)
+            .await
+            .expect("permission refresh should succeed");
+
+        assert!(refreshed.requested_input_monitoring);
+        assert_eq!(
+            refreshed.preflight,
+            PermissionPreflightStatus::all_granted()
+        );
+        assert_eq!(permissions.preflight_calls(), 2);
+        assert_eq!(permissions.request_input_monitoring_calls(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn injection_permission_refresh_requests_accessibility_and_rechecks_status() {
+        let permissions = MockPermissionsAdapter::new();
+        permissions.set_preflight_status(PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Denied,
+            input_monitoring: PermissionStatus::Granted,
+        });
+        permissions.set_request_accessibility_result(true);
+        permissions.set_post_request_preflight_status(PermissionPreflightStatus::all_granted());
+
+        let refreshed = refresh_injection_permissions_for_user_action(&permissions)
+            .await
+            .expect("injection permission refresh should succeed");
+
+        assert!(refreshed.requested_accessibility);
+        assert_eq!(
+            refreshed.preflight,
+            PermissionPreflightStatus::all_granted()
+        );
+        assert_eq!(permissions.preflight_calls(), 2);
+        assert_eq!(permissions.request_accessibility_calls(), 1);
+    }
+
+    #[test]
+    fn recording_start_aborts_after_input_monitoring_prompt_even_when_now_granted() {
+        assert!(should_abort_recording_start(
+            PermissionPreflightStatus::all_granted(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn recording_start_continues_when_permissions_are_already_ready() {
+        assert!(!should_abort_recording_start(
+            PermissionPreflightStatus::all_granted(),
+            false,
+        ));
+    }
+
+    #[test]
+    fn injection_aborts_after_accessibility_prompt_even_when_now_granted() {
+        assert!(should_abort_injection(
+            PermissionPreflightStatus::all_granted(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn injection_continues_when_permissions_are_already_ready() {
+        assert!(!should_abort_injection(
+            PermissionPreflightStatus::all_granted(),
+            false,
+        ));
     }
 
     #[test]

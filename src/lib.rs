@@ -277,6 +277,8 @@ pub trait IndicatorAdapter: Send + Sync {
 #[async_trait]
 pub trait PermissionsAdapter: Send + Sync {
     async fn preflight(&self) -> MacosAdapterResult<PermissionPreflightStatus>;
+    async fn request_input_monitoring_access(&self) -> MacosAdapterResult<bool>;
+    async fn request_accessibility_access(&self) -> MacosAdapterResult<bool>;
 }
 
 #[async_trait]

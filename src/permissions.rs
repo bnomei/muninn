@@ -1,5 +1,11 @@
 use async_trait::async_trait;
 
+#[cfg(not(target_os = "macos"))]
+use crate::{
+    MacosAdapterError, MacosAdapterResult, PermissionPreflightStatus, PermissionStatus,
+    PermissionsAdapter,
+};
+#[cfg(target_os = "macos")]
 use crate::{MacosAdapterResult, PermissionPreflightStatus, PermissionStatus, PermissionsAdapter};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -23,6 +29,30 @@ impl PermissionsAdapter for MacosPermissionsAdapter {
         #[cfg(not(target_os = "macos"))]
         {
             Ok(PermissionPreflightStatus::unsupported())
+        }
+    }
+
+    async fn request_input_monitoring_access(&self) -> MacosAdapterResult<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(request_input_monitoring_access())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(MacosAdapterError::UnsupportedPlatform)
+        }
+    }
+
+    async fn request_accessibility_access(&self) -> MacosAdapterResult<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            Ok(request_accessibility_access())
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(MacosAdapterError::UnsupportedPlatform)
         }
     }
 }
@@ -52,6 +82,16 @@ fn input_monitoring_status() -> PermissionStatus {
     } else {
         PermissionStatus::Denied
     }
+}
+
+#[cfg(target_os = "macos")]
+fn request_input_monitoring_access() -> bool {
+    objc2_core_graphics::CGRequestListenEventAccess()
+}
+
+#[cfg(target_os = "macos")]
+fn request_accessibility_access() -> bool {
+    macos_accessibility_client::accessibility::application_is_trusted_with_prompt()
 }
 
 #[cfg(target_os = "macos")]
