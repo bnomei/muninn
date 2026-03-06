@@ -24,6 +24,7 @@ const BENCH_TIMESTAMP: &str = "2026-03-06T00:00:00Z";
 
 mod google_tool_impl {
     #![allow(dead_code)]
+    #![allow(clippy::items_after_test_module)]
     #![allow(unused_imports)]
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),

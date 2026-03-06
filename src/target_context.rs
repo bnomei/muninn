@@ -42,9 +42,7 @@ fn capture_frontmost_target_context_macos() -> TargetContextSnapshot {
     use objc2_app_kit::NSWorkspace;
 
     let captured_at = Utc::now().to_rfc3339();
-    let frontmost_application = unsafe {
-        NSWorkspace::sharedWorkspace().frontmostApplication()
-    };
+    let frontmost_application = unsafe { NSWorkspace::sharedWorkspace().frontmostApplication() };
 
     let Some(application) = frontmost_application else {
         return TargetContextSnapshot {
@@ -157,7 +155,11 @@ fn get_cf_number_i32_value(
             &mut result as *mut i32 as *mut c_void,
         )
     };
-    if ok { Ok(result) } else { Err(()) }
+    if ok {
+        Ok(result)
+    } else {
+        Err(())
+    }
 }
 
 fn normalize_optional_string(value: Option<String>) -> Option<String> {

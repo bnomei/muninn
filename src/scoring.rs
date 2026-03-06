@@ -193,7 +193,7 @@ fn top_two_scores(scores: &[f32]) -> (Option<f32>, Option<f32>) {
                 top = Some(score);
             }
             Some(_) => {
-                if second.is_none_or(|current_second| score > current_second) {
+                if second.map_or(true, |current_second| score > current_second) {
                     second = Some(score);
                 }
             }

@@ -198,7 +198,10 @@ impl AppConfig {
 
         if let Some(voice_id) = selection.voice_id.as_deref() {
             if let Some(voice) = self.voices.get(voice_id) {
-                voice.apply_to(&mut effective_config.transcript, &mut effective_config.refine);
+                voice.apply_to(
+                    &mut effective_config.transcript,
+                    &mut effective_config.refine,
+                );
             }
         }
 
@@ -601,10 +604,12 @@ impl VoiceConfig {
             match (chars.next(), chars.next()) {
                 (Some(letter), None) if letter.is_ascii_alphabetic() => {}
                 _ => {
-                    return Err(ConfigValidationError::VoiceIndicatorGlyphMustBeSingleAsciiLetter {
-                        voice_id: voice_id.to_string(),
-                        value: glyph.to_string(),
-                    });
+                    return Err(
+                        ConfigValidationError::VoiceIndicatorGlyphMustBeSingleAsciiLetter {
+                            voice_id: voice_id.to_string(),
+                            value: glyph.to_string(),
+                        },
+                    );
                 }
             }
         }
@@ -806,10 +811,18 @@ pub struct RefineOverrides {
 
 impl RefineOverrides {
     fn validate(&self, profile_id: &str) -> Result<(), ConfigValidationError> {
-        if self.endpoint.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        if self
+            .endpoint
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
             return Err(ConfigValidationError::RefineEndpointMustNotBeEmpty);
         }
-        if self.model.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        if self
+            .model
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
             return Err(ConfigValidationError::RefineModelMustNotBeEmpty);
         }
         validate_optional_refine_fields(
@@ -870,12 +883,17 @@ pub struct ProfileRuleConfig {
 impl ProfileRuleConfig {
     fn validate(&self, app: &AppSettings) -> Result<(), ConfigValidationError> {
         validate_identifier(self.id.trim(), "profile_rules.id")?;
-        validate_identifier(self.profile.trim(), &format!("profile_rules.{}.profile", self.id))?;
+        validate_identifier(
+            self.profile.trim(),
+            &format!("profile_rules.{}.profile", self.id),
+        )?;
 
         if !self.has_matcher() {
-            return Err(ConfigValidationError::ProfileRuleMustIncludeAtLeastOneMatcher {
-                rule_id: self.id.clone(),
-            });
+            return Err(
+                ConfigValidationError::ProfileRuleMustIncludeAtLeastOneMatcher {
+                    rule_id: self.id.clone(),
+                },
+            );
         }
 
         for (field_name, value) in [
@@ -883,7 +901,10 @@ impl ProfileRuleConfig {
             ("bundle_id_prefix", self.bundle_id_prefix.as_deref()),
             ("app_name", self.app_name.as_deref()),
             ("app_name_contains", self.app_name_contains.as_deref()),
-            ("window_title_contains", self.window_title_contains.as_deref()),
+            (
+                "window_title_contains",
+                self.window_title_contains.as_deref(),
+            ),
         ] {
             if value.is_some_and(|value| value.trim().is_empty()) {
                 return Err(ConfigValidationError::ProfileRuleFieldMustNotBeEmpty {
@@ -910,7 +931,10 @@ impl ProfileRuleConfig {
 
     #[must_use]
     pub fn matches(&self, target_context: &TargetContextSnapshot) -> bool {
-        if !match_optional_exact(self.bundle_id.as_deref(), target_context.bundle_id.as_deref()) {
+        if !match_optional_exact(
+            self.bundle_id.as_deref(),
+            target_context.bundle_id.as_deref(),
+        ) {
             return false;
         }
         if !match_optional_prefix(
@@ -1102,7 +1126,10 @@ pub enum ConfigValidationError {
     #[error("voice indicator_glyph must be exactly one ASCII letter ({voice_id}={value})")]
     VoiceIndicatorGlyphMustBeSingleAsciiLetter { voice_id: String, value: String },
     #[error("profile references unknown voice ({profile_id} -> {voice_id})")]
-    UnknownVoiceReference { profile_id: String, voice_id: String },
+    UnknownVoiceReference {
+        profile_id: String,
+        voice_id: String,
+    },
     #[error("{field_name} references unknown profile ({profile_id})")]
     UnknownProfileReference {
         field_name: String,
@@ -1292,7 +1319,10 @@ fn fallback_reason(target_context: &TargetContextSnapshot, default_profile: &str
 }
 
 fn match_optional_exact(expected: Option<&str>, actual: Option<&str>) -> bool {
-    match (expected.and_then(normalize_match_string), actual.and_then(normalize_match_string)) {
+    match (
+        expected.and_then(normalize_match_string),
+        actual.and_then(normalize_match_string),
+    ) {
         (Some(expected), Some(actual)) => actual == expected,
         (Some(_), None) => false,
         (None, _) => true,
@@ -1300,7 +1330,10 @@ fn match_optional_exact(expected: Option<&str>, actual: Option<&str>) -> bool {
 }
 
 fn match_optional_prefix(expected: Option<&str>, actual: Option<&str>) -> bool {
-    match (expected.and_then(normalize_match_string), actual.and_then(normalize_match_string)) {
+    match (
+        expected.and_then(normalize_match_string),
+        actual.and_then(normalize_match_string),
+    ) {
         (Some(expected), Some(actual)) => actual.starts_with(&expected),
         (Some(_), None) => false,
         (None, _) => true,
@@ -1308,7 +1341,10 @@ fn match_optional_prefix(expected: Option<&str>, actual: Option<&str>) -> bool {
 }
 
 fn match_optional_contains(expected: Option<&str>, actual: Option<&str>) -> bool {
-    match (expected.and_then(normalize_match_string), actual.and_then(normalize_match_string)) {
+    match (
+        expected.and_then(normalize_match_string),
+        actual.and_then(normalize_match_string),
+    ) {
         (Some(expected), Some(actual)) => actual.contains(&expected),
         (Some(_), None) => false,
         (None, _) => true,
@@ -1913,11 +1949,17 @@ on_error = "abort"
         assert_eq!(resolved.voice_id.as_deref(), Some("dev_mode"));
         assert_eq!(resolved.voice_glyph, Some('D'));
         assert_eq!(resolved.effective_config.recording.sample_rate_khz, 48);
-        assert_eq!(resolved.effective_config.transcript.system_prompt, "profile prompt");
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            "profile prompt"
+        );
         assert_eq!(resolved.effective_config.refine.temperature, 0.2);
         assert_eq!(resolved.effective_config.refine.max_output_tokens, 256);
         assert_eq!(resolved.effective_config.refine.max_length_delta_ratio, 0.4);
-        assert_eq!(resolved.effective_config.refine.max_token_change_ratio, 0.60);
+        assert_eq!(
+            resolved.effective_config.refine.max_token_change_ratio,
+            0.60
+        );
     }
 
     #[test]

@@ -102,7 +102,7 @@ pub fn persist_replay(
     };
     let replay_retention_days = config.logging.replay_retention_days;
     let replay_max_bytes = config.logging.replay_max_bytes;
-    let refine_context = replay_refine_context(&config);
+    let refine_context = replay_refine_context(config);
     let redacted_config = redacted_config_snapshot(config.clone());
     let resolution = ReplayResolutionContext {
         target_context: resolved.target_context,
@@ -889,10 +889,15 @@ mod tests {
             }),
         );
 
-        let artifact_dir =
-            persist_replay(resolved, envelope, sample_outcome(), sample_route(), recorded)
-                .expect("persist replay should succeed")
-                .expect("replay should be written");
+        let artifact_dir = persist_replay(
+            resolved,
+            envelope,
+            sample_outcome(),
+            sample_route(),
+            recorded,
+        )
+        .expect("persist replay should succeed")
+        .expect("replay should be written");
 
         let record: Value = serde_json::from_str(
             &fs::read_to_string(artifact_dir.join("record.json")).expect("read replay record"),

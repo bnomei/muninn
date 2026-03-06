@@ -482,6 +482,7 @@ where
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn decode_envelope_json_output(
     input_envelope: MuninnEnvelopeV1,
     stdout: Vec<u8>,
@@ -552,6 +553,7 @@ fn decode_envelope_json_output(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn decode_text_filter_output(
     mut input_envelope: MuninnEnvelopeV1,
     stdout: Vec<u8>,

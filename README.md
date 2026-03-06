@@ -8,14 +8,16 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-AI-native macOS menu bar dictation.
+AI-native macOS menu bar dictation with a post-recording text pipeline.
 
-Muninn records a short utterance, runs it through a configurable pipeline, and injects the result back into the active app. It is designed for code-adjacent dictation: commands, flags, package names, file paths, env vars, acronyms, and other text that normal voice tools often mangle.
+Muninn records speech, transcribes it, then runs the transcript through a configurable pipeline before injecting the final text back into the active app. The core idea is not just voice capture. It is the AI-native pass after recording that can correct, reshape, or enhance the transcribed text so technical dictation survives intact.
+
+It is designed for code-adjacent dictation: commands, flags, package names, file paths, env vars, acronyms, and other text that normal voice tools often mangle.
 
 Muninn is:
 - a local app with global hotkeys, a menu bar indicator, microphone capture, and keyboard injection
-- a pipeline runner that can chain built-in AI steps with normal Unix commands
-- BYOK by design: you bring the provider keys, models, and settings; Muninn orchestrates the flow and applies its own developer-focused refine layer on top
+- a post-recording pipeline runner that can chain built-in AI steps with normal Unix commands
+- BYOK by design: you bring the provider keys, models, and settings; Muninn orchestrates the flow and applies its own developer-focused text transformation layer on top
 
 ## What Muninn Does
 

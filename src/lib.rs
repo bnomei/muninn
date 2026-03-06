@@ -265,7 +265,8 @@ pub trait IndicatorAdapter: Send + Sync {
     ) -> MacosAdapterResult<()> {
         let _ = glyph;
         let _ = fallback_glyph;
-        self.set_temporary_state(state, min_duration, fallback_state).await
+        self.set_temporary_state(state, min_duration, fallback_state)
+            .await
     }
     async fn state(&self) -> MacosAdapterResult<IndicatorState>;
     async fn indicator_glyph(&self) -> MacosAdapterResult<Option<char>> {

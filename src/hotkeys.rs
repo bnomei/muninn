@@ -107,7 +107,7 @@ impl MacosHotkeyEventSource {
                     if let Err(error) =
                         handle_rdev_event(&bindings, &sender, &mut runtime_state, event)
                     {
-                        let _ = sender.send(Err(error));
+                        let _ = try_send_hotkey_result(&sender, Err(error));
                     }
                 };
 
