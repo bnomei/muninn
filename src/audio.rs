@@ -1,23 +1,25 @@
-use std::env;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use async_trait::async_trait;
-use tracing::{debug, warn};
 
 use crate::config::RecordingConfig;
 use crate::{AudioRecorder, MacosAdapterError, MacosAdapterResult, RecordedAudio};
 
 const MAX_BUFFERED_RECORDING_SECS: usize = 180;
 
+#[cfg(target_os = "macos")]
+use std::sync::Arc;
+
 #[derive(Default)]
 pub struct MacosAudioRecorder {
+    #[cfg(target_os = "macos")]
     engine: Option<CaptureEngine>,
     started_at: Option<Instant>,
     output_config: RecordingConfig,
 }
 
+#[cfg(target_os = "macos")]
 struct CaptureEngine {
     stream: cpal::Stream,
     capture: Arc<Mutex<CaptureBuffer>>,
@@ -26,6 +28,7 @@ struct CaptureEngine {
     requested_output_config: RecordingConfig,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct CaptureBuffer {
     active: bool,
@@ -33,6 +36,7 @@ struct CaptureBuffer {
     samples: Vec<i16>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureSampleFormat {
     F32,
@@ -40,6 +44,7 @@ enum CaptureSampleFormat {
     U16,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CaptureConfigChoice {
     sample_format: CaptureSampleFormat,
@@ -51,6 +56,7 @@ impl MacosAudioRecorder {
     #[must_use]
     pub const fn new(output_config: RecordingConfig) -> Self {
         Self {
+            #[cfg(target_os = "macos")]
             engine: None,
             started_at: None,
             output_config,
@@ -59,6 +65,7 @@ impl MacosAudioRecorder {
 
     pub fn set_recording_config(&mut self, output_config: RecordingConfig) {
         self.output_config = output_config;
+        #[cfg(target_os = "macos")]
         if self.started_at.is_none() {
             self.engine = None;
         }
@@ -122,7 +129,7 @@ impl AudioRecorder for MacosAudioRecorder {
             let output_sample_rate_hz = self.output_config.sample_rate_hz();
             let output_mono = self.output_config.mono;
             self.started_at = Some(Instant::now());
-            debug!(
+            tracing::debug!(
                 capture_sample_rate_hz,
                 capture_channels, output_sample_rate_hz, output_mono, "audio recording started"
             );
@@ -183,7 +190,7 @@ impl AudioRecorder for MacosAudioRecorder {
 
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             if samples.is_empty() {
-                warn!(
+                tracing::warn!(
                     capture_sample_rate_hz = engine.sample_rate,
                     capture_channels = engine.channels,
                     output_sample_rate_hz = self.output_config.sample_rate_hz(),
@@ -200,7 +207,7 @@ impl AudioRecorder for MacosAudioRecorder {
             let wav_bytes = std::fs::metadata(&wav_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or_default();
-            debug!(
+            tracing::debug!(
                 wav_path = %wav_path.display(),
                 wav_bytes,
                 buffered_samples = samples.len(),
@@ -332,7 +339,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
         ),
     }?;
 
-    debug!(
+    tracing::debug!(
         capture_sample_format = ?selection.sample_format,
         capture_sample_rate_hz = config.sample_rate.0,
         capture_channels = config.channels,
@@ -509,10 +516,12 @@ fn build_u16_stream(
         })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn max_buffered_samples(sample_rate: u32, channels: u16) -> usize {
     sample_rate as usize * channels as usize * MAX_BUFFERED_RECORDING_SECS
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn preferred_capture_choice(
     default_choice: CaptureConfigChoice,
     available_choices: &[CaptureConfigChoice],
@@ -541,6 +550,7 @@ fn preferred_capture_choice(
         .unwrap_or(default_choice)
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn append_capped_samples(
     capture: &mut CaptureBuffer,
     sample_budget: usize,
@@ -742,8 +752,9 @@ fn write_wav_file(
     source_sample_rate: u32,
     source_channels: u16,
     output_config: &RecordingConfig,
-) -> MacosAdapterResult<PathBuf> {
-    let wav_path = env::temp_dir().join(format!("muninn-{}.wav", uuid::Uuid::now_v7()));
+) -> MacosAdapterResult<std::path::PathBuf> {
+    let wav_path =
+        std::env::temp_dir().join(format!("muninn-{}.wav", uuid::Uuid::now_v7()));
     let output_spec = output_wav_spec(source_channels, output_config);
     let spec = hound::WavSpec {
         channels: output_spec.channels,
