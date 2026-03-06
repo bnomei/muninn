@@ -19,6 +19,9 @@ Muninn is:
 - a post-recording pipeline runner that can chain built-in AI steps with normal Unix commands
 - BYOK by design: you bring the provider keys, models, and settings; Muninn orchestrates the flow and applies its own developer-focused text transformation layer on top
 
+
+<a title="click to open" target="_blank" style="cursor: zoom-in;" href="https://raw.githubusercontent.com/bnomei/muninn/main/screenshot.avif"><img src="https://raw.githubusercontent.com/bnomei/muninn/main/screenshot.avif" alt="screenshot" style="width: 100%;" /></a>
+
 ## What Muninn Does
 
 High-level flow:
@@ -229,10 +232,34 @@ Optional macOS autostart:
 - changes take effect on the next macOS login
 - login autostart does not inherit shell exports; prefer config-backed credentials, or make sure the LaunchAgent working directory contains the `.env` file you want Muninn to read
 
-macOS permissions required:
-- Input Monitoring for global hotkeys
-- Accessibility for text injection
-- Microphone for recording
+### 5) Grant macOS permissions
+
+Muninn needs these macOS permissions:
+
+| Permission | Why Muninn needs it | System Settings path |
+| --- | --- | --- |
+| Input Monitoring | Listen for global hotkeys even when Muninn is not frontmost | Privacy & Security > Input Monitoring |
+| Accessibility | Inject the final text into the current app | Privacy & Security > Accessibility |
+| Microphone | Record your speech | Privacy & Security > Microphone |
+
+Important:
+- Grant these permissions to Muninn itself.
+- Do not grant them to the target app you want to dictate into. Terminal, Codex, Mail, Slack, and other target apps do not need Input Monitoring or Accessibility for Muninn to work.
+- If you launch Muninn from Terminal during development, do not assume Terminal's permissions are enough. The exact Muninn app or binary you launched must be allowed by macOS.
+- If macOS shows a prompt, grant access and then retry the recording or injection action.
+
+What to expect:
+- The first recording attempt may trigger Input Monitoring and Microphone prompts.
+- The first text injection attempt may trigger the Accessibility prompt.
+- If Input Monitoring was previously denied, macOS may not show the prompt again automatically.
+
+If a permission prompt stops appearing, re-enable the permission manually in System Settings or reset the specific TCC service and relaunch Muninn:
+
+```bash
+tccutil reset ListenEvent
+tccutil reset Accessibility
+tccutil reset Microphone
+```
 
 ## Internal Step Smoke Checks
 
