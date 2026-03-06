@@ -164,16 +164,24 @@ impl AppConfig {
             .profile_rules
             .iter()
             .find(|rule| rule.matches(target_context));
+        let used_default_profile_fallback =
+            matched_rule.is_none() && !self.profile_rules.is_empty();
         let profile_id = matched_rule
             .map(|rule| rule.profile.clone())
             .unwrap_or_else(|| self.app.profile.clone());
         let explicit_profile = self.profiles.get(&profile_id);
         let voice_id = explicit_profile.and_then(|profile| profile.voice.clone());
-        let voice_glyph = voice_id
-            .as_deref()
-            .and_then(|voice_id| self.voices.get(voice_id))
-            .and_then(VoiceConfig::normalized_indicator_glyph);
-        let fallback_reason = if matched_rule.is_none() && !self.profile_rules.is_empty() {
+        // Preserve the default profile behavior, but let the indicator render the
+        // generic M glyph until a contextual rule matches.
+        let voice_glyph = if used_default_profile_fallback {
+            None
+        } else {
+            voice_id
+                .as_deref()
+                .and_then(|voice_id| self.voices.get(voice_id))
+                .and_then(VoiceConfig::normalized_indicator_glyph)
+        };
+        let fallback_reason = if used_default_profile_fallback {
             Some(fallback_reason(target_context, &self.app.profile))
         } else {
             None
@@ -1877,6 +1885,57 @@ on_error = "abort"
         assert_eq!(fallback.matched_rule_id, None);
         assert_eq!(fallback.profile_id, "default");
         assert_eq!(fallback.voice_id, None);
+        assert_eq!(fallback.voice_glyph, None);
+        assert_eq!(
+            fallback.fallback_reason.as_deref(),
+            Some("no profile rule matched; using default profile `default`")
+        );
+    }
+
+    #[test]
+    fn resolve_profile_selection_uses_generic_m_mode_for_unknown_contextual_apps() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[voices.default_mode]
+indicator_glyph = "d"
+
+[profiles.default]
+voice = "default_mode"
+
+[profiles.codex]
+voice = "default_mode"
+
+[[profile_rules]]
+id = "codex_window"
+profile = "codex"
+bundle_id_prefix = "com.openai."
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "stt_openai"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("contextual config should parse");
+
+        let fallback = config.resolve_profile_selection(&target_context(
+            Some("com.apple.Terminal"),
+            Some("Terminal"),
+            Some("notes.txt"),
+        ));
+
+        assert_eq!(fallback.matched_rule_id, None);
+        assert_eq!(fallback.profile_id, "default");
+        assert_eq!(fallback.voice_id.as_deref(), Some("default_mode"));
+        assert_eq!(fallback.voice_glyph, None);
         assert_eq!(
             fallback.fallback_reason.as_deref(),
             Some("no profile rule matched; using default profile `default`")
@@ -1959,6 +2018,68 @@ on_error = "abort"
         assert_eq!(
             resolved.effective_config.refine.max_token_change_ratio,
             0.60
+        );
+    }
+
+    #[test]
+    fn resolve_profile_selection_hides_default_profile_glyph_when_no_rule_matches() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[recording]
+sample_rate_khz = 16
+
+[transcript]
+system_prompt = "base prompt"
+
+[refine]
+temperature = 0.0
+max_output_tokens = 512
+max_length_delta_ratio = 0.25
+max_token_change_ratio = 0.60
+
+[voices.mail]
+indicator_glyph = "e"
+system_prompt = "mail prompt"
+
+[profiles.default]
+voice = "mail"
+
+[profiles.codex]
+
+[[profile_rules]]
+id = "codex_app"
+profile = "codex"
+app_name = "Codex"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "stt_openai"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("config with default fallback voice should parse");
+
+        let fallback = config.resolve_profile_selection(&target_context(
+            Some("com.apple.Terminal"),
+            Some("Terminal"),
+            Some("notes.txt"),
+        ));
+
+        assert_eq!(fallback.matched_rule_id, None);
+        assert_eq!(fallback.profile_id, "default");
+        assert_eq!(fallback.voice_id.as_deref(), Some("mail"));
+        assert_eq!(fallback.voice_glyph, None);
+        assert_eq!(
+            fallback.fallback_reason.as_deref(),
+            Some("no profile rule matched; using default profile `default`")
         );
     }
 

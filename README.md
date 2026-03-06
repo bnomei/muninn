@@ -167,7 +167,7 @@ Resolution order is:
 - apply the matched profile last, so profile overrides win when both touch the same field
 
 Tray behavior follows the resolved voice:
-- idle preview shows the glyph for the currently matched voice, or `M` when no voice is resolved
+- idle preview shows the glyph for the currently matched voice; when no app rule matches, the tray falls back to `M` even though `app.profile` still applies
 - recording and processing freeze the resolved glyph for that utterance even if the frontmost app changes
 - `?` remains reserved for missing-credentials feedback and overrides any voice glyph
 

@@ -152,8 +152,8 @@ max_new_word_count = 2
 # profile = "mail"
 # bundle_id = "ch.protonmail.desktop"
 #
-# If no rule matches, Muninn falls back to app.profile. If that profile has no voice,
-# the idle tray glyph stays at the default M.
+# If no rule matches, Muninn falls back to app.profile for behavior, but the idle
+# tray glyph still falls back to the default M until a rule matches.
 
 [logging]
 replay_enabled = false
