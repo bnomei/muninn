@@ -109,10 +109,11 @@ fn run_debug_record(duration_arg: Option<&String>) -> Result<()> {
 
     runtime.block_on(async move {
         let permissions = MacosPermissionsAdapter::new();
-        let recording_permissions = refresh_recording_permissions_for_user_action(&permissions)
-            .await
-            .context("refreshing permissions for __debug_record")?;
-        ensure_recording_can_start(recording_permissions.preflight)?;
+        let recording_permissions =
+            refresh_recording_permissions_for_user_action(&permissions, RecordingStartSource::Tray)
+                .await
+                .context("refreshing permissions for __debug_record")?;
+        ensure_recording_can_start(recording_permissions.preflight, RecordingStartSource::Tray)?;
 
         let mut recorder = MacosAudioRecorder::new(config.recording.clone());
         recorder.warm_up().await.context("warming recorder")?;
@@ -1103,7 +1104,7 @@ where
         }
 
         loop {
-            let app_event = tokio::select! {
+            let (app_event, recording_source) = tokio::select! {
                 hotkey_event = hotkeys.next_event() => {
                     let hotkey_event = match hotkey_event {
                         Ok(event) => event,
@@ -1118,11 +1119,13 @@ where
                     let Some(app_event) = map_hotkey_event(hotkey_event) else {
                         continue;
                     };
-                    app_event
+                    (app_event, RecordingStartSource::Hotkey)
                 }
                 maybe_event = runtime_events.recv() => {
                     match maybe_event {
-                        Some(RuntimeMessage::AppEvent(app_event)) => app_event,
+                        Some(RuntimeMessage::AppEvent(app_event)) => {
+                            (app_event, RecordingStartSource::Tray)
+                        }
                         Some(RuntimeMessage::ReloadConfig(new_config)) => {
                             apply_live_config_reload(
                                 &mut self.config,
@@ -1148,14 +1151,18 @@ where
 
             match (state, app_event, next) {
                 (AppState::Idle, AppEvent::PttPressed, AppState::RecordingPushToTalk) => {
-                    let recording_permissions =
-                        refresh_recording_permissions_for_user_action(&permissions)
-                            .await
-                            .context("refreshing permissions before push-to-talk recording")?;
+                    let recording_permissions = refresh_recording_permissions_for_user_action(
+                        &permissions,
+                        recording_source,
+                    )
+                    .await
+                    .context("refreshing permissions before push-to-talk recording")?;
                     self.preflight = recording_permissions.preflight;
                     if should_abort_recording_start(
                         self.preflight,
+                        recording_permissions.requested_microphone,
                         recording_permissions.requested_input_monitoring,
+                        recording_source,
                     ) {
                         continue;
                     }
@@ -1192,14 +1199,18 @@ where
                     state = next;
                 }
                 (AppState::Idle, AppEvent::DoneTogglePressed, AppState::RecordingDone) => {
-                    let recording_permissions =
-                        refresh_recording_permissions_for_user_action(&permissions)
-                            .await
-                            .context("refreshing permissions before done-mode recording")?;
+                    let recording_permissions = refresh_recording_permissions_for_user_action(
+                        &permissions,
+                        RecordingStartSource::Hotkey,
+                    )
+                    .await
+                    .context("refreshing permissions before done-mode recording")?;
                     self.preflight = recording_permissions.preflight;
                     if should_abort_recording_start(
                         self.preflight,
+                        recording_permissions.requested_microphone,
                         recording_permissions.requested_input_monitoring,
+                        RecordingStartSource::Hotkey,
                     ) {
                         continue;
                     }
@@ -1860,17 +1871,39 @@ where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RecordingPermissionRefresh {
     preflight: PermissionPreflightStatus,
+    requested_microphone: bool,
     requested_input_monitoring: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingStartSource {
+    Hotkey,
+    Tray,
 }
 
 async fn refresh_recording_permissions_for_user_action<A>(
     permissions: &A,
+    _source: RecordingStartSource,
 ) -> Result<RecordingPermissionRefresh>
 where
     A: PermissionsAdapter,
 {
     let mut preflight = refresh_permissions_status_with(permissions).await?;
+    let mut requested_microphone = false;
     let mut requested_input_monitoring = false;
+
+    if matches!(
+        preflight.microphone,
+        PermissionStatus::Denied | PermissionStatus::NotDetermined
+    ) {
+        requested_microphone = true;
+        let granted = permissions
+            .request_microphone_access()
+            .await
+            .map_err(|error| anyhow!(error))?;
+        info!(granted, "requested microphone access");
+        preflight = refresh_permissions_status_with(permissions).await?;
+    }
 
     if matches!(
         preflight.input_monitoring,
@@ -1887,6 +1920,7 @@ where
 
     Ok(RecordingPermissionRefresh {
         preflight,
+        requested_microphone,
         requested_input_monitoring,
     })
 }
@@ -1927,27 +1961,42 @@ where
 
 fn should_abort_recording_start(
     preflight: PermissionPreflightStatus,
+    requested_microphone: bool,
     requested_input_monitoring: bool,
+    source: RecordingStartSource,
 ) -> bool {
-    match ensure_recording_can_start(preflight) {
-        Ok(()) if requested_input_monitoring => {
+    match ensure_recording_can_start(preflight, source) {
+        Ok(())
+            if requested_microphone
+                || (requested_input_monitoring
+                    && matches!(source, RecordingStartSource::Hotkey)) =>
+        {
             info!(
-                "Input Monitoring access changed during this interaction; retry the recording gesture"
+                "recording permissions changed during this interaction; retry the recording gesture"
             );
             true
         }
         Ok(()) => false,
         Err(error) => {
-            log_recording_start_block(preflight, &error);
+            log_recording_start_block(preflight, source, &error);
             true
         }
     }
 }
 
-fn log_recording_start_block(preflight: PermissionPreflightStatus, error: &anyhow::Error) {
-    let missing = preflight.missing_for_recording();
+fn log_recording_start_block(
+    preflight: PermissionPreflightStatus,
+    source: RecordingStartSource,
+    error: &anyhow::Error,
+) {
+    let missing = match source {
+        RecordingStartSource::Hotkey => preflight.missing_for_recording(),
+        RecordingStartSource::Tray => preflight.missing_for_tray_recording(),
+    };
 
-    if missing.contains(&PermissionKind::InputMonitoring) {
+    if matches!(source, RecordingStartSource::Hotkey)
+        && missing.contains(&PermissionKind::InputMonitoring)
+    {
         warn!(
             ?preflight,
             ?missing,
@@ -2119,19 +2168,31 @@ fn cleanup_stale_temp_recordings() -> Result<()> {
     Ok(())
 }
 
-fn ensure_recording_can_start(preflight: PermissionPreflightStatus) -> Result<()> {
-    if matches!(preflight.input_monitoring, PermissionStatus::Granted)
-        && !matches!(
-            preflight.microphone,
-            PermissionStatus::Denied | PermissionStatus::Restricted | PermissionStatus::Unsupported
-        )
-    {
-        return Ok(());
-    }
+fn ensure_recording_can_start(
+    preflight: PermissionPreflightStatus,
+    source: RecordingStartSource,
+) -> Result<()> {
+    match source {
+        RecordingStartSource::Hotkey => {
+            if matches!(preflight.input_monitoring, PermissionStatus::Granted)
+                && !matches!(
+                    preflight.microphone,
+                    PermissionStatus::Denied
+                        | PermissionStatus::Restricted
+                        | PermissionStatus::Unsupported
+                )
+            {
+                return Ok(());
+            }
 
-    preflight
-        .ensure_recording_allowed()
-        .map_err(|error| anyhow!(error))
+            preflight
+                .ensure_recording_allowed()
+                .map_err(|error| anyhow!(error))
+        }
+        RecordingStartSource::Tray => preflight
+            .ensure_tray_recording_allowed()
+            .map_err(|error| anyhow!(error)),
+    }
 }
 
 fn ensure_injection_allowed(preflight: PermissionPreflightStatus) -> Result<()> {
@@ -2179,7 +2240,7 @@ mod tests {
         refresh_recording_permissions_for_user_action, resolve_pipeline_config,
         resolved_indicator_glyph, should_abort_injection, should_abort_recording_start,
         should_load_dotenv, should_show_missing_credentials_feedback, ConfigFingerprint,
-        IndicatorGlyph, DEFAULT_INDICATOR_GLYPH,
+        IndicatorGlyph, RecordingStartSource, DEFAULT_INDICATOR_GLYPH,
     };
     use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
     use muninn::{
@@ -2291,16 +2352,91 @@ mod tests {
         permissions.set_request_input_monitoring_result(true);
         permissions.set_post_request_preflight_status(PermissionPreflightStatus::all_granted());
 
-        let refreshed = refresh_recording_permissions_for_user_action(&permissions)
-            .await
-            .expect("permission refresh should succeed");
+        let refreshed = refresh_recording_permissions_for_user_action(
+            &permissions,
+            RecordingStartSource::Hotkey,
+        )
+        .await
+        .expect("permission refresh should succeed");
 
+        assert!(!refreshed.requested_microphone);
         assert!(refreshed.requested_input_monitoring);
         assert_eq!(
             refreshed.preflight,
             PermissionPreflightStatus::all_granted()
         );
         assert_eq!(permissions.preflight_calls(), 2);
+        assert_eq!(permissions.request_microphone_calls(), 0);
+        assert_eq!(permissions.request_input_monitoring_calls(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recording_permission_refresh_requests_microphone_before_input_monitoring() {
+        let permissions = MockPermissionsAdapter::new();
+        permissions.set_preflight_status(PermissionPreflightStatus {
+            microphone: PermissionStatus::NotDetermined,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Denied,
+        });
+        permissions.set_request_microphone_result(true);
+        permissions.set_request_input_monitoring_result(true);
+        permissions.set_post_request_preflight_status(PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Denied,
+        });
+        permissions.set_post_request_preflight_status(PermissionPreflightStatus::all_granted());
+
+        let refreshed = refresh_recording_permissions_for_user_action(
+            &permissions,
+            RecordingStartSource::Hotkey,
+        )
+        .await
+        .expect("permission refresh should succeed");
+
+        assert!(refreshed.requested_microphone);
+        assert!(refreshed.requested_input_monitoring);
+        assert_eq!(
+            refreshed.preflight,
+            PermissionPreflightStatus::all_granted()
+        );
+        assert_eq!(permissions.preflight_calls(), 3);
+        assert_eq!(permissions.request_microphone_calls(), 1);
+        assert_eq!(permissions.request_input_monitoring_calls(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn tray_permission_refresh_bootstraps_input_monitoring_without_blocking_recording() {
+        let permissions = MockPermissionsAdapter::new();
+        permissions.set_preflight_status(PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Denied,
+        });
+        permissions.set_request_input_monitoring_result(false);
+        permissions.set_post_request_preflight_status(PermissionPreflightStatus {
+            microphone: PermissionStatus::Granted,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Denied,
+        });
+
+        let refreshed =
+            refresh_recording_permissions_for_user_action(&permissions, RecordingStartSource::Tray)
+                .await
+                .expect("permission refresh should succeed");
+
+        assert!(!refreshed.requested_microphone);
+        assert!(refreshed.requested_input_monitoring);
+        assert_eq!(
+            refreshed.preflight,
+            PermissionPreflightStatus {
+                microphone: PermissionStatus::Granted,
+                accessibility: PermissionStatus::Granted,
+                input_monitoring: PermissionStatus::Denied,
+            }
+        );
+        assert_eq!(permissions.preflight_calls(), 2);
+        assert_eq!(permissions.request_microphone_calls(), 0);
         assert_eq!(permissions.request_input_monitoring_calls(), 1);
     }
 
@@ -2329,18 +2465,70 @@ mod tests {
     }
 
     #[test]
-    fn recording_start_aborts_after_input_monitoring_prompt_even_when_now_granted() {
+    fn hotkey_recording_start_aborts_after_input_monitoring_prompt_even_when_now_granted() {
         assert!(should_abort_recording_start(
             PermissionPreflightStatus::all_granted(),
+            false,
             true,
+            RecordingStartSource::Hotkey,
         ));
     }
 
     #[test]
-    fn recording_start_continues_when_permissions_are_already_ready() {
+    fn hotkey_recording_start_aborts_after_microphone_prompt_even_when_now_granted() {
+        assert!(should_abort_recording_start(
+            PermissionPreflightStatus::all_granted(),
+            true,
+            false,
+            RecordingStartSource::Hotkey,
+        ));
+    }
+
+    #[test]
+    fn hotkey_recording_start_continues_when_permissions_are_already_ready() {
         assert!(!should_abort_recording_start(
             PermissionPreflightStatus::all_granted(),
             false,
+            false,
+            RecordingStartSource::Hotkey,
+        ));
+    }
+
+    #[test]
+    fn tray_recording_start_continues_after_input_monitoring_prompt() {
+        assert!(!should_abort_recording_start(
+            PermissionPreflightStatus::all_granted(),
+            false,
+            true,
+            RecordingStartSource::Tray,
+        ));
+    }
+
+    #[test]
+    fn tray_recording_start_continues_without_input_monitoring() {
+        assert!(!should_abort_recording_start(
+            PermissionPreflightStatus {
+                microphone: PermissionStatus::NotDetermined,
+                accessibility: PermissionStatus::Granted,
+                input_monitoring: PermissionStatus::Denied,
+            },
+            false,
+            false,
+            RecordingStartSource::Tray,
+        ));
+    }
+
+    #[test]
+    fn tray_recording_start_aborts_when_microphone_is_denied() {
+        assert!(should_abort_recording_start(
+            PermissionPreflightStatus {
+                microphone: PermissionStatus::Denied,
+                accessibility: PermissionStatus::Granted,
+                input_monitoring: PermissionStatus::Granted,
+            },
+            false,
+            false,
+            RecordingStartSource::Tray,
         ));
     }
 

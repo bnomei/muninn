@@ -225,12 +225,49 @@ Muninn now tries to load `./.env` from the current working directory by default.
 MUNINN_CONFIG="$PWD/configs/config.sample.toml" cargo run
 ```
 
+Current upstream distribution status:
+- GitHub Releases currently publish raw macOS binaries for Apple Silicon and Intel.
+- Muninn does not yet ship an official signed and notarized `.app` bundle.
+- Short term, the supported upstream path is: ship the binary, document a manual macOS setup step, and keep the local app bundle flow as an opt-in convenience.
+
+If you install a release binary directly, keep it at a stable path before granting macOS permissions. For example:
+
+```bash
+mkdir -p "$HOME/.local/bin"
+mv muninn "$HOME/.local/bin/muninn"
+chmod +x "$HOME/.local/bin/muninn"
+"$HOME/.local/bin/muninn"
+```
+
+When you run Muninn as a raw binary:
+- macOS permissions attach to that exact binary path
+- moving or replacing the binary may require re-granting permissions
+- Finder Login Items and app-style launch behavior do not apply
+
+Optional macOS app bundle (recommended when you want stable permissions and Login Items instead of a raw LaunchAgent):
+
+```bash
+cargo build --release --bin muninn
+bash scripts/package-macos-app.sh
+open dist/Muninn.app
+```
+
+This app bundle flow is currently the recommended manual macOS setup step when you want stable permissions without waiting for an official upstream `.app` release. The packaging script signs the bundle ad hoc by default so macOS sees a stable app identity instead of only the linker-signed binary. Set `CODESIGN_IDENTITY` when you want to sign with a Developer ID certificate, or `CODESIGN_APP=0` if you explicitly want to skip signing.
+
+Then:
+- move `dist/Muninn.app` to `/Applications/Muninn.app` to keep the app identity stable
+- make sure your config and provider setup live at Muninn's normal resolved paths, because Finder/Login Items will not inherit your shell exports
+- launch it once and grant permissions to `Muninn`
+- add `Muninn.app` under **System Settings > General > Login Items**
+- keep `[app].autostart = false` when using the packaged app, because the built-in autostart still writes a raw-binary LaunchAgent
+
 Optional macOS autostart:
 - set `autostart = true` under `[app]` in your config
 - Muninn uses the current executable path when writing the LaunchAgent
 - Muninn writes `~/Library/LaunchAgents/com.bnomei.muninn.plist` when it starts or reloads config
 - changes take effect on the next macOS login
 - login autostart does not inherit shell exports; prefer config-backed credentials, or make sure the LaunchAgent working directory contains the `.env` file you want Muninn to read
+- if you are using `Muninn.app`, prefer macOS Login Items over this LaunchAgent path
 
 ### 5) Grant macOS permissions
 
@@ -249,7 +286,8 @@ Important:
 - If macOS shows a prompt, grant access and then retry the recording or injection action.
 
 What to expect:
-- The first recording attempt may trigger Input Monitoring and Microphone prompts.
+- A tray click can start recording and bootstrap the Microphone prompt even before Input Monitoring is granted. If Input Monitoring is still missing, Muninn also asks for it, but tray recording itself is not blocked on that permission.
+- The first hotkey recording attempt may trigger the Input Monitoring prompt.
 - The first text injection attempt may trigger the Accessibility prompt.
 - If Input Monitoring was previously denied, macOS may not show the prompt again automatically.
 

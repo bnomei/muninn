@@ -144,11 +144,13 @@ pub struct MockPermissionsAdapter {
 struct PermissionsInner {
     preflight_result: MacosAdapterResult<PermissionPreflightStatus>,
     preflight_calls: usize,
+    request_microphone_result: MacosAdapterResult<bool>,
+    request_microphone_calls: usize,
     request_input_monitoring_result: MacosAdapterResult<bool>,
     request_input_monitoring_calls: usize,
     request_accessibility_result: MacosAdapterResult<bool>,
     request_accessibility_calls: usize,
-    preflight_result_after_request: Option<MacosAdapterResult<PermissionPreflightStatus>>,
+    preflight_results_after_request: VecDeque<MacosAdapterResult<PermissionPreflightStatus>>,
 }
 
 impl Default for PermissionsInner {
@@ -156,11 +158,13 @@ impl Default for PermissionsInner {
         Self {
             preflight_result: Ok(PermissionPreflightStatus::default()),
             preflight_calls: 0,
+            request_microphone_result: Ok(false),
+            request_microphone_calls: 0,
             request_input_monitoring_result: Ok(false),
             request_input_monitoring_calls: 0,
             request_accessibility_result: Ok(false),
             request_accessibility_calls: 0,
-            preflight_result_after_request: None,
+            preflight_results_after_request: VecDeque::new(),
         }
     }
 }
@@ -215,6 +219,20 @@ impl MockPermissionsAdapter {
             .request_input_monitoring_result = Err(error);
     }
 
+    pub fn set_request_microphone_result(&self, granted: bool) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_microphone_result = Ok(granted);
+    }
+
+    pub fn set_request_microphone_error(&self, error: MacosAdapterError) {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_microphone_result = Err(error);
+    }
+
     pub fn set_request_accessibility_result(&self, granted: bool) {
         self.inner
             .lock()
@@ -233,7 +251,8 @@ impl MockPermissionsAdapter {
         self.inner
             .lock()
             .expect("permissions mutex poisoned")
-            .preflight_result_after_request = Some(Ok(status));
+            .preflight_results_after_request
+            .push_back(Ok(status));
     }
 
     #[must_use]
@@ -242,6 +261,14 @@ impl MockPermissionsAdapter {
             .lock()
             .expect("permissions mutex poisoned")
             .request_input_monitoring_calls
+    }
+
+    #[must_use]
+    pub fn request_microphone_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("permissions mutex poisoned")
+            .request_microphone_calls
     }
 
     #[must_use]
@@ -261,12 +288,24 @@ impl PermissionsAdapter for MockPermissionsAdapter {
         inner.preflight_result.clone()
     }
 
+    async fn request_microphone_access(&self) -> MacosAdapterResult<bool> {
+        let mut inner = self.inner.lock().expect("permissions mutex poisoned");
+        inner.request_microphone_calls += 1;
+        let result = inner.request_microphone_result.clone();
+        if result.is_ok() {
+            if let Some(next_preflight) = inner.preflight_results_after_request.pop_front() {
+                inner.preflight_result = next_preflight;
+            }
+        }
+        result
+    }
+
     async fn request_input_monitoring_access(&self) -> MacosAdapterResult<bool> {
         let mut inner = self.inner.lock().expect("permissions mutex poisoned");
         inner.request_input_monitoring_calls += 1;
         let result = inner.request_input_monitoring_result.clone();
         if result.is_ok() {
-            if let Some(next_preflight) = inner.preflight_result_after_request.take() {
+            if let Some(next_preflight) = inner.preflight_results_after_request.pop_front() {
                 inner.preflight_result = next_preflight;
             }
         }
@@ -278,7 +317,7 @@ impl PermissionsAdapter for MockPermissionsAdapter {
         inner.request_accessibility_calls += 1;
         let result = inner.request_accessibility_result.clone();
         if result.is_ok() {
-            if let Some(next_preflight) = inner.preflight_result_after_request.take() {
+            if let Some(next_preflight) = inner.preflight_results_after_request.pop_front() {
                 inner.preflight_result = next_preflight;
             }
         }

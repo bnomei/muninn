@@ -152,6 +152,15 @@ impl PermissionPreflightStatus {
     }
 
     #[must_use]
+    pub fn missing_for_tray_recording(self) -> Vec<PermissionKind> {
+        let mut missing = Vec::new();
+        if status_blocks_recording_start(self.microphone) {
+            missing.push(PermissionKind::Microphone);
+        }
+        missing
+    }
+
+    #[must_use]
     pub fn missing_for_injection(self) -> Vec<PermissionKind> {
         let mut missing = Vec::new();
         if !status_is_granted(self.accessibility) {
@@ -162,6 +171,14 @@ impl PermissionPreflightStatus {
 
     pub fn ensure_recording_allowed(self) -> MacosAdapterResult<()> {
         let permissions = self.missing_for_recording();
+        if permissions.is_empty() {
+            return Ok(());
+        }
+        Err(MacosAdapterError::MissingPermissions { permissions })
+    }
+
+    pub fn ensure_tray_recording_allowed(self) -> MacosAdapterResult<()> {
+        let permissions = self.missing_for_tray_recording();
         if permissions.is_empty() {
             return Ok(());
         }
@@ -179,6 +196,13 @@ impl PermissionPreflightStatus {
 
 const fn status_is_granted(status: PermissionStatus) -> bool {
     matches!(status, PermissionStatus::Granted)
+}
+
+const fn status_blocks_recording_start(status: PermissionStatus) -> bool {
+    matches!(
+        status,
+        PermissionStatus::Denied | PermissionStatus::Restricted | PermissionStatus::Unsupported
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -277,6 +301,7 @@ pub trait IndicatorAdapter: Send + Sync {
 #[async_trait]
 pub trait PermissionsAdapter: Send + Sync {
     async fn preflight(&self) -> MacosAdapterResult<PermissionPreflightStatus>;
+    async fn request_microphone_access(&self) -> MacosAdapterResult<bool>;
     async fn request_input_monitoring_access(&self) -> MacosAdapterResult<bool>;
     async fn request_accessibility_access(&self) -> MacosAdapterResult<bool>;
 }
@@ -344,6 +369,40 @@ mod tests {
                 permissions: vec![PermissionKind::Microphone, PermissionKind::InputMonitoring]
             }
         );
+    }
+
+    #[test]
+    fn tray_recording_preflight_only_blocks_on_microphone_failures() {
+        let status = PermissionPreflightStatus {
+            microphone: PermissionStatus::Denied,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::NotDetermined,
+        };
+
+        assert_eq!(
+            status.missing_for_tray_recording(),
+            vec![PermissionKind::Microphone]
+        );
+        assert_eq!(
+            status.ensure_tray_recording_allowed().unwrap_err(),
+            MacosAdapterError::MissingPermissions {
+                permissions: vec![PermissionKind::Microphone]
+            }
+        );
+    }
+
+    #[test]
+    fn tray_recording_allows_microphone_bootstrap_without_input_monitoring() {
+        let status = PermissionPreflightStatus {
+            microphone: PermissionStatus::NotDetermined,
+            accessibility: PermissionStatus::Granted,
+            input_monitoring: PermissionStatus::Denied,
+        };
+
+        assert!(status.missing_for_tray_recording().is_empty());
+        status
+            .ensure_tray_recording_allowed()
+            .expect("tray recording should allow microphone bootstrap");
     }
 
     #[test]
