@@ -120,7 +120,7 @@ fn request_microphone_access() -> bool {
     });
 
     unsafe {
-        AVAudioApplication::requestRecordPermissionWithCompletionHandler(&*response);
+        AVAudioApplication::requestRecordPermissionWithCompletionHandler(&response);
     }
 
     receiver.recv().unwrap_or(false)
