@@ -1,6 +1,6 @@
 [package]
 name = "muninn-speach-to-text"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["Bruno Meilick <b@bnomei.com>", "Muninn Contributors"]
 edition = "2021"
 license = "MIT"
@@ -42,14 +42,16 @@ tray-icon = "0.21"
 uuid = { version = "1", features = ["serde", "v7"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
 core-graphics = "0.25"
 cpal = "0.16"
 macos-accessibility-client = "0.0.1"
-objc2-avf-audio = { version = "0.3.2", features = ["AVAudioApplication"] }
+objc2-avf-audio = { version = "0.3.2", features = ["AVAudioApplication", "block2"] }
 objc2-app-kit = { version = "0.2.2", features = ["NSRunningApplication", "NSWorkspace", "libc"] }
 objc2-core-foundation = "0.3.2"
 objc2-core-graphics = "0.3.2"
 objc2-foundation = { version = "0.2.2", features = ["NSString"] }
+objc2 = "0.6.4"
 rdev = "0.5"
 
 [dev-dependencies]
