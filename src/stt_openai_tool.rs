@@ -1,6 +1,10 @@
 use muninn::resolve_secret;
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
+use muninn::{
+    append_transcription_attempt, TranscriptionAttempt, TranscriptionAttemptOutcome,
+    TranscriptionProvider,
+};
 use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
@@ -126,8 +130,10 @@ where
     match prepare_envelope(input, get_env, config)? {
         PreparedEnvelope::Ready(envelope) => Ok(envelope),
         PreparedEnvelope::NeedsTranscription(request) => {
-            let transcript = transcribe_with_openai(&request).await?;
-            Ok(apply_openai_transcript(request.envelope, transcript))
+            match transcribe_with_openai(&request).await {
+                Ok(transcript) => Ok(apply_openai_transcript(request.envelope, transcript)),
+                Err(error) => Ok(apply_openai_transcription_failure(request.envelope, &error)),
+            }
         }
     }
 }
@@ -164,9 +170,20 @@ where
             "missing_openai_api_key",
             "missing OpenAI API key; skipping OpenAI transcription",
         );
+        append_transcription_attempt(
+            &mut envelope,
+            TranscriptionAttempt::new(
+                TranscriptionProvider::OpenAi,
+                TranscriptionAttemptOutcome::UnavailableCredentials,
+                "missing_openai_api_key",
+                "missing OpenAI API key; skipping OpenAI transcription",
+            ),
+        );
         envelope.errors.push(json!({
+            "provider": "openai",
             "code": "missing_openai_api_key",
-            "message": "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in config"
+            "message": "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in config",
+            "transcription_outcome": "unavailable_credentials",
         }));
         return Ok(PreparedEnvelope::Ready(envelope));
     };
@@ -287,13 +304,45 @@ fn apply_openai_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -
         );
         envelope.transcript.raw_text = None;
         envelope.errors.push(json!({
+            "provider": "openai",
             "code": "empty_transcript_text",
             "message": "OpenAI transcription returned an empty transcript",
         }));
     } else {
+        append_transcription_attempt(
+            &mut envelope,
+            TranscriptionAttempt::new(
+                TranscriptionProvider::OpenAi,
+                TranscriptionAttemptOutcome::ProducedTranscript,
+                "produced_transcript",
+                "OpenAI transcription produced transcript text",
+            ),
+        );
         envelope.transcript.raw_text = Some(transcript);
     }
 
+    envelope
+}
+
+fn apply_openai_transcription_failure(
+    mut envelope: MuninnEnvelopeV1,
+    error: &CliError,
+) -> MuninnEnvelopeV1 {
+    append_transcription_attempt(
+        &mut envelope,
+        TranscriptionAttempt::new(
+            TranscriptionProvider::OpenAi,
+            TranscriptionAttemptOutcome::RequestFailed,
+            error.code,
+            error.message(),
+        ),
+    );
+    envelope.errors.push(json!({
+        "provider": "openai",
+        "code": error.code,
+        "message": error.message(),
+        "transcription_outcome": "request_failed",
+    }));
     envelope
 }
 
@@ -516,7 +565,17 @@ mod tests {
                 assert_eq!(envelope.audio, input.audio);
                 assert_eq!(envelope.output, input.output);
                 assert_eq!(envelope.errors.len(), 2);
+                assert_eq!(envelope.errors[1]["provider"], json!("openai"));
                 assert_eq!(envelope.errors[1]["code"], json!("missing_openai_api_key"));
+                assert_eq!(
+                    envelope.errors[1]["transcription_outcome"],
+                    json!("unavailable_credentials")
+                );
+                assert_eq!(muninn::transcription_attempts(&envelope).len(), 1);
+                assert_eq!(
+                    muninn::transcription_attempts(&envelope)[0].outcome,
+                    muninn::TranscriptionAttemptOutcome::UnavailableCredentials
+                );
             }
             PreparedEnvelope::NeedsTranscription(_) => {
                 panic!("missing credentials should not attempt transcription")
@@ -577,12 +636,17 @@ mod tests {
         assert_eq!(envelope.transcript.provider.as_deref(), Some("openai"));
         assert!(envelope.transcript.raw_text.is_none());
         assert_eq!(
-            envelope.errors.last(),
-            Some(&json!({
-                "code": "empty_transcript_text",
-                "message": "OpenAI transcription returned an empty transcript",
-            }))
+            envelope
+                .errors
+                .last()
+                .and_then(|value| value.get("provider")),
+            Some(&json!("openai"))
         );
+        assert_eq!(
+            envelope.errors.last().and_then(|value| value.get("code")),
+            Some(&json!("empty_transcript_text"))
+        );
+        assert!(muninn::transcription_attempts(&envelope).is_empty());
     }
 
     #[test]

@@ -4,9 +4,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use muninn::config::{PipelineStepConfig, StepIoMode};
 use muninn::{
-    InProcessStepError, InProcessStepExecutor, MuninnEnvelopeV1, ResolvedBuiltinStepConfig,
-    StepFailureKind,
+    append_transcription_attempt, InProcessStepError, InProcessStepExecutor, MuninnEnvelopeV1,
+    ResolvedBuiltinStepConfig, StepFailureKind, TranscriptionAttempt, TranscriptionAttemptOutcome,
+    TranscriptionProvider,
 };
+use serde_json::json;
 
 use crate::{refine, stt_google_tool, stt_openai_tool};
 
@@ -20,6 +22,9 @@ pub enum BuiltinStepKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinStep {
+    SttAppleSpeech,
+    SttWhisperCpp,
+    SttDeepgram,
     SttOpenAi,
     SttGoogle,
     Refine,
@@ -28,6 +33,9 @@ pub enum BuiltinStep {
 impl BuiltinStep {
     pub const fn canonical_name(self) -> &'static str {
         match self {
+            Self::SttAppleSpeech => "stt_apple_speech",
+            Self::SttWhisperCpp => "stt_whisper_cpp",
+            Self::SttDeepgram => "stt_deepgram",
             Self::SttOpenAi => "stt_openai",
             Self::SttGoogle => "stt_google",
             Self::Refine => "refine",
@@ -36,7 +44,11 @@ impl BuiltinStep {
 
     pub const fn kind(self) -> BuiltinStepKind {
         match self {
-            Self::SttOpenAi | Self::SttGoogle => BuiltinStepKind::Transcription,
+            Self::SttAppleSpeech
+            | Self::SttWhisperCpp
+            | Self::SttDeepgram
+            | Self::SttOpenAi
+            | Self::SttGoogle => BuiltinStepKind::Transcription,
             Self::Refine => BuiltinStepKind::Transform,
         }
     }
@@ -47,6 +59,13 @@ impl BuiltinStep {
 
     pub fn run_as_internal_tool(self) -> ExitCode {
         match self {
+            Self::SttAppleSpeech => {
+                run_unavailable_transcription_cli(TranscriptionProvider::AppleSpeech)
+            }
+            Self::SttWhisperCpp => {
+                run_unavailable_transcription_cli(TranscriptionProvider::WhisperCpp)
+            }
+            Self::SttDeepgram => run_unavailable_transcription_cli(TranscriptionProvider::Deepgram),
             Self::SttOpenAi => stt_openai_tool::run_as_internal_tool(),
             Self::SttGoogle => stt_google_tool::run_as_internal_tool(),
             Self::Refine => refine::run_as_internal_tool(),
@@ -59,6 +78,18 @@ impl BuiltinStep {
         config: &ResolvedBuiltinStepConfig,
     ) -> Result<MuninnEnvelopeV1, InProcessStepError> {
         match self {
+            Self::SttAppleSpeech => Ok(execute_unavailable_transcription_step(
+                input,
+                TranscriptionProvider::AppleSpeech,
+            )),
+            Self::SttWhisperCpp => Ok(execute_unavailable_transcription_step(
+                input,
+                TranscriptionProvider::WhisperCpp,
+            )),
+            Self::SttDeepgram => Ok(execute_unavailable_transcription_step(
+                input,
+                TranscriptionProvider::Deepgram,
+            )),
             Self::SttOpenAi => stt_openai_tool::process_input_in_process(input, config)
                 .await
                 .map_err(map_internal_tool_error),
@@ -68,6 +99,91 @@ impl BuiltinStep {
             Self::Refine => refine::process_input_in_process(input, config)
                 .await
                 .map_err(map_internal_tool_error),
+        }
+    }
+}
+
+fn run_unavailable_transcription_cli(provider: TranscriptionProvider) -> ExitCode {
+    let attempt = unavailable_transcription_attempt(provider);
+    eprintln!(
+        "{}",
+        json!({
+            "error": {
+                "provider": provider.config_id(),
+                "code": attempt.code,
+                "message": attempt.detail,
+                "transcription_outcome": attempt.outcome,
+            }
+        })
+    );
+    ExitCode::FAILURE
+}
+
+fn execute_unavailable_transcription_step(
+    input: &MuninnEnvelopeV1,
+    provider: TranscriptionProvider,
+) -> MuninnEnvelopeV1 {
+    if input
+        .transcript
+        .raw_text
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        return input.clone();
+    }
+
+    let attempt = unavailable_transcription_attempt(provider);
+    let mut envelope = input.clone();
+    append_transcription_attempt(&mut envelope, attempt.clone());
+    envelope.errors.push(json!({
+        "provider": provider.config_id(),
+        "code": attempt.code,
+        "message": attempt.detail,
+        "transcription_outcome": attempt.outcome,
+    }));
+    envelope
+}
+
+fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> TranscriptionAttempt {
+    match provider {
+        TranscriptionProvider::AppleSpeech if !cfg!(target_os = "macos") => TranscriptionAttempt::new(
+            provider,
+            TranscriptionAttemptOutcome::UnavailablePlatform,
+            "unsupported_apple_speech_platform",
+            "Apple Speech transcription requires macOS",
+        ),
+        TranscriptionProvider::AppleSpeech => TranscriptionAttempt::new(
+            provider,
+            TranscriptionAttemptOutcome::UnavailableRuntimeCapability,
+            "apple_speech_backend_unavailable",
+            "Apple Speech transcription is not available in this build yet",
+        ),
+        TranscriptionProvider::WhisperCpp => TranscriptionAttempt::new(
+            provider,
+            TranscriptionAttemptOutcome::UnavailableAssets,
+            "missing_whisper_cpp_assets",
+            "whisper.cpp assets are not available in this build yet",
+        ),
+        TranscriptionProvider::Deepgram
+            if std::env::var("DEEPGRAM_API_KEY")
+                .ok()
+                .map_or(true, |value| value.trim().is_empty()) =>
+        {
+            TranscriptionAttempt::new(
+                provider,
+                TranscriptionAttemptOutcome::UnavailableCredentials,
+                "missing_deepgram_api_key",
+                "missing Deepgram API key; set DEEPGRAM_API_KEY before using the Deepgram route leg",
+            )
+        }
+        TranscriptionProvider::Deepgram => TranscriptionAttempt::new(
+            provider,
+            TranscriptionAttemptOutcome::UnavailableRuntimeCapability,
+            "deepgram_backend_unavailable",
+            "Deepgram transcription is not available in this build yet",
+        ),
+        TranscriptionProvider::OpenAi | TranscriptionProvider::Google => {
+            unreachable!("implemented providers should not use the unavailable placeholder path")
         }
     }
 }
@@ -119,9 +235,17 @@ pub fn is_transcription_step(step: &PipelineStepConfig) -> bool {
 }
 
 pub fn lookup_builtin_step(raw: &str) -> Option<BuiltinStep> {
+    if let Some(provider) = TranscriptionProvider::lookup_step_name(raw) {
+        return Some(match provider {
+            TranscriptionProvider::AppleSpeech => BuiltinStep::SttAppleSpeech,
+            TranscriptionProvider::WhisperCpp => BuiltinStep::SttWhisperCpp,
+            TranscriptionProvider::Deepgram => BuiltinStep::SttDeepgram,
+            TranscriptionProvider::OpenAi => BuiltinStep::SttOpenAi,
+            TranscriptionProvider::Google => BuiltinStep::SttGoogle,
+        });
+    }
+
     match raw {
-        "stt_openai" => Some(BuiltinStep::SttOpenAi),
-        "stt_google" => Some(BuiltinStep::SttGoogle),
         "refine" => Some(BuiltinStep::Refine),
         _ => None,
     }
@@ -217,6 +341,18 @@ mod tests {
     #[test]
     fn lookup_builtin_step_accepts_only_canonical_builtin_names() {
         assert_eq!(
+            lookup_builtin_step("stt_apple_speech").map(BuiltinStep::canonical_name),
+            Some("stt_apple_speech")
+        );
+        assert_eq!(
+            lookup_builtin_step("stt_whisper_cpp").map(BuiltinStep::canonical_name),
+            Some("stt_whisper_cpp")
+        );
+        assert_eq!(
+            lookup_builtin_step("stt_deepgram").map(BuiltinStep::canonical_name),
+            Some("stt_deepgram")
+        );
+        assert_eq!(
             lookup_builtin_step("stt_openai").map(BuiltinStep::canonical_name),
             Some("stt_openai")
         );
@@ -235,6 +371,9 @@ mod tests {
 
     #[test]
     fn classifies_transcription_steps_from_registry() {
+        assert!(BuiltinStep::SttAppleSpeech.is_transcription());
+        assert!(BuiltinStep::SttWhisperCpp.is_transcription());
+        assert!(BuiltinStep::SttDeepgram.is_transcription());
         assert!(BuiltinStep::SttOpenAi.is_transcription());
         assert!(BuiltinStep::SttGoogle.is_transcription());
         assert!(!BuiltinStep::Refine.is_transcription());

@@ -6,10 +6,11 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use muninn::config::PipelineConfig;
 use muninn::{
-    AppConfig, AppEvent, AppState, IndicatorAdapter, IndicatorState, MacosPermissionsAdapter,
+    attach_transcription_route, resolved_transcription_route, transcription_attempts, AppConfig,
+    AppEvent, AppState, IndicatorAdapter, IndicatorState, MacosPermissionsAdapter,
     MacosTextInjector, MuninnEnvelopeV1, Orchestrator, PipelineOutcome, PipelineRunner,
     PipelineStopReason, PipelineTraceEntry, ResolvedBuiltinStepConfig, ResolvedUtteranceConfig,
-    TextInjector,
+    TextInjector, TranscriptionAttemptOutcome,
 };
 use serde_json::Value;
 use tracing::{info, warn};
@@ -34,7 +35,7 @@ where
     I: IndicatorAdapter,
 {
     let result = async {
-        let envelope = build_envelope(&context.resolved.effective_config, recorded);
+        let envelope = build_envelope(context.resolved, recorded);
         let mut outcome = run_pipeline_with_indicator_stages(
             context.pipeline,
             context.runner,
@@ -358,6 +359,8 @@ fn duration_to_u64_ms(duration: Duration) -> u64 {
 }
 
 fn log_pipeline_outcome_diagnostics(outcome: &PipelineOutcome) {
+    log_transcription_route_diagnostics(outcome);
+
     let trace = match outcome {
         PipelineOutcome::Completed { trace, .. }
         | PipelineOutcome::FallbackRaw { trace, .. }
@@ -393,11 +396,17 @@ fn log_pipeline_outcome_diagnostics(outcome: &PipelineOutcome) {
     );
 }
 
-fn build_envelope(_config: &AppConfig, recorded: &muninn::RecordedAudio) -> MuninnEnvelopeV1 {
-    MuninnEnvelopeV1::new(Uuid::now_v7().to_string(), Utc::now().to_rfc3339()).with_audio(
-        Some(recorded.wav_path.display().to_string()),
-        recorded.duration_ms,
-    )
+fn build_envelope(
+    resolved: &ResolvedUtteranceConfig,
+    recorded: &muninn::RecordedAudio,
+) -> MuninnEnvelopeV1 {
+    let mut envelope = MuninnEnvelopeV1::new(Uuid::now_v7().to_string(), Utc::now().to_rfc3339())
+        .with_audio(
+            Some(recorded.wav_path.display().to_string()),
+            recorded.duration_ms,
+        );
+    attach_transcription_route(&mut envelope, &resolved.transcription_route);
+    envelope
 }
 
 fn outcome_contains_missing_credential_error(outcome: &PipelineOutcome) -> bool {
@@ -430,6 +439,14 @@ fn stderr_contains_missing_credential_error(stderr: &str) -> bool {
 }
 
 fn value_contains_missing_credential_error(value: &Value) -> bool {
+    if value
+        .get("transcription_outcome")
+        .and_then(Value::as_str)
+        .is_some_and(|outcome| outcome == "unavailable_credentials")
+    {
+        return true;
+    }
+
     value
         .pointer("/error/code")
         .or_else(|| value.get("code"))
@@ -440,8 +457,56 @@ fn value_contains_missing_credential_error(value: &Value) -> bool {
 fn is_missing_credential_error_code(code: &str) -> bool {
     matches!(
         code,
-        "missing_openai_api_key" | "missing_google_credentials"
+        "missing_openai_api_key" | "missing_google_credentials" | "missing_deepgram_api_key"
     )
+}
+
+fn log_transcription_route_diagnostics(outcome: &PipelineOutcome) {
+    let envelope = match outcome {
+        PipelineOutcome::Completed { envelope, .. }
+        | PipelineOutcome::FallbackRaw { envelope, .. } => envelope,
+        PipelineOutcome::Aborted { .. } => return,
+    };
+
+    let attempts = transcription_attempts(envelope);
+    if attempts.is_empty() {
+        return;
+    }
+
+    let route = resolved_transcription_route(envelope)
+        .map(|route| {
+            route
+                .providers
+                .into_iter()
+                .map(|provider| provider.to_string())
+                .collect::<Vec<_>>()
+                .join(" -> ")
+        })
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let attempt_summary = attempts
+        .iter()
+        .map(|attempt| format!("{}:{}", attempt.provider, attempt.code))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let produced_transcript = attempts
+        .iter()
+        .any(|attempt| attempt.outcome == TranscriptionAttemptOutcome::ProducedTranscript);
+
+    if produced_transcript {
+        info!(
+            target: logging::TARGET_PIPELINE,
+            route = %route,
+            attempts = %attempt_summary,
+            "transcription route attempted providers"
+        );
+    } else {
+        warn!(
+            target: logging::TARGET_PIPELINE,
+            route = %route,
+            attempts = %attempt_summary,
+            "transcription route exhausted without transcript"
+        );
+    }
 }
 
 fn resolve_step_command(cmd: &str) -> Result<String> {
