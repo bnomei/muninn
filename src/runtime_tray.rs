@@ -21,6 +21,7 @@ pub(crate) enum UserEvent {
     PreviewContextUpdated(TargetContextSnapshot),
     ConfigReloaded(Box<AppConfig>),
     ConfigReloadFailed(String),
+    RetryPendingConfigReload,
     RuntimeFailure(String),
 }
 

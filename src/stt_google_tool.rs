@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use tracing::{error, warn};
 
 const DEFAULT_LANGUAGE_CODE: &str = "en-US";
+const PROVIDER_LOG_TARGET: &str = "provider";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
@@ -47,7 +48,7 @@ impl CliError {
 
 fn log_provider_error(error: &CliError) {
     error!(
-        target: crate::logging::TARGET_PROVIDER,
+        target: PROVIDER_LOG_TARGET,
         provider = "google",
         code = error.code,
         detail = %error.message,
@@ -57,7 +58,7 @@ fn log_provider_error(error: &CliError) {
 
 fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
     warn!(
-        target: crate::logging::TARGET_PROVIDER,
+        target: PROVIDER_LOG_TARGET,
         provider = "google",
         code,
         detail = detail.as_ref(),
@@ -235,15 +236,9 @@ where
 async fn transcribe_with_google(
     request: &PreparedTranscriptionRequest,
 ) -> Result<String, CliError> {
-    let wav = load_wav_metadata(&request.wav_path).map_err(|error| {
-        log_provider_error(&error);
-        error
-    })?;
-    let body =
-        google_request_body(&request.wav_path, wav, request.model.as_deref()).map_err(|error| {
-            log_provider_error(&error);
-            error
-        })?;
+    let wav = load_wav_metadata(&request.wav_path).inspect_err(log_provider_error)?;
+    let body = google_request_body(&request.wav_path, wav, request.model.as_deref())
+        .inspect_err(log_provider_error)?;
 
     let mut endpoint = Url::parse(&request.endpoint).map_err(|source| {
         let error = CliError::new(

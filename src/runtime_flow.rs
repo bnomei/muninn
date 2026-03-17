@@ -129,20 +129,30 @@ where
             .set_state_with_glyph(IndicatorState::Pipeline, glyph)
             .await?;
         self.state = self.state.on_event(AppEvent::ProcessingFinished);
-        if let Some(text) = route.target.text() {
-            self.indicator
-                .set_temporary_state_with_glyph(
-                    IndicatorState::Output,
-                    glyph,
-                    output_indicator_min_duration,
-                    IndicatorState::Idle,
-                    None,
-                )
-                .await?;
-            self.injector.inject_checked(text).await?;
+        let route_result = async {
+            if let Some(text) = route.target.text() {
+                self.indicator
+                    .set_temporary_state_with_glyph(
+                        IndicatorState::Output,
+                        glyph,
+                        output_indicator_min_duration,
+                        IndicatorState::Idle,
+                        None,
+                    )
+                    .await?;
+                self.injector.inject_checked(text).await?;
+            }
+            Ok::<(), crate::MacosAdapterError>(())
         }
+        .await;
 
         self.state = self.state.on_event(AppEvent::InjectionFinished);
+        if let Err(error) = route_result {
+            if matches!(self.indicator.state().await, Ok(IndicatorState::Pipeline)) {
+                let _ = self.indicator.set_state(IndicatorState::Idle).await;
+            }
+            return Err(error);
+        }
         if matches!(self.indicator.state().await?, IndicatorState::Pipeline) {
             self.indicator.set_state(IndicatorState::Idle).await?;
         }
@@ -209,7 +219,8 @@ pub fn map_hotkey_event(event: HotkeyEvent) -> Option<AppEvent> {
         (HotkeyAction::CancelCurrentCapture, HotkeyEventKind::Pressed) => {
             Some(AppEvent::CancelPressed)
         }
-        _ => None,
+        (HotkeyAction::DoneModeToggle, HotkeyEventKind::Released)
+        | (HotkeyAction::CancelCurrentCapture, HotkeyEventKind::Released) => None,
     }
 }
 
@@ -217,8 +228,8 @@ pub fn map_hotkey_event(event: HotkeyEvent) -> Option<AppEvent> {
 mod tests {
     use super::*;
     use crate::{
-        InjectionRouteReason, InjectionTarget, MockAudioRecorder, MockIndicatorAdapter,
-        MockTextInjector,
+        InjectionRouteReason, InjectionTarget, MacosAdapterError, MockAudioRecorder,
+        MockIndicatorAdapter, MockTextInjector,
     };
 
     #[tokio::test(flavor = "current_thread")]
@@ -266,5 +277,55 @@ mod tests {
                 IndicatorState::Idle,
             ]
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_returns_to_idle_when_injection_fails() {
+        let indicator = MockIndicatorAdapter::new();
+        let recorder = MockAudioRecorder::new();
+        let injector = MockTextInjector::new();
+        injector.enqueue_inject_error(MacosAdapterError::operation_failed("injector", "boom"));
+        let mut coordinator =
+            RuntimeFlowCoordinator::new(indicator.clone(), recorder, injector.clone());
+
+        coordinator
+            .initialize()
+            .await
+            .expect("initialize should work");
+        coordinator
+            .start_push_to_talk(Some('T'))
+            .await
+            .expect("start should work");
+        coordinator
+            .finish_push_to_talk_for_processing(IndicatorState::Transcribing, Some('T'))
+            .await
+            .expect("stop should work")
+            .expect("recorded audio expected");
+
+        let route = InjectionRoute {
+            target: InjectionTarget::TranscriptRawText("ship to sf".to_string()),
+            reason: InjectionRouteReason::SelectedTranscriptRawText,
+            pipeline_stop_reason: None,
+        };
+        let error = coordinator
+            .complete_processing_with_route(&route, Some('T'), Duration::from_millis(1))
+            .await
+            .expect_err("injection failure should surface");
+
+        assert_eq!(coordinator.state(), AppState::Idle);
+        assert_eq!(injector.inject_calls(), 1);
+        assert_eq!(
+            indicator.state_history(),
+            vec![
+                IndicatorState::Recording {
+                    mode: RecordingMode::PushToTalk
+                },
+                IndicatorState::Transcribing,
+                IndicatorState::Pipeline,
+                IndicatorState::Output,
+                IndicatorState::Idle,
+            ]
+        );
+        assert!(error.to_string().contains("boom"));
     }
 }

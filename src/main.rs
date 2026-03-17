@@ -506,12 +506,6 @@ mod tests {
             accessibility: PermissionStatus::Granted,
             input_monitoring: PermissionStatus::Denied,
         });
-        permissions.set_request_input_monitoring_result(false);
-        permissions.set_post_request_preflight_status(PermissionPreflightStatus {
-            microphone: PermissionStatus::Granted,
-            accessibility: PermissionStatus::Granted,
-            input_monitoring: PermissionStatus::Denied,
-        });
 
         let refreshed =
             refresh_recording_permissions_for_user_action(&permissions, RecordingStartSource::Tray)
@@ -519,7 +513,7 @@ mod tests {
                 .expect("permission refresh should succeed");
 
         assert!(!refreshed.requested_microphone);
-        assert!(refreshed.requested_input_monitoring);
+        assert!(!refreshed.requested_input_monitoring);
         assert_eq!(
             refreshed.preflight,
             PermissionPreflightStatus {
@@ -528,9 +522,9 @@ mod tests {
                 input_monitoring: PermissionStatus::Denied,
             }
         );
-        assert_eq!(permissions.preflight_calls(), 2);
+        assert_eq!(permissions.preflight_calls(), 1);
         assert_eq!(permissions.request_microphone_calls(), 0);
-        assert_eq!(permissions.request_input_monitoring_calls(), 1);
+        assert_eq!(permissions.request_input_monitoring_calls(), 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

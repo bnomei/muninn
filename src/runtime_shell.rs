@@ -6,7 +6,7 @@ use muninn::{
     IndicatorState, PermissionPreflightStatus, PermissionsAdapter, Platform,
 };
 use tao::event::{Event, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 #[cfg(target_os = "macos")]
 use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
 use tracing::{error, info, warn};
@@ -18,6 +18,8 @@ use crate::runtime_tray::{
 };
 use crate::runtime_worker::{spawn_runtime_worker, RuntimeMessage};
 use crate::{config_watch, logging};
+
+const CONFIG_RELOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 pub(crate) struct AppRuntime {
     config_path: PathBuf,
@@ -115,15 +117,32 @@ impl AppRuntime {
                 }
                 Event::UserEvent(UserEvent::TrayEvent(event)) => {
                     if let Some(app_event) = map_tray_event(&event) {
-                        if runtime_event_tx
-                            .try_send(RuntimeMessage::AppEvent(app_event))
-                            .is_err()
-                        {
-                            warn!(
-                                target: logging::TARGET_HOTKEY,
-                                ?app_event,
-                                "dropped tray interaction while runtime queue was full"
-                            );
+                        match runtime_event_tx.try_send(RuntimeMessage::AppEvent(app_event)) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                RuntimeMessage::AppEvent(app_event),
+                            )) => {
+                                warn!(
+                                    target: logging::TARGET_HOTKEY,
+                                    ?app_event,
+                                    "dropped tray interaction while runtime queue was full"
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(
+                                RuntimeMessage::AppEvent(app_event),
+                            )) => {
+                                warn!(
+                                    target: logging::TARGET_RUNTIME,
+                                    ?app_event,
+                                    "dropped tray interaction because runtime worker channel closed"
+                                );
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(
+                                RuntimeMessage::ReloadConfig(_),
+                            ))
+                            | Err(tokio::sync::mpsc::error::TrySendError::Closed(
+                                RuntimeMessage::ReloadConfig(_),
+                            )) => unreachable!("tray forwarding only sends app events"),
                         }
                     }
 
@@ -188,6 +207,7 @@ impl AppRuntime {
                             RuntimeMessage::ReloadConfig(config),
                         )) => {
                             pending_config_reload = Some(config);
+                            schedule_pending_config_reload_retry(&proxy);
                             info!(
                                 target: logging::TARGET_CONFIG,
                                 "queued latest config reload for next available runtime slot"
@@ -211,8 +231,15 @@ impl AppRuntime {
                         "live config reload failed; keeping previous config"
                     );
                 }
+                Event::UserEvent(UserEvent::RetryPendingConfigReload) => {
+                    if pending_config_reload.is_some() {
+                        schedule_pending_config_reload_retry(&proxy);
+                    }
+                }
                 Event::UserEvent(UserEvent::RuntimeFailure(message)) => {
                     error!(target: logging::TARGET_RUNTIME, %message, "runtime worker failed");
+                    last_indicator_state = IndicatorState::Idle;
+                    last_active_glyph = None;
                     if let Some(icon) = tray_icon.as_ref() {
                         update_tray_appearance(
                             icon,
@@ -229,4 +256,12 @@ impl AppRuntime {
             let _keep_alive = tray_icon.as_ref();
         });
     }
+}
+
+fn schedule_pending_config_reload_retry(proxy: &EventLoopProxy<UserEvent>) {
+    let proxy = proxy.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(CONFIG_RELOAD_RETRY_DELAY);
+        let _ = proxy.send_event(UserEvent::RetryPendingConfigReload);
+    });
 }

@@ -200,11 +200,11 @@ where
                     coordinator
                         .recorder_mut()
                         .set_recording_config(resolved.effective_config.recording.clone());
+                    let started = std::time::Instant::now();
                     coordinator
                         .start_push_to_talk(resolved.voice_glyph)
                         .await
                         .context("starting push-to-talk recording flow")?;
-                    let started = std::time::Instant::now();
                     active_utterance = Some(ActiveUtterance { resolved });
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
@@ -214,7 +214,7 @@ where
                 (AppState::Idle, AppEvent::DoneTogglePressed, AppState::RecordingDone) => {
                     let recording_permissions = refresh_recording_permissions_for_user_action(
                         &permissions,
-                        RecordingStartSource::Hotkey,
+                        recording_source,
                     )
                     .await
                     .context("refreshing permissions before done-mode recording")?;
@@ -223,7 +223,7 @@ where
                         self.preflight,
                         recording_permissions.requested_microphone,
                         recording_permissions.requested_input_monitoring,
-                        RecordingStartSource::Hotkey,
+                        recording_source,
                     ) {
                         continue;
                     }
@@ -241,11 +241,11 @@ where
                     coordinator
                         .recorder_mut()
                         .set_recording_config(resolved.effective_config.recording.clone());
+                    let started = std::time::Instant::now();
                     coordinator
                         .start_done_mode(resolved.voice_glyph)
                         .await
                         .context("starting done-mode recording flow")?;
-                    let started = std::time::Instant::now();
                     active_utterance = Some(ActiveUtterance { resolved });
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
@@ -379,7 +379,7 @@ pub(crate) enum RecordingStartSource {
 
 pub(crate) async fn refresh_recording_permissions_for_user_action<A>(
     permissions: &A,
-    _source: RecordingStartSource,
+    source: RecordingStartSource,
 ) -> Result<RecordingPermissionRefresh>
 where
     A: PermissionsAdapter,
@@ -401,10 +401,12 @@ where
         preflight = refresh_permissions_status_with(permissions).await?;
     }
 
-    if matches!(
-        preflight.input_monitoring,
-        PermissionStatus::Denied | PermissionStatus::NotDetermined
-    ) {
+    if matches!(source, RecordingStartSource::Hotkey)
+        && matches!(
+            preflight.input_monitoring,
+            PermissionStatus::Denied | PermissionStatus::NotDetermined
+        )
+    {
         requested_input_monitoring = true;
         let granted = permissions
             .request_input_monitoring_access()

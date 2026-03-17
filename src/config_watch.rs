@@ -88,7 +88,10 @@ pub(crate) fn preview_context_key(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigFingerprint {
     Missing,
-    Metadata { modified_at: SystemTime, len: u64 },
+    Metadata {
+        modified_at: Option<SystemTime>,
+        len: u64,
+    },
     Unreadable(String),
 }
 
@@ -101,12 +104,9 @@ enum ConfigSnapshot {
 
 pub(crate) fn read_config_fingerprint(path: &Path) -> ConfigFingerprint {
     match fs::metadata(path) {
-        Ok(metadata) => match metadata.modified() {
-            Ok(modified_at) => ConfigFingerprint::Metadata {
-                modified_at,
-                len: metadata.len(),
-            },
-            Err(error) => ConfigFingerprint::Unreadable(error.to_string()),
+        Ok(metadata) => ConfigFingerprint::Metadata {
+            modified_at: metadata.modified().ok(),
+            len: metadata.len(),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => ConfigFingerprint::Missing,
         Err(error) => ConfigFingerprint::Unreadable(error.to_string()),
