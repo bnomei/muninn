@@ -224,6 +224,7 @@ impl AppConfig {
             voice_id: selection.voice_id,
             voice_glyph: selection.voice_glyph,
             fallback_reason: selection.fallback_reason,
+            builtin_steps: ResolvedBuiltinStepConfig::from_app_config(&effective_config),
             effective_config,
         }
     }
@@ -985,6 +986,25 @@ pub struct ResolvedUtteranceConfig {
     pub voice_glyph: Option<char>,
     pub fallback_reason: Option<String>,
     pub effective_config: AppConfig,
+    pub builtin_steps: ResolvedBuiltinStepConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBuiltinStepConfig {
+    pub transcript: TranscriptConfig,
+    pub refine: RefineConfig,
+    pub providers: ProvidersConfig,
+}
+
+impl ResolvedBuiltinStepConfig {
+    #[must_use]
+    pub fn from_app_config(config: &AppConfig) -> Self {
+        Self {
+            transcript: config.transcript.clone(),
+            refine: config.refine.clone(),
+            providers: config.providers.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

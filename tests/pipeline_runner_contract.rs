@@ -46,6 +46,79 @@ async fn contract_malformed_stdout_aborts() {
 }
 
 #[tokio::test]
+async fn contract_invalid_envelope_aborts() {
+    let runner = PipelineRunner::default();
+    let config = config_with_steps(
+        1_000,
+        vec![fixture_step(
+            "invalid-envelope",
+            &["--scenario", "invalid-envelope"],
+            2_000,
+            OnErrorPolicy::Abort,
+        )],
+    );
+
+    let outcome = runner.run(sample_envelope(), &config).await;
+
+    match outcome {
+        PipelineOutcome::Aborted { trace, reason } => {
+            assert_eq!(trace.len(), 1);
+            assert_eq!(trace[0].id, "invalid-envelope");
+            assert_eq!(trace[0].exit_status, Some(0));
+            assert_eq!(trace[0].policy_applied, PipelinePolicyApplied::Abort);
+
+            match reason {
+                PipelineStopReason::StepFailed {
+                    step_id,
+                    failure,
+                    message,
+                } => {
+                    assert_eq!(step_id, "invalid-envelope");
+                    assert_eq!(failure, StepFailureKind::InvalidEnvelope);
+                    assert!(
+                        message.starts_with("step JSON object was not a valid MuninnEnvelopeV1:")
+                    );
+                }
+                other => panic!("expected step failure reason, got {other:?}"),
+            }
+        }
+        other => panic!("expected aborted outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn contract_non_object_stdout_bypasses_in_non_strict_mode() {
+    let runner = PipelineRunner::new(false);
+    let config = config_with_steps(
+        1_000,
+        vec![fixture_step(
+            "non-object",
+            &["--scenario", "non-object-stdout"],
+            2_000,
+            OnErrorPolicy::Abort,
+        )],
+    );
+    let input = sample_envelope();
+
+    let outcome = runner.run(input.clone(), &config).await;
+
+    match outcome {
+        PipelineOutcome::Completed { envelope, trace } => {
+            assert_eq!(envelope, input);
+            assert_eq!(trace.len(), 1);
+            assert_eq!(trace[0].id, "non-object");
+            assert_eq!(trace[0].exit_status, Some(0));
+            assert_eq!(
+                trace[0].policy_applied,
+                PipelinePolicyApplied::ContractBypass
+            );
+            assert!(!trace[0].timed_out);
+        }
+        other => panic!("expected completed outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn contract_non_zero_exit_aborts() {
     let runner = PipelineRunner::default();
     let config = config_with_steps(

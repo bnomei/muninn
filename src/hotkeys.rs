@@ -356,6 +356,7 @@ fn record_hotkey_queue_drop(payload_kind: &'static str) {
     };
 
     warn!(
+        target: "hotkey",
         payload_kind,
         dropped_events = warning.dropped_events,
         queue_capacity = HOTKEY_EVENT_BUFFER_CAPACITY,

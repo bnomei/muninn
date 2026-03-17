@@ -53,6 +53,7 @@ objc2-core-graphics = "0.3.2"
 objc2-foundation = { version = "0.2.2", features = ["NSString"] }
 objc2 = "0.6.4"
 rdev = "0.5"
+tracing-oslog = "0.3"
 
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "4.3.0" }

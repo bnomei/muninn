@@ -16,6 +16,7 @@ pub mod orchestrator;
 pub mod permissions;
 pub mod platform;
 pub mod runner;
+pub mod runtime_flow;
 pub mod scoring;
 pub mod secrets;
 pub mod state;
@@ -25,8 +26,8 @@ pub use audio::MacosAudioRecorder;
 pub use config::{
     resolve_config_path, AppConfig, ConfigError, ConfigValidationError, OnErrorPolicy,
     PayloadFormat, ProfileConfig, ProfileRuleConfig, RecordingConfig, RefineOverrides,
-    ResolvedProfileSelection, ResolvedUtteranceConfig, TranscriptOverrides, TriggerType,
-    VoiceConfig,
+    ResolvedBuiltinStepConfig, ResolvedProfileSelection, ResolvedUtteranceConfig,
+    TranscriptOverrides, TriggerType, VoiceConfig,
 };
 pub use envelope::MuninnEnvelopeV1;
 pub use error::{MacosAdapterError, MacosAdapterResult, PermissionKind};
@@ -43,6 +44,7 @@ pub use runner::{
     InProcessStepError, InProcessStepExecutor, PipelineOutcome, PipelinePolicyApplied,
     PipelineRunner, PipelineStopReason, PipelineTraceEntry, StepFailureKind,
 };
+pub use runtime_flow::{map_hotkey_event, RuntimeFlowCoordinator};
 pub use scoring::{
     DecisionReason, ReplacementDecision, ReplacementDecisionInput, SpanMetadata, Thresholds,
 };

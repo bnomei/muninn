@@ -1,7 +1,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use muninn::resolve_secret;
-use muninn::AppConfig;
 use muninn::MuninnEnvelopeV1;
+use muninn::ResolvedBuiltinStepConfig;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Url;
 use serde::Serialize;
@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
+use tracing::{error, warn};
 
 const DEFAULT_LANGUAGE_CODE: &str = "en-US";
 
@@ -42,6 +43,26 @@ impl CliError {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
+}
+
+fn log_provider_error(error: &CliError) {
+    error!(
+        target: crate::logging::TARGET_PROVIDER,
+        provider = "google",
+        code = error.code,
+        detail = %error.message,
+        "Google transcription step failed"
+    );
+}
+
+fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
+    warn!(
+        target: crate::logging::TARGET_PROVIDER,
+        provider = "google",
+        code,
+        detail = detail.as_ref(),
+        "Google transcription step warning"
+    );
 }
 
 #[derive(Debug, Clone, Default)]
@@ -100,6 +121,7 @@ pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            log_provider_error(&error);
             eprintln!("{}", error.to_stderr_json());
             ExitCode::FAILURE
         }
@@ -149,10 +171,10 @@ where
 
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
-    config: &AppConfig,
+    config: &ResolvedBuiltinStepConfig,
 ) -> Result<MuninnEnvelopeV1, CliError> {
     let env_lookup = |key: &str| std::env::var(key).ok();
-    let resolved = resolved_config_from_app_config(config);
+    let resolved = resolved_config_from_builtin_steps(config);
     process_input(input.clone(), &env_lookup, &resolved).await
 }
 
@@ -176,10 +198,12 @@ where
 
     let credentials = resolve_google_credentials(get_env, &config.credentials);
     if !credentials.has_credentials() {
-        return Err(CliError::new(
+        let error = CliError::new(
             "missing_google_credentials",
             "missing Google credentials; set GOOGLE_API_KEY or GOOGLE_STT_TOKEN, or provide providers.google.api_key/providers.google.token in config",
-        ));
+        );
+        log_provider_warning(error.code, error.message());
+        return Err(error);
     }
 
     let wav_path = envelope
@@ -189,10 +213,12 @@ where
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| {
-            CliError::new(
+            let error = CliError::new(
                 "missing_audio_wav_path",
                 "transcript.raw_text is missing and audio.wav_path is required for Google transcription",
-            )
+            );
+            log_provider_warning(error.code, error.message());
+            error
         })?;
 
     Ok(PreparedEnvelope::NeedsTranscription(
@@ -209,14 +235,23 @@ where
 async fn transcribe_with_google(
     request: &PreparedTranscriptionRequest,
 ) -> Result<String, CliError> {
-    let wav = load_wav_metadata(&request.wav_path)?;
-    let body = google_request_body(&request.wav_path, wav, request.model.as_deref())?;
+    let wav = load_wav_metadata(&request.wav_path).map_err(|error| {
+        log_provider_error(&error);
+        error
+    })?;
+    let body =
+        google_request_body(&request.wav_path, wav, request.model.as_deref()).map_err(|error| {
+            log_provider_error(&error);
+            error
+        })?;
 
     let mut endpoint = Url::parse(&request.endpoint).map_err(|source| {
-        CliError::new(
+        let error = CliError::new(
             "invalid_google_endpoint",
             format!("invalid Google endpoint {}: {source}", request.endpoint),
-        )
+        );
+        log_provider_error(&error);
+        error
     })?;
     if request.credentials.token.is_none() {
         if let Some(api_key) = request.credentials.api_key.as_deref() {
@@ -233,29 +268,35 @@ async fn transcribe_with_google(
     }
 
     let response = builder.send().await.map_err(|source| {
-        CliError::new(
+        let error = CliError::new(
             "http_request_failed",
             format!("Google transcription request failed: {source}"),
-        )
+        );
+        log_provider_error(&error);
+        error
     })?;
 
     let status = response.status();
     let body = response.bytes().await.map_err(|source| {
-        CliError::new(
+        let error = CliError::new(
             "http_body_read_failed",
             format!("failed to read Google response body: {source}"),
-        )
+        );
+        log_provider_error(&error);
+        error
     })?;
 
     if !status.is_success() {
-        return Err(CliError::new(
+        let error = CliError::new(
             "google_http_error",
             format!(
                 "Google transcription request failed with status {}: {}",
                 status,
                 summarize_error_body(&body)
             ),
-        ));
+        );
+        log_provider_error(&error);
+        return Err(error);
     }
 
     extract_google_transcript_text(&body)
@@ -434,6 +475,10 @@ fn apply_google_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -
     envelope.transcript.provider = Some("google".to_string());
 
     if transcript.trim().is_empty() {
+        log_provider_warning(
+            "empty_transcript_text",
+            "Google transcription returned an empty transcript",
+        );
         envelope.transcript.raw_text = None;
         envelope.errors.push(json!({
             "code": "empty_transcript_text",
@@ -565,12 +610,21 @@ where
 }
 
 fn load_google_config_from_config() -> GoogleResolvedConfig {
-    let defaults = AppConfig::default().providers.google;
+    let defaults = muninn::AppConfig::default().providers.google;
 
-    AppConfig::load()
-        .ok()
-        .map(|config| resolved_config_from_app_config(&config))
-        .unwrap_or_else(|| GoogleResolvedConfig {
+    muninn::AppConfig::load()
+        .map(|config| {
+            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
+                &config,
+            ))
+        })
+        .inspect_err(|error| {
+            log_provider_warning(
+                "config_load_failed",
+                format!("failed to load AppConfig for Google provider: {error}"),
+            );
+        })
+        .unwrap_or_else(|_| GoogleResolvedConfig {
             credentials: GoogleCredentials {
                 api_key: resolve_secret(None, defaults.api_key),
                 token: resolve_secret(None, defaults.token),
@@ -580,7 +634,7 @@ fn load_google_config_from_config() -> GoogleResolvedConfig {
         })
 }
 
-fn resolved_config_from_app_config(config: &AppConfig) -> GoogleResolvedConfig {
+fn resolved_config_from_builtin_steps(config: &ResolvedBuiltinStepConfig) -> GoogleResolvedConfig {
     GoogleResolvedConfig {
         credentials: GoogleCredentials {
             api_key: resolve_secret(None, config.providers.google.api_key.clone()),
