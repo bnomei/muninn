@@ -2,6 +2,10 @@ use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use muninn::resolve_secret;
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
+use muninn::{
+    append_transcription_attempt, TranscriptionAttempt, TranscriptionAttemptOutcome,
+    TranscriptionProvider,
+};
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Url;
 use serde::Serialize;
@@ -164,8 +168,10 @@ where
     match prepare_envelope(input, get_env, config)? {
         PreparedEnvelope::Ready(envelope) => Ok(envelope),
         PreparedEnvelope::NeedsTranscription(request) => {
-            let transcript = transcribe_with_google(&request).await?;
-            Ok(apply_google_transcript(request.envelope, transcript))
+            match transcribe_with_google(&request).await {
+                Ok(transcript) => Ok(apply_google_transcript(request.envelope, transcript)),
+                Err(error) => Ok(apply_google_transcription_failure(request.envelope, &error)),
+            }
         }
     }
 }
@@ -199,12 +205,24 @@ where
 
     let credentials = resolve_google_credentials(get_env, &config.credentials);
     if !credentials.has_credentials() {
-        let error = CliError::new(
-            "missing_google_credentials",
-            "missing Google credentials; set GOOGLE_API_KEY or GOOGLE_STT_TOKEN, or provide providers.google.api_key/providers.google.token in config",
+        let detail = "missing Google credentials; set GOOGLE_API_KEY or GOOGLE_STT_TOKEN, or provide providers.google.api_key/providers.google.token in config";
+        append_transcription_attempt(
+            &mut envelope,
+            TranscriptionAttempt::new(
+                TranscriptionProvider::Google,
+                TranscriptionAttemptOutcome::UnavailableCredentials,
+                "missing_google_credentials",
+                detail,
+            ),
         );
-        log_provider_warning(error.code, error.message());
-        return Err(error);
+        log_provider_warning("missing_google_credentials", detail);
+        envelope.errors.push(json!({
+            "provider": "google",
+            "code": "missing_google_credentials",
+            "message": detail,
+            "transcription_outcome": "unavailable_credentials",
+        }));
+        return Ok(PreparedEnvelope::Ready(envelope));
     }
 
     let wav_path = envelope
@@ -470,19 +488,60 @@ fn apply_google_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -
     envelope.transcript.provider = Some("google".to_string());
 
     if transcript.trim().is_empty() {
+        append_transcription_attempt(
+            &mut envelope,
+            TranscriptionAttempt::new(
+                TranscriptionProvider::Google,
+                TranscriptionAttemptOutcome::EmptyTranscript,
+                "empty_transcript_text",
+                "Google transcription returned an empty transcript",
+            ),
+        );
         log_provider_warning(
             "empty_transcript_text",
             "Google transcription returned an empty transcript",
         );
         envelope.transcript.raw_text = None;
         envelope.errors.push(json!({
+            "provider": "google",
             "code": "empty_transcript_text",
             "message": "Google transcription returned an empty transcript",
         }));
     } else {
+        append_transcription_attempt(
+            &mut envelope,
+            TranscriptionAttempt::new(
+                TranscriptionProvider::Google,
+                TranscriptionAttemptOutcome::ProducedTranscript,
+                "produced_transcript",
+                "Google transcription produced transcript text",
+            ),
+        );
         envelope.transcript.raw_text = Some(transcript);
     }
 
+    envelope
+}
+
+fn apply_google_transcription_failure(
+    mut envelope: MuninnEnvelopeV1,
+    error: &CliError,
+) -> MuninnEnvelopeV1 {
+    append_transcription_attempt(
+        &mut envelope,
+        TranscriptionAttempt::new(
+            TranscriptionProvider::Google,
+            TranscriptionAttemptOutcome::RequestFailed,
+            error.code,
+            error.message(),
+        ),
+    );
+    envelope.errors.push(json!({
+        "provider": "google",
+        "code": error.code,
+        "message": error.message(),
+        "transcription_outcome": "request_failed",
+    }));
     envelope
 }
 
@@ -813,10 +872,10 @@ mod tests {
     }
 
     #[test]
-    fn errors_when_credentials_missing_everywhere() {
+    fn missing_credentials_pass_through_for_later_stt_steps() {
         let input = baseline_envelope();
 
-        let error = prepare_envelope(
+        let prepared = prepare_envelope(
             input,
             &env_lookup(&[]),
             &GoogleResolvedConfig {
@@ -825,10 +884,38 @@ mod tests {
                 model: config().model,
             },
         )
-        .expect_err("missing credentials should fail");
-        assert_eq!(error.code, "missing_google_credentials");
-        assert!(error.message.contains("GOOGLE_API_KEY"));
-        assert!(error.message.contains("GOOGLE_STT_TOKEN"));
+        .expect("missing credentials should pass through");
+
+        match prepared {
+            PreparedEnvelope::Ready(envelope) => {
+                assert_eq!(
+                    envelope
+                        .errors
+                        .last()
+                        .and_then(|value| value.get("provider")),
+                    Some(&json!("google"))
+                );
+                assert_eq!(
+                    envelope.errors.last().and_then(|value| value.get("code")),
+                    Some(&json!("missing_google_credentials"))
+                );
+                assert_eq!(
+                    envelope
+                        .errors
+                        .last()
+                        .and_then(|value| value.get("transcription_outcome")),
+                    Some(&json!("unavailable_credentials"))
+                );
+                assert_eq!(muninn::transcription_attempts(&envelope).len(), 1);
+                assert_eq!(
+                    muninn::transcription_attempts(&envelope)[0].outcome,
+                    muninn::TranscriptionAttemptOutcome::UnavailableCredentials
+                );
+            }
+            PreparedEnvelope::NeedsTranscription(_) => {
+                panic!("missing credentials should not attempt transcription")
+            }
+        }
     }
 
     #[test]
@@ -861,11 +948,20 @@ mod tests {
         assert_eq!(envelope.transcript.provider.as_deref(), Some("google"));
         assert!(envelope.transcript.raw_text.is_none());
         assert_eq!(
-            envelope.errors.last(),
-            Some(&json!({
-                "code": "empty_transcript_text",
-                "message": "Google transcription returned an empty transcript",
-            }))
+            envelope
+                .errors
+                .last()
+                .and_then(|value| value.get("provider")),
+            Some(&json!("google"))
+        );
+        assert_eq!(
+            envelope.errors.last().and_then(|value| value.get("code")),
+            Some(&json!("empty_transcript_text"))
+        );
+        assert_eq!(muninn::transcription_attempts(&envelope).len(), 1);
+        assert_eq!(
+            muninn::transcription_attempts(&envelope)[0].outcome,
+            muninn::TranscriptionAttemptOutcome::EmptyTranscript
         );
     }
 

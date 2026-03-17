@@ -15,7 +15,8 @@ use muninn::scoring::{apply_scored_replacements_to_envelope, Thresholds};
 use muninn::{
     InProcessStepError, InProcessStepExecutor, InjectionRoute, InjectionRouteReason,
     InjectionTarget, MuninnEnvelopeV1, PipelineOutcome, PipelinePolicyApplied, PipelineRunner,
-    PipelineTraceEntry, RecordedAudio, ResolvedUtteranceConfig, TargetContextSnapshot,
+    PipelineTraceEntry, RecordedAudio, ResolvedTranscriptionRoute, ResolvedUtteranceConfig,
+    TargetContextSnapshot, TranscriptionRouteSource,
 };
 use serde_json::json;
 use tempfile::{NamedTempFile, TempDir};
@@ -530,6 +531,10 @@ fn replay_bench_input(replay_retain_audio: bool) -> ReplayBenchInput {
             voice_id: Some("voice_default".to_string()),
             voice_glyph: Some('D'),
             fallback_reason: None,
+            transcription_route: ResolvedTranscriptionRoute {
+                providers: Vec::new(),
+                source: TranscriptionRouteSource::PipelineInferred,
+            },
             builtin_steps: muninn::ResolvedBuiltinStepConfig::from_app_config(&config),
             effective_config: config,
         },

@@ -21,13 +21,14 @@ pub mod scoring;
 pub mod secrets;
 pub mod state;
 pub mod target_context;
+pub mod transcription;
 
 pub use audio::MacosAudioRecorder;
 pub use config::{
     resolve_config_path, AppConfig, ConfigError, ConfigValidationError, OnErrorPolicy,
     PayloadFormat, ProfileConfig, ProfileRuleConfig, RecordingConfig, RefineOverrides,
     ResolvedBuiltinStepConfig, ResolvedProfileSelection, ResolvedUtteranceConfig,
-    TranscriptOverrides, TriggerType, VoiceConfig,
+    TranscriptOverrides, TranscriptionConfig, TriggerType, VoiceConfig,
 };
 pub use envelope::MuninnEnvelopeV1;
 pub use error::{MacosAdapterError, MacosAdapterResult, PermissionKind};
@@ -51,6 +52,11 @@ pub use scoring::{
 pub use secrets::{resolve_secret, resolve_secret_from_env};
 pub use state::{AppEvent, AppState};
 pub use target_context::{capture_frontmost_target_context, TargetContextSnapshot};
+pub use transcription::{
+    append_transcription_attempt, attach_transcription_route, resolved_transcription_route,
+    transcription_attempts, ResolvedTranscriptionRoute, TranscriptionAttempt,
+    TranscriptionAttemptOutcome, TranscriptionProvider, TranscriptionRouteSource,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {

@@ -13,8 +13,11 @@ use muninn::MuninnEnvelopeV1;
 use muninn::PipelineOutcome;
 use muninn::PipelineTraceEntry;
 use muninn::RecordedAudio;
+use muninn::ResolvedTranscriptionRoute;
 use muninn::ResolvedUtteranceConfig;
 use muninn::TargetContextSnapshot;
+#[cfg(test)]
+use muninn::TranscriptionRouteSource;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -58,6 +61,7 @@ struct ReplayResolutionContext {
     voice_id: Option<String>,
     voice_glyph: Option<char>,
     fallback_reason: Option<String>,
+    transcription_route: ResolvedTranscriptionRoute,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +115,7 @@ pub fn persist_replay(
         voice_id: resolved.voice_id,
         voice_glyph: resolved.voice_glyph,
         fallback_reason: resolved.fallback_reason,
+        transcription_route: resolved.transcription_route,
     };
 
     let record = ReplayRecord {
@@ -526,6 +531,10 @@ mod tests {
             voice_id: Some("codex_focus".to_string()),
             voice_glyph: Some('C'),
             fallback_reason: None,
+            transcription_route: ResolvedTranscriptionRoute {
+                providers: Vec::new(),
+                source: TranscriptionRouteSource::PipelineInferred,
+            },
             builtin_steps: muninn::ResolvedBuiltinStepConfig::from_app_config(&effective_config),
             effective_config,
         }
@@ -839,6 +848,10 @@ mod tests {
             voice_id: Some("terminal_terse".to_string()),
             voice_glyph: Some('T'),
             fallback_reason: None,
+            transcription_route: ResolvedTranscriptionRoute {
+                providers: Vec::new(),
+                source: TranscriptionRouteSource::PipelineInferred,
+            },
             builtin_steps: muninn::ResolvedBuiltinStepConfig::from_app_config(&config),
             effective_config: config.clone(),
         };

@@ -37,23 +37,16 @@ glyph = "#FFFFFF"
 mono = true
 sample_rate_khz = 16
 
+[transcription]
+# Local-first ordered provider route from spec 29.
+providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
+
 [pipeline]
 deadline_ms = 40000
 payload_format = "json_object"
 
-# OpenAI wrapper (active, first provider)
-[[pipeline.steps]]
-id = "stt_openai"
-cmd = "stt_openai"
-timeout_ms = 18000
-on_error = "continue"
-
-# Google wrapper (active, second provider)
-[[pipeline.steps]]
-id = "stt_google"
-cmd = "stt_google"
-timeout_ms = 18000
-on_error = "abort"
+# STT route legs are resolved from [transcription].providers before the runner starts.
+# Keep explicit stt_* steps here only when you intentionally want pipeline-only compatibility.
 
 # Built-in refine step (active)
 [[pipeline.steps]]
@@ -126,6 +119,10 @@ max_new_word_count = 2
 #
 # [profiles.mail]
 # voice = "mail"
+
+# Example cloud-focused override for one profile.
+# [profiles.mail.transcription]
+# providers = ["deepgram", "openai", "google"]
 #
 # [[profile_rules]]
 # id = "codex-app"

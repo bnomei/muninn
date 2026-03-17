@@ -26,7 +26,7 @@ Muninn is:
 
 High-level flow:
 
-`hotkey -> record temp WAV (default 16 kHz mono) -> transcribe with your provider -> run Muninn refine pass -> optional filters -> inject text`
+`hotkey -> record temp WAV (default 16 kHz mono) -> resolve transcription route -> transcribe with the first available provider -> run Muninn refine pass -> optional filters -> inject text`
 
 The default setup is already a two-pass AI pipeline. First, your chosen STT provider turns audio into raw text. Then Muninn runs a second pass that aligns that text to developer needs: technical terms, commands, flags, paths, env vars, acronyms, and obvious dictation errors. That second pass is conservative by default, but it is still part of the core product behavior, not an afterthought.
 
@@ -34,26 +34,39 @@ The current app supports:
 - a live menu bar app
 - macOS global hotkeys
 - microphone recording to a temp WAV with configurable mono output and sample rate
-- built-in transcription and refine steps in pipeline order
+- ordered transcription-provider routing plus built-in refine and external pipeline steps
 - keyboard-event text injection into the current app
 - stderr tracing logs plus optional replay artifacts per utterance
 
 ## Pipeline-First By Design
 
-The pipeline is the core idea. Each step is declared in config and runs as a command with:
+The pipeline is still the core idea. Muninn now resolves an ordered transcription route from `[transcription].providers` before the runner sees the utterance, then it hands the runner an ordinary concrete pipeline. Existing configs that spell STT steps directly in `pipeline.steps` still work unchanged.
+
+Each step is declared in config and runs as a command with:
 - `cmd`
 - optional `args`
 - `timeout_ms`
 - `on_error`
 - optional `io_mode`
 
-Built-in steps:
+Ordered transcription providers:
+- `apple_speech`
+- `whisper_cpp`
+- `deepgram`
+- `openai`
+- `google`
+
+Built-in pipeline steps:
+- `stt_apple_speech`
+- `stt_whisper_cpp`
+- `stt_deepgram`
 - `stt_openai`
 - `stt_google`
 - `refine`
 
 What makes this flexible:
-- Built-ins are referenced directly in config, so you can use Muninn's own steps without wiring separate binaries.
+- The preferred STT surface is `[transcription].providers`, so profiles can reorder or narrow fallback without copying raw step lists.
+- Built-ins are still referenced directly in config, so you can use Muninn's own steps without wiring separate binaries.
 - External Unix tools work too. Text filters like `sed`, `tr`, and `awk` can be dropped into the pipeline directly.
 - External steps default to plain text filtering. Use `io_mode = "envelope_json"` only when a step truly needs the full JSON envelope.
 - Each step has its own timeout and error policy, so you can choose when to `continue`, `fallback`, or `abort`.
@@ -65,17 +78,8 @@ That gives you a small but useful contract: keep the default developer-focused p
 Example shape:
 
 ```toml
-[[pipeline.steps]]
-id = "stt_openai"
-cmd = "stt_openai"
-timeout_ms = 18000
-on_error = "continue"
-
-[[pipeline.steps]]
-id = "stt_google"
-cmd = "stt_google"
-timeout_ms = 18000
-on_error = "abort"
+[transcription]
+providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
 
 [[pipeline.steps]]
 id = "refine"
@@ -91,14 +95,19 @@ timeout_ms = 250
 on_error = "continue"
 ```
 
+If you already have explicit `stt_*` steps in `pipeline.steps`, Muninn still accepts them and preserves that route order. The ordered-provider surface is the preferred way to express fallback now.
+
 ## BYOK And AI-Native Defaults
 
 Muninn reads provider credentials from your environment or config and uses them directly for its built-in steps. Environment variables override config values.
 
 Setup:
-- OpenAI: set `OPENAI_API_KEY` for the first default STT provider and for the default refine pass
-- Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the second default STT provider
+- OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg and for the default refine pass
+- Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the Google route leg
+- Deepgram: set `DEEPGRAM_API_KEY` if you keep the Deepgram leg enabled in your route
 - optional provider settings such as endpoints and models live in the config you control
+
+The shipped route order is local-first, but the current live STT backends are still OpenAI and Google. `apple_speech`, `whisper_cpp`, and `deepgram` already participate in route resolution and diagnostics, and they fall through cleanly until their concrete backends are available.
 
 That makes Muninn AI-native even in BYOK mode. You are not just piping audio into someone else's transcript API and injecting whatever comes back. The default flow uses your STT provider for the first pass, then uses Muninn's own built-in prompt contract for a second pass that aligns the text to developer dictation.
 
@@ -204,8 +213,8 @@ cp configs/config.sample.toml "$CONFIG_PATH"
 echo "Using config: $CONFIG_PATH"
 ```
 
-The sample enables `stt_openai`, `stt_google`, and `refine`, with OpenAI first and Google second.
-In other words: transcribe, run Muninn's developer-focused refine pass, then inject.
+The sample enables the local-first ordered transcription route and keeps `refine` as the first explicit pipeline step.
+In other words: resolve providers, transcribe with the first usable leg, run Muninn's developer-focused refine pass, then inject.
 It also defaults recording output to `mono = true` and `sample_rate_khz = 16`.
 Replay audio retention defaults to `replay_retain_audio = true`; set it to `false` if you only want replay metadata.
 
@@ -215,8 +224,9 @@ Muninn now tries to load `./.env` from the current working directory by default.
 
 | Concern | Variables | Notes |
 | --- | --- | --- |
-| OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | Stub text is only needed when `transcript.raw_text` is missing in the input envelope. |
-| Google-backed step | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google STT runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
+| OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
+| Deepgram transcription | `DEEPGRAM_API_KEY` | The route leg is normalized now; current builds record availability/failure diagnostics until a live backend lands. |
+| Google transcription | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google STT runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
 | Refine step | `OPENAI_API_KEY`, `MUNINN_REFINE_STUB_TEXT` | This is the second AI pass. `transcript.system_prompt` can give it voice/style hints. Stub text bypasses the network for refine. |
 
 ### 4) Run the tray app
@@ -304,17 +314,33 @@ tccutil reset Microphone
 Optional. Built-ins can be run directly with:
 
 ```bash
-cargo run -q -- __internal_step <stt_openai|stt_google|refine>
+cargo run -q -- __internal_step <stt_apple_speech|stt_whisper_cpp|stt_deepgram|stt_openai|stt_google|refine>
 ```
 
 Use the fixtures in `tests/fixtures/` when you want example input.
 
 ## Built-In Step Behavior
 
-- `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it passes the envelope through unchanged
-- `stt_google` fills `transcript.raw_text` when Google is configured, and fails if no STT step produced text by then
+- `stt_apple_speech` is the macOS local route leg and currently records unsupported or unavailable runtime states before falling through
+- `stt_whisper_cpp` is the local-assets route leg and currently records missing-asset states before falling through
+- `stt_deepgram` records missing `DEEPGRAM_API_KEY` or backend-unavailable states before falling through
+- `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it records structured failure details and lets later route legs run
+- `stt_google` fills `transcript.raw_text` when Google is configured, otherwise it records structured failure details and lets later route legs run
 - `refine` applies Muninn's built-in developer contract plus your `transcript.system_prompt` hints and writes accepted output to `output.final_text`
-- recommended order: `stt_* -> refine -> optional external filters`
+- recommended default: `[transcription].providers -> refine -> optional external filters`
+
+### Ordered transcription provider routing
+
+Spec 29 introduces `[transcription].providers` as the ordered STT route that the runtime resolves before it hands a concrete pipeline to the runner. The shipped default list is local-first: `apple_speech`, `whisper_cpp`, `deepgram`, `openai`, then `google`. During execution Muninn records which provider was attempted, why it succeeded or failed, and whether the normalized route metadata allows the next provider to run.
+
+Profiles can override only the provider order for their context, without re-encoding raw pipeline steps. For example, a mail profile that prefers the cloud leg can narrow the chain:
+
+```toml
+[profiles.mail.transcription]
+providers = ["deepgram", "openai", "google"]
+```
+
+This profile now skips the local-first defaults while other profiles continue inheriting the system-wide chained route.
 
 ## Replay And Debugging
 
