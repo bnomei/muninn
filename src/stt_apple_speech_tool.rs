@@ -2,8 +2,8 @@ use std::fs;
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
-use std::sync::OnceLock;
+use std::process::{Command, ExitCode, Output, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
@@ -13,6 +13,7 @@ use muninn::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
 use tracing::{error, warn};
 
 #[cfg(unix)]
@@ -134,6 +135,18 @@ fn process_input(
     input: MuninnEnvelopeV1,
     config: AppleSpeechResolvedConfig,
 ) -> Result<MuninnEnvelopeV1, CliError> {
+    if !cfg!(target_os = "macos") {
+        return match prepare_envelope(input, &config)? {
+            PreparedEnvelope::Ready(envelope) => Ok(envelope),
+            PreparedEnvelope::NeedsTranscription(request) => Ok(apply_apple_speech_response(
+                request.envelope,
+                unavailable_platform_response(
+                    "Apple Speech transcription is only available on macOS builds",
+                ),
+            )),
+        };
+    }
+
     process_input_with_runner(input, config, invoke_apple_speech_helper)
 }
 
@@ -161,17 +174,28 @@ pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
     config: &ResolvedBuiltinStepConfig,
 ) -> Result<MuninnEnvelopeV1, CliError> {
-    let input = input.clone();
     let resolved = resolved_config_from_builtin_steps(config);
+    match prepare_envelope(input.clone(), &resolved)? {
+        PreparedEnvelope::Ready(envelope) => Ok(envelope),
+        PreparedEnvelope::NeedsTranscription(request) => {
+            if !cfg!(target_os = "macos") {
+                return Ok(apply_apple_speech_response(
+                    request.envelope,
+                    unavailable_platform_response(
+                        "Apple Speech transcription is only available on macOS builds",
+                    ),
+                ));
+            }
 
-    tokio::task::spawn_blocking(move || process_input(input, resolved))
-        .await
-        .map_err(|source| {
-            CliError::new(
-                "apple_speech_task_failed",
-                format!("Apple Speech worker task failed: {source}"),
-            )
-        })?
+            match invoke_apple_speech_helper_async(&request.helper).await {
+                Ok(response) => Ok(apply_apple_speech_response(request.envelope, response)),
+                Err(error) => Ok(apply_apple_speech_transcription_failure(
+                    request.envelope,
+                    &error,
+                )),
+            }
+        }
+    }
 }
 
 fn prepare_envelope(
@@ -270,14 +294,69 @@ fn invoke_apple_speech_helper(
             )
         })?;
     }
+    drop(child.stdin.take());
 
-    let output = child.wait_with_output().map_err(|source| {
+    let output = child.wait_with_output().map_err(helper_wait_error)?;
+
+    decode_apple_speech_helper_output(output)
+}
+
+async fn invoke_apple_speech_helper_async(
+    request: &AppleSpeechHelperRequest,
+) -> Result<AppleSpeechHelperResponse, CliError> {
+    let helper_path = materialize_helper_binary()?;
+    let payload = serde_json::to_vec(request).map_err(|source| {
         CliError::new(
-            "apple_speech_helper_wait_failed",
-            format!("failed to wait for Apple Speech helper: {source}"),
+            "apple_speech_helper_input_encode_failed",
+            format!("failed to encode Apple Speech helper input: {source}"),
         )
     })?;
 
+    let mut child = tokio::process::Command::new(&helper_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|source| {
+            CliError::new(
+                "apple_speech_helper_spawn_failed",
+                format!(
+                    "failed to launch Apple Speech helper at {}: {source}",
+                    helper_path.display()
+                ),
+            )
+        })?;
+
+    {
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            CliError::new(
+                "apple_speech_helper_stdin_unavailable",
+                "Apple Speech helper stdin was unavailable after spawn",
+            )
+        })?;
+        stdin.write_all(&payload).await.map_err(|source| {
+            CliError::new(
+                "apple_speech_helper_stdin_write_failed",
+                format!("failed to write Apple Speech helper input: {source}"),
+            )
+        })?;
+        stdin.shutdown().await.map_err(|source| {
+            CliError::new(
+                "apple_speech_helper_stdin_write_failed",
+                format!("failed to close Apple Speech helper stdin: {source}"),
+            )
+        })?;
+    }
+
+    let output = child.wait_with_output().await.map_err(helper_wait_error)?;
+
+    decode_apple_speech_helper_output(output)
+}
+
+fn decode_apple_speech_helper_output(
+    output: Output,
+) -> Result<AppleSpeechHelperResponse, CliError> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -306,6 +385,24 @@ fn invoke_apple_speech_helper(
             ),
         )
     })
+}
+
+fn helper_wait_error(source: std::io::Error) -> CliError {
+    CliError::new(
+        "apple_speech_helper_wait_failed",
+        format!("failed to wait for Apple Speech helper: {source}"),
+    )
+}
+
+fn unavailable_platform_response(message: impl Into<String>) -> AppleSpeechHelperResponse {
+    AppleSpeechHelperResponse {
+        outcome: TranscriptionAttemptOutcome::UnavailablePlatform,
+        code: "unsupported_apple_speech_platform".to_string(),
+        message: message.into(),
+        transcript: None,
+        resolved_locale: None,
+        asset_status: None,
+    }
 }
 
 fn apply_apple_speech_response(
@@ -458,6 +555,18 @@ fn resolved_config_from_builtin_steps(
 
 fn materialize_helper_binary() -> Result<PathBuf, CliError> {
     static HELPER_PATH: OnceLock<PathBuf> = OnceLock::new();
+    static HELPER_INIT: Mutex<()> = Mutex::new(());
+
+    if let Some(path) = HELPER_PATH.get() {
+        return Ok(path.clone());
+    }
+
+    let _guard = HELPER_INIT.lock().map_err(|_| {
+        CliError::new(
+            "apple_speech_helper_lock_failed",
+            "Apple Speech helper initialization lock was poisoned",
+        )
+    })?;
 
     if let Some(path) = HELPER_PATH.get() {
         return Ok(path.clone());
@@ -477,15 +586,7 @@ fn materialize_helper_binary() -> Result<PathBuf, CliError> {
             })?;
         }
 
-        fs::write(&path, EMBEDDED_HELPER_BYTES).map_err(|source| {
-            CliError::new(
-                "apple_speech_helper_write_failed",
-                format!(
-                    "failed to materialize Apple Speech helper at {}: {source}",
-                    path.display()
-                ),
-            )
-        })?;
+        write_helper_atomically(&path)?;
     }
 
     ensure_helper_permissions(&path)?;
@@ -517,6 +618,30 @@ fn helper_needs_refresh(path: &Path) -> Result<bool, CliError> {
             ),
         )),
     }
+}
+
+fn write_helper_atomically(path: &Path) -> Result<(), CliError> {
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temp_path, EMBEDDED_HELPER_BYTES).map_err(|source| {
+        CliError::new(
+            "apple_speech_helper_write_failed",
+            format!(
+                "failed to stage Apple Speech helper at {}: {source}",
+                temp_path.display()
+            ),
+        )
+    })?;
+
+    fs::rename(&temp_path, path).map_err(|source| {
+        let _ = fs::remove_file(&temp_path);
+        CliError::new(
+            "apple_speech_helper_write_failed",
+            format!(
+                "failed to materialize Apple Speech helper at {}: {source}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn ensure_helper_permissions(path: &Path) -> Result<(), CliError> {

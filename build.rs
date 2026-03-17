@@ -18,10 +18,20 @@ fn main() {
         return;
     }
 
-    let sdk_path = command_output("xcrun", &["--show-sdk-path"])
-        .expect("xcrun --show-sdk-path must succeed for macOS Apple Speech builds");
-    let sdk_version = command_output("xcrun", &["--show-sdk-version"])
-        .expect("xcrun --show-sdk-version must succeed for macOS Apple Speech builds");
+    let Some(sdk_path) = command_output("xcrun", &["--show-sdk-path"]) else {
+        println!(
+            "cargo:warning=falling back to Apple Speech stub helper because xcrun could not resolve the macOS SDK path"
+        );
+        write_stub_helper(&output_path, stub_message());
+        return;
+    };
+    let Some(sdk_version) = command_output("xcrun", &["--show-sdk-version"]) else {
+        println!(
+            "cargo:warning=falling back to Apple Speech stub helper because xcrun could not resolve the macOS SDK version"
+        );
+        write_stub_helper(&output_path, stub_message());
+        return;
+    };
 
     if !sdk_supports_apple_speech(&sdk_version) {
         println!(
@@ -31,7 +41,7 @@ fn main() {
         return;
     }
 
-    let swift_target = swift_target_for(env::var("TARGET").unwrap_or_default(), &sdk_version)
+    let swift_target = swift_target_for(env::var("TARGET").unwrap_or_default(), "26.0")
         .expect("TARGET must be an Apple macOS architecture for Apple Speech builds");
 
     let status = Command::new("swiftc")
@@ -79,14 +89,14 @@ fn sdk_supports_apple_speech(sdk_version: &str) -> bool {
         .is_some_and(|major| major >= 26)
 }
 
-fn swift_target_for(target: String, sdk_version: &str) -> Option<String> {
+fn swift_target_for(target: String, deployment_version: &str) -> Option<String> {
     let arch = match target.split('-').next()? {
         "aarch64" => "arm64",
         "x86_64" => "x86_64",
         _ => return None,
     };
 
-    Some(format!("{arch}-apple-macosx{sdk_version}"))
+    Some(format!("{arch}-apple-macosx{deployment_version}"))
 }
 
 fn write_stub_helper(path: &Path, message: &str) {

@@ -237,9 +237,14 @@ struct AppleSpeechTranscriberHelper {
 
             let transcript = String(result.text.characters)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if transcript.count >= bestTranscript.count {
-                bestTranscript = transcript
+            guard !transcript.isEmpty else {
+                continue
             }
+
+            if !bestTranscript.isEmpty {
+                bestTranscript.append(" ")
+            }
+            bestTranscript.append(transcript)
         }
 
         return bestTranscript

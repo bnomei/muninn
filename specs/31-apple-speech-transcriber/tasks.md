@@ -38,7 +38,7 @@ Meta:
   - Validation:
     - manual audit against current runtime and Apple Speech framework constraints captured in the roadmap
   - Notes:
-    - This task authors the spec only; implementation tasks remain in Todo.
+    - This task authors the spec only; implementation tasks T001-T004 are complete and Todo is empty.
 
 - [x] T001: Add Apple speech backend config surface, locale handling, and macOS 26+ support gating (owner: codex) (scope: src/config.rs,src/,tests/) (depends: spec:29-local-first-transcription-foundations)
   - Context: Backend config is now supported via `[providers.apple_speech]` with locale and install-assets controls.
