@@ -198,7 +198,6 @@ impl AppRuntime {
 
     fn run(self) -> Result<()> {
         let mut event_loop_builder = EventLoopBuilder::<UserEvent>::with_user_event();
-        #[cfg(target_os = "macos")]
         let mut event_loop = event_loop_builder.build();
         #[cfg(target_os = "macos")]
         {

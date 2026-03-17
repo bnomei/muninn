@@ -1,7 +1,7 @@
 # Requirements — 28-runtime-structural-cleanup
 
 ## Scope
-Modularize Muninn’s runtime so contextual profiles/voices and later feature work can evolve without concentrating more logic into `main.rs` and the current monolithic runner seams.
+Modularize Muninn’s runtime so contextual profiles, provider routing, and later local-first backend work can evolve without concentrating more logic into `main.rs` and the current monolithic runner seams.
 
 ## EARS requirements
 1. When the runtime-structural-cleanup refactor is implemented, the system shall preserve the current tray-runtime behavior and CLI entry points except for intentional changes introduced by dependent feature specs.
@@ -12,5 +12,6 @@ Modularize Muninn’s runtime so contextual profiles/voices and later feature wo
 6. When built-in steps are dispatched, the system shall use a single registry or equivalent shared source of truth for step identity, step kind, and in-process handler lookup.
 7. When pipeline execution is modularized, the system shall separate policy orchestration from process transport and payload codec logic while preserving current timeout, stderr-cap, and contract semantics.
 8. While this refactor is in progress, the system shall preserve current replay sanitization, missing-credentials feedback, and hotkey backpressure behavior.
-9. When this refactor completes, the system shall not require an immediate multi-crate split as part of the same change.
-10. When this refactor completes, the system shall leave the codebase in a state where a future crate split is optional rather than mandatory.
+9. When the runtime emits operational diagnostics, the system shall mirror the existing console/stderr feedback into macOS unified logging with stable subsystem/category names suitable for troubleshooting outside a terminal.
+10. When this refactor completes, the system shall not require an immediate multi-crate split as part of the same change.
+11. When this refactor completes, the system shall leave the codebase in a state where a future crate split is optional rather than mandatory.

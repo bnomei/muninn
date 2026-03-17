@@ -42,7 +42,17 @@
 - `27-contextual-profiles-and-voices` (depends: `08-current-runtime-surface`, `26-runtime-troubleshooting-feedback`)
   - Resolve per-utterance profiles and refine voices from frontmost app/window context so Muninn can adapt its pipeline to Codex, Terminal, Mail, and similar targets while previewing the selected voice in the tray glyph.
 - `28-runtime-structural-cleanup` (depends: `08-current-runtime-surface`, `19-inprocess-internal-steps`, `27-contextual-profiles-and-voices`)
-  - Extract runtime seams, resolved config domains, and built-in step metadata so contextual profiles do not further concentrate logic in `main.rs` and the runner.
+  - Extract runtime seams, resolved config domains, built-in step metadata, and unified logging so contextual profiles and provider routing do not further concentrate logic in `main.rs` and the runner.
+- `29-local-first-transcription-foundations` (depends: `27-contextual-profiles-and-voices`, `28-runtime-structural-cleanup`)
+  - Add ordered provider routing, a shared STT provider registry, and normalized fallthrough behavior so local-first routing is layered onto profiles instead of raw step-order copy/paste.
+- `30-whisper-cpp-backend` (depends: `29-local-first-transcription-foundations`)
+  - Add a portable offline Whisper backend with managed local model lifecycle and an explicit no-streaming boundary.
+- `31-apple-speech-transcriber` (depends: `29-local-first-transcription-foundations`)
+  - Add an Apple-native on-device STT backend for macOS 26+ using the current Speech framework analysis/transcription APIs.
+- `32-deepgram-stt` (depends: `29-local-first-transcription-foundations`)
+  - Add a Deepgram STT backend so the default ordered provider route has a stronger preferred cloud transcription option.
+- `33-pipeline-vocabulary-patterns` (depends: `29-local-first-transcription-foundations`, `30-whisper-cpp-backend`, `31-apple-speech-transcriber`, `32-deepgram-stt`)
+  - Document and validate a pipeline-first vocabulary JSON pattern using the existing prompt/refine surfaces instead of adding a dedicated provider-adaptation subsystem.
 
 ## Goal
 Ship a Rust-only macOS menu-bar dictation app with config-driven pipeline execution, built-in internal STT/refine tools, keyboard injection, and replay diagnostics.

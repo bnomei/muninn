@@ -99,6 +99,21 @@ Meta:
     - full `cargo test -q`
   - Escalate if: the extracted coordinator seam is still too entangled to test without broad fixture churn
 
+- [ ] T006: Add a shared runtime logging seam that mirrors key events into macOS unified logging (owner: unassigned) (scope: src/main.rs,src/,tests/) (depends: T001)
+  - Context: Muninn often runs outside a terminal, so stderr-only diagnostics are not enough. The runtime needs stable unified-log categories for real troubleshooting.
+  - Reuse_targets: current warning/error emission sites in src/main.rs and provider helpers; replay/runtime diagnostics patterns
+  - Autonomy: standard
+  - Risk: medium
+  - Complexity: medium
+  - DoD:
+    - one shared logging helper or seam is used instead of scattered ad hoc runtime logging
+    - operator-relevant runtime, provider, config, hotkey, and recording events can be mirrored into macOS unified logging
+    - terminal launches still surface the existing console/stderr feedback
+  - Validation:
+    - targeted tests for logging category selection or emission wrappers where practical
+    - full `cargo test -q`
+  - Escalate if: macOS unified logging integration would force a broader cross-platform logging abstraction than this spec should own
+
 ## Done
 
 - [x] T000: Author spec set for runtime structural cleanup (owner: mayor) (scope: specs/28-runtime-structural-cleanup/,specs/index.md,specs/_handoff.md) (depends: spec:27-contextual-profiles-and-voices)
