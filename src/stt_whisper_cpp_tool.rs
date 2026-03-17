@@ -320,63 +320,95 @@ const fn acceleration_supported_in_build() -> bool {
 
 fn resolve_model_spec(config: &WhisperCppResolvedConfig) -> Result<WhisperModelSpec, CliError> {
     let model_dir = expand_model_dir(&config.model_dir)?;
-    Ok(resolve_model_spec_from_parts(
-        config.model.as_deref(),
-        &model_dir,
-    ))
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_model_spec_from_parts(config.model.as_deref(), &model_dir, home.as_deref())
 }
 
-fn resolve_model_spec_from_parts(model: Option<&str>, model_dir: &Path) -> WhisperModelSpec {
+fn resolve_model_spec_from_parts(
+    model: Option<&str>,
+    model_dir: &Path,
+    home: Option<&Path>,
+) -> Result<WhisperModelSpec, CliError> {
     let label = model
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(DEFAULT_MODEL_ID);
 
-    if Path::new(label).is_absolute() {
-        return WhisperModelSpec {
+    if let Some(explicit_path) = expand_explicit_model_path(label, home)? {
+        return Ok(WhisperModelSpec {
             label: label.to_string(),
-            path: PathBuf::from(label),
+            path: explicit_path,
             download_url: None,
-        };
+        });
     }
 
     if label.contains(std::path::MAIN_SEPARATOR) || label.ends_with(".bin") {
-        return WhisperModelSpec {
+        return Ok(WhisperModelSpec {
             label: label.to_string(),
             path: model_dir.join(label),
             download_url: label
                 .rsplit(std::path::MAIN_SEPARATOR)
                 .next()
                 .map(|filename| format!("{MODEL_DOWNLOAD_BASE_URL}/{filename}")),
-        };
+        });
     }
 
     let filename = format!("ggml-{label}.bin");
-    WhisperModelSpec {
+    Ok(WhisperModelSpec {
         label: label.to_string(),
         path: model_dir.join(&filename),
         download_url: Some(format!("{MODEL_DOWNLOAD_BASE_URL}/{filename}")),
+    })
+}
+
+fn expand_explicit_model_path(
+    label: &str,
+    home: Option<&Path>,
+) -> Result<Option<PathBuf>, CliError> {
+    let path = Path::new(label);
+    if path.is_absolute() {
+        return Ok(Some(path.to_path_buf()));
     }
+
+    let raw = path.to_string_lossy();
+    if raw == "~" || raw.starts_with("~/") {
+        return expand_home_path_with(
+            path,
+            home,
+            "missing_home_for_whisper_model",
+            "HOME is not set for providers.whisper_cpp.model expansion",
+        )
+        .map(Some);
+    }
+
+    Ok(None)
 }
 
 fn expand_model_dir(path: &Path) -> Result<PathBuf, CliError> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    expand_home_path_with(
+        path,
+        home.as_deref(),
+        "missing_home_for_whisper_model_dir",
+        "HOME is not set for providers.whisper_cpp.model_dir expansion",
+    )
+}
+
+fn expand_home_path_with(
+    path: &Path,
+    home: Option<&Path>,
+    missing_home_code: &'static str,
+    missing_home_message: &'static str,
+) -> Result<PathBuf, CliError> {
     if path == Path::new("~") {
-        return std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-            CliError::new(
-                "missing_home_for_whisper_model_dir",
-                "HOME is not set for providers.whisper_cpp.model_dir expansion",
-            )
-        });
+        return home
+            .map(Path::to_path_buf)
+            .ok_or_else(|| CliError::new(missing_home_code, missing_home_message));
     }
 
     let raw = path.to_string_lossy();
     if let Some(suffix) = raw.strip_prefix("~/") {
-        let home = std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-            CliError::new(
-                "missing_home_for_whisper_model_dir",
-                "HOME is not set for providers.whisper_cpp.model_dir expansion",
-            )
-        })?;
+        let home = home.ok_or_else(|| CliError::new(missing_home_code, missing_home_message))?;
         return Ok(home.join(suffix));
     }
 
@@ -430,7 +462,7 @@ fn transcribe_with_whisper_cpp(request: &WhisperInferenceRequest) -> Result<Stri
         )
     })?;
 
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 0 });
+    let mut params = FullParams::new(SamplingStrategy::default());
     params.set_n_threads(default_thread_count());
     params.set_translate(false);
     params.set_no_context(true);
@@ -632,8 +664,9 @@ fn apply_whisper_transcript(
     transcript: String,
 ) -> MuninnEnvelopeV1 {
     envelope.transcript.provider = Some("whisper_cpp".to_string());
+    let transcript = transcript.trim().to_string();
 
-    if transcript.trim().is_empty() {
+    if transcript.is_empty() {
         append_transcription_attempt(
             &mut envelope,
             TranscriptionAttempt::new(
@@ -811,7 +844,8 @@ mod tests {
 
     #[test]
     fn resolve_model_spec_uses_default_tiny_en_path() {
-        let spec = resolve_model_spec_from_parts(None, Path::new("/tmp/muninn-models"));
+        let spec = resolve_model_spec_from_parts(None, Path::new("/tmp/muninn-models"), None)
+            .expect("default model spec");
 
         assert_eq!(spec.label, DEFAULT_MODEL_ID);
         assert_eq!(
@@ -822,6 +856,20 @@ mod tests {
             spec.download_url.as_deref(),
             Some("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin")
         );
+    }
+
+    #[test]
+    fn resolve_model_spec_expands_tilde_model_path() {
+        let spec = resolve_model_spec_from_parts(
+            Some("~/models/custom.bin"),
+            Path::new("/tmp/ignored"),
+            Some(Path::new("/Users/tester")),
+        )
+        .expect("tilde path should expand");
+
+        assert_eq!(spec.label, "~/models/custom.bin");
+        assert_eq!(spec.path, PathBuf::from("/Users/tester/models/custom.bin"));
+        assert_eq!(spec.download_url, None);
     }
 
     #[test]
@@ -912,7 +960,7 @@ mod tests {
 
     #[test]
     fn apply_whisper_transcript_records_empty_transcript_warning_without_raw_text() {
-        let envelope = apply_whisper_transcript(baseline_envelope(), String::new());
+        let envelope = apply_whisper_transcript(baseline_envelope(), "   \n\t".to_string());
 
         assert_eq!(envelope.transcript.provider.as_deref(), Some("whisper_cpp"));
         assert!(envelope.transcript.raw_text.is_none());
@@ -929,7 +977,8 @@ mod tests {
 
     #[test]
     fn apply_whisper_transcript_writes_raw_text_and_preserves_existing_fields() {
-        let envelope = apply_whisper_transcript(baseline_envelope(), "dictated text".to_string());
+        let envelope =
+            apply_whisper_transcript(baseline_envelope(), "  dictated text  ".to_string());
 
         assert_eq!(envelope.transcript.provider.as_deref(), Some("whisper_cpp"));
         assert_eq!(
