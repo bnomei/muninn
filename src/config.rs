@@ -521,7 +521,34 @@ impl TranscriptionConfig {
             );
         }
 
+        if let Some(providers) = self.providers.as_ref() {
+            let mut seen = HashSet::new();
+            let mut duplicates = HashSet::new();
+            for provider in providers {
+                if !seen.insert(*provider) {
+                    duplicates.insert(*provider);
+                }
+            }
+            if !duplicates.is_empty() {
+                let mut provider_ids = duplicates
+                    .into_iter()
+                    .map(|provider| provider.config_id().to_string())
+                    .collect::<Vec<_>>();
+                provider_ids.sort();
+                return Err(ConfigValidationError::DuplicateTranscriptionProviders {
+                    field_name: field_name.to_string(),
+                    provider_ids,
+                });
+            }
+        }
+
         Ok(())
+    }
+
+    fn apply_to(&self, target: &mut TranscriptionConfig) {
+        if let Some(providers) = self.providers.as_ref() {
+            target.providers = Some(providers.clone());
+        }
     }
 }
 
@@ -717,7 +744,7 @@ impl ProfileConfig {
             pipeline.apply_to(&mut config.pipeline);
         }
         if let Some(transcription) = self.transcription.as_ref() {
-            config.transcription = transcription.clone();
+            transcription.apply_to(&mut config.transcription);
         }
         if let Some(transcript) = self.transcript.as_ref() {
             transcript.apply_to(&mut config.transcript);
@@ -1147,6 +1174,11 @@ pub enum ConfigValidationError {
     ConfigIdentifierMustNotBeEmpty { field_name: String },
     #[error("{field_name} must include at least one provider")]
     TranscriptionProvidersMustNotBeEmpty { field_name: String },
+    #[error("{field_name} must not contain duplicate providers ({provider_ids:?})")]
+    DuplicateTranscriptionProviders {
+        field_name: String,
+        provider_ids: Vec<String>,
+    },
     #[error("pipeline.deadline_ms must be greater than 0")]
     PipelineDeadlineMsMustBePositive,
     #[error("pipeline must include at least one step")]
@@ -1381,7 +1413,6 @@ fn infer_transcription_route_from_pipeline(
     pipeline
         .steps
         .iter()
-        .take_while(|step| TranscriptionProvider::lookup_step_name(&step.cmd).is_some())
         .filter_map(|step| TranscriptionProvider::lookup_step_name(&step.cmd))
         .collect()
 }
@@ -1404,7 +1435,7 @@ fn expand_pipeline_with_transcription_route(
         pipeline
             .steps
             .iter()
-            .skip_while(|step| TranscriptionProvider::lookup_step_name(&step.cmd).is_some())
+            .filter(|step| TranscriptionProvider::lookup_step_name(&step.cmd).is_none())
             .cloned(),
     );
 
@@ -1673,6 +1704,118 @@ on_error = "continue"
     }
 
     #[test]
+    fn resolve_effective_config_infers_interleaved_pipeline_transcription_steps() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt-openai"
+cmd = "stt_openai"
+timeout_ms = 100
+on_error = "continue"
+
+[[pipeline.steps]]
+id = "uppercase"
+cmd = "/usr/bin/tr"
+timeout_ms = 100
+on_error = "continue"
+
+[[pipeline.steps]]
+id = "stt-google"
+cmd = "stt_google"
+timeout_ms = 100
+on_error = "abort"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("pipeline-only config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.transcription_route.providers,
+            vec![TranscriptionProvider::OpenAi, TranscriptionProvider::Google]
+        );
+        assert_eq!(
+            resolved
+                .effective_config
+                .pipeline
+                .steps
+                .iter()
+                .map(|step| step.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stt_openai", "/usr/bin/tr", "stt_google", "refine"]
+        );
+    }
+
+    #[test]
+    fn resolve_effective_config_explicit_route_strips_all_existing_transcription_steps() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[transcription]
+providers = ["deepgram", "google"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt-openai"
+cmd = "stt_openai"
+timeout_ms = 100
+on_error = "continue"
+
+[[pipeline.steps]]
+id = "uppercase"
+cmd = "/usr/bin/tr"
+timeout_ms = 100
+on_error = "continue"
+
+[[pipeline.steps]]
+id = "stt-google"
+cmd = "stt_google"
+timeout_ms = 100
+on_error = "abort"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("explicit-route config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.transcription_route.providers,
+            vec![
+                TranscriptionProvider::Deepgram,
+                TranscriptionProvider::Google
+            ]
+        );
+        assert_eq!(
+            resolved
+                .effective_config
+                .pipeline
+                .steps
+                .iter()
+                .map(|step| step.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stt_deepgram", "stt_google", "/usr/bin/tr", "refine"]
+        );
+    }
+
+    #[test]
     fn rejects_invalid_refine_ratio() {
         let error = AppConfig::from_toml_str(
             r#"
@@ -1698,6 +1841,78 @@ on_error = "abort"
                 field_name: "refine.max_token_change_ratio".to_string(),
                 value: "1.5".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_transcription_provider_list() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[transcription]
+providers = ["openai", "openai"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect_err("duplicate transcription provider list should fail");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::DuplicateTranscriptionProviders {
+                field_name: "transcription.providers".to_string(),
+                provider_ids: vec!["openai".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn resolve_effective_config_keeps_default_route_when_profile_transcription_table_is_empty() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "mail"
+
+[transcription]
+providers = ["openai", "google"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+
+[profiles.mail.transcription]
+"#,
+        )
+        .expect("profile transcription override should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.transcription_route.providers,
+            vec![TranscriptionProvider::OpenAi, TranscriptionProvider::Google]
+        );
+        assert_eq!(
+            resolved
+                .effective_config
+                .pipeline
+                .steps
+                .iter()
+                .map(|step| step.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec!["stt_openai", "stt_google", "refine"]
         );
     }
 

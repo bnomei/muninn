@@ -133,6 +133,7 @@ impl ResolvedTranscriptionRoute {
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionAttemptOutcome {
     ProducedTranscript,
+    EmptyTranscript,
     UnavailablePlatform,
     UnavailableCredentials,
     UnavailableAssets,

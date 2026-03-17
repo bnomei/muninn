@@ -4,9 +4,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use muninn::config::{PipelineStepConfig, StepIoMode};
 use muninn::{
-    append_transcription_attempt, InProcessStepError, InProcessStepExecutor, MuninnEnvelopeV1,
-    ResolvedBuiltinStepConfig, StepFailureKind, TranscriptionAttempt, TranscriptionAttemptOutcome,
-    TranscriptionProvider,
+    append_transcription_attempt, resolve_secret_from_env, InProcessStepError,
+    InProcessStepExecutor, MuninnEnvelopeV1, ResolvedBuiltinStepConfig, StepFailureKind,
+    TranscriptionAttempt, TranscriptionAttemptOutcome, TranscriptionProvider,
 };
 use serde_json::json;
 
@@ -165,9 +165,7 @@ fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> Transcr
             "whisper.cpp assets are not available in this build yet",
         ),
         TranscriptionProvider::Deepgram
-            if std::env::var("DEEPGRAM_API_KEY")
-                .ok()
-                .map_or(true, |value| value.trim().is_empty()) =>
+            if resolve_secret_from_env("DEEPGRAM_API_KEY", None).is_none() =>
         {
             TranscriptionAttempt::new(
                 provider,

@@ -298,6 +298,15 @@ fn apply_openai_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -
     envelope.transcript.provider = Some("openai".to_string());
 
     if transcript.trim().is_empty() {
+        append_transcription_attempt(
+            &mut envelope,
+            TranscriptionAttempt::new(
+                TranscriptionProvider::OpenAi,
+                TranscriptionAttemptOutcome::EmptyTranscript,
+                "empty_transcript_text",
+                "OpenAI transcription returned an empty transcript",
+            ),
+        );
         log_provider_warning(
             "empty_transcript_text",
             "OpenAI transcription returned an empty transcript",
@@ -646,7 +655,11 @@ mod tests {
             envelope.errors.last().and_then(|value| value.get("code")),
             Some(&json!("empty_transcript_text"))
         );
-        assert!(muninn::transcription_attempts(&envelope).is_empty());
+        assert_eq!(muninn::transcription_attempts(&envelope).len(), 1);
+        assert_eq!(
+            muninn::transcription_attempts(&envelope)[0].outcome,
+            muninn::TranscriptionAttemptOutcome::EmptyTranscript
+        );
     }
 
     #[test]
