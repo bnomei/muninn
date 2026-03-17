@@ -71,6 +71,7 @@ impl TranscriptionProvider {
     #[must_use]
     pub const fn default_timeout_ms(self) -> u64 {
         match self {
+            Self::AppleSpeech => 30_000,
             Self::WhisperCpp => 45_000,
             _ => DEFAULT_STT_TIMEOUT_MS,
         }

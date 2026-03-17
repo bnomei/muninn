@@ -102,13 +102,14 @@ If you already have explicit `stt_*` steps in `pipeline.steps`, Muninn still acc
 Muninn reads provider credentials from your environment or config and uses them directly for its built-in steps. Environment variables override config values.
 
 Setup:
+- Apple Speech: no API key is required; this local leg requires macOS 26+ and Apple-managed Speech assets for the selected locale
 - Whisper.cpp: no API key is required; place a model under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file
 - OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg and for the default refine pass
 - Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the Google route leg
 - Deepgram: set `DEEPGRAM_API_KEY` if you keep the Deepgram leg enabled in your route
 - optional provider settings such as endpoints and models live in the config you control
 
-The shipped route order is local-first. `whisper_cpp` is a live offline backend for completed recordings when a local model is present. `apple_speech` and `deepgram` still participate in route resolution and diagnostics, then fall through cleanly until their concrete backends are available.
+The shipped route order is local-first. `apple_speech` and `whisper_cpp` run locally on completed recordings for post-processing transcription; `deepgram` still participates in route resolution and diagnostics, then falls through until its live backend is available. `openai` and `google` remain cloud legs.
 
 Whisper model lifecycle:
 - documented first-use default: `tiny.en`, resolved as `ggml-tiny.en.bin`
@@ -254,6 +255,7 @@ Muninn now tries to load `./.env` from the current working directory by default.
 
 | Concern | Variables | Notes |
 | --- | --- | --- |
+| Apple Speech transcription | none | Configure `[providers.apple_speech]` (`locale` and `install_assets`) in config; this provider is completed-recording only, requires macOS 26+, and uses Apple-managed assets |
 | Whisper.cpp transcription | none | Put a model file under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file. The backend runs on completed recordings only. |
 | OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
 | Deepgram transcription | `DEEPGRAM_API_KEY` | The route leg is normalized now; current builds record availability/failure diagnostics until a live backend lands. |
@@ -352,7 +354,7 @@ Use the fixtures in `tests/fixtures/` when you want example input.
 
 ## Built-In Step Behavior
 
-- `stt_apple_speech` is the macOS local route leg and currently records unsupported or unavailable runtime states before falling through
+- `stt_apple_speech` is the native macOS 26+ on-device route leg; it reads completed recordings from `audio.wav_path`, uses Apple-managed speech assets, writes `transcript.raw_text` on success, and falls through when unsupported platform/locale or assets are unavailable
 - `stt_whisper_cpp` reads `audio.wav_path`, runs local whisper.cpp inference on completed recordings, writes `transcript.raw_text` on success, and records missing-model or unsupported-build diagnostics before falling through
 - `stt_deepgram` records missing `DEEPGRAM_API_KEY` or backend-unavailable states before falling through
 - `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it records structured failure details and lets later route legs run
@@ -385,7 +387,7 @@ This profile now skips the local-first defaults while other profiles continue in
 
 - Muninn currently supports macOS only.
 - Whisper.cpp model files are not auto-downloaded yet; place them in the configured model directory yourself.
-- Apple-native and Deepgram route legs still stop at normalized diagnostics until their live backends land.
+- Deepgram route legs still stop at normalized diagnostics until their live backend lands.
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.
 - Provider-backed transcription needs realistic timeout budgets.

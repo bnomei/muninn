@@ -10,7 +10,9 @@ use muninn::{
 };
 use serde_json::json;
 
-use crate::{refine, stt_google_tool, stt_openai_tool, stt_whisper_cpp_tool};
+use crate::{
+    refine, stt_apple_speech_tool, stt_google_tool, stt_openai_tool, stt_whisper_cpp_tool,
+};
 
 const INTERNAL_STEP_MARKER: &str = "__internal_step";
 
@@ -59,9 +61,7 @@ impl BuiltinStep {
 
     pub fn run_as_internal_tool(self) -> ExitCode {
         match self {
-            Self::SttAppleSpeech => {
-                run_unavailable_transcription_cli(TranscriptionProvider::AppleSpeech)
-            }
+            Self::SttAppleSpeech => stt_apple_speech_tool::run_as_internal_tool(),
             Self::SttWhisperCpp => stt_whisper_cpp_tool::run_as_internal_tool(),
             Self::SttDeepgram => run_unavailable_transcription_cli(TranscriptionProvider::Deepgram),
             Self::SttOpenAi => stt_openai_tool::run_as_internal_tool(),
@@ -76,10 +76,9 @@ impl BuiltinStep {
         config: &ResolvedBuiltinStepConfig,
     ) -> Result<MuninnEnvelopeV1, InProcessStepError> {
         match self {
-            Self::SttAppleSpeech => Ok(execute_unavailable_transcription_step(
-                input,
-                TranscriptionProvider::AppleSpeech,
-            )),
+            Self::SttAppleSpeech => stt_apple_speech_tool::process_input_in_process(input, config)
+                .await
+                .map_err(map_internal_tool_error),
             Self::SttWhisperCpp => stt_whisper_cpp_tool::process_input_in_process(input, config)
                 .await
                 .map_err(map_internal_tool_error),
@@ -143,18 +142,6 @@ fn execute_unavailable_transcription_step(
 
 fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> TranscriptionAttempt {
     match provider {
-        TranscriptionProvider::AppleSpeech if !cfg!(target_os = "macos") => TranscriptionAttempt::new(
-            provider,
-            TranscriptionAttemptOutcome::UnavailablePlatform,
-            "unsupported_apple_speech_platform",
-            "Apple Speech transcription requires macOS",
-        ),
-        TranscriptionProvider::AppleSpeech => TranscriptionAttempt::new(
-            provider,
-            TranscriptionAttemptOutcome::UnavailableRuntimeCapability,
-            "apple_speech_backend_unavailable",
-            "Apple Speech transcription is not available in this build yet",
-        ),
         TranscriptionProvider::Deepgram
             if resolve_secret_from_env("DEEPGRAM_API_KEY", None).is_none() =>
         {
@@ -171,7 +158,8 @@ fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> Transcr
             "deepgram_backend_unavailable",
             "Deepgram transcription is not available in this build yet",
         ),
-        TranscriptionProvider::WhisperCpp
+        TranscriptionProvider::AppleSpeech
+        | TranscriptionProvider::WhisperCpp
         | TranscriptionProvider::OpenAi
         | TranscriptionProvider::Google => {
             unreachable!("implemented providers should not use the unavailable placeholder path")
@@ -273,6 +261,16 @@ impl InternalToolError for stt_google_tool::CliError {
 
     fn to_stderr_json(&self) -> String {
         stt_google_tool::CliError::to_stderr_json(self)
+    }
+}
+
+impl InternalToolError for stt_apple_speech_tool::CliError {
+    fn message(&self) -> &str {
+        stt_apple_speech_tool::CliError::message(self)
+    }
+
+    fn to_stderr_json(&self) -> String {
+        stt_apple_speech_tool::CliError::to_stderr_json(self)
     }
 }
 
