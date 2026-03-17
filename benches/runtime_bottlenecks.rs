@@ -530,6 +530,7 @@ fn replay_bench_input(replay_retain_audio: bool) -> ReplayBenchInput {
             voice_id: Some("voice_default".to_string()),
             voice_glyph: Some('D'),
             fallback_reason: None,
+            builtin_steps: muninn::ResolvedBuiltinStepConfig::from_app_config(&config),
             effective_config: config,
         },
         input_envelope,

@@ -513,6 +513,7 @@ mod tests {
     }
 
     fn sample_resolved(root: &Path) -> ResolvedUtteranceConfig {
+        let effective_config = sample_config(root);
         ResolvedUtteranceConfig {
             target_context: TargetContextSnapshot {
                 bundle_id: Some("com.openai.codex".to_string()),
@@ -525,7 +526,8 @@ mod tests {
             voice_id: Some("codex_focus".to_string()),
             voice_glyph: Some('C'),
             fallback_reason: None,
-            effective_config: sample_config(root),
+            builtin_steps: muninn::ResolvedBuiltinStepConfig::from_app_config(&effective_config),
+            effective_config,
         }
     }
 
@@ -837,6 +839,7 @@ mod tests {
             voice_id: Some("terminal_terse".to_string()),
             voice_glyph: Some('T'),
             fallback_reason: None,
+            builtin_steps: muninn::ResolvedBuiltinStepConfig::from_app_config(&config),
             effective_config: config.clone(),
         };
 

@@ -5,9 +5,10 @@ use std::sync::OnceLock;
 
 use muninn::config::{RefineConfig, RefineProvider};
 use muninn::resolve_secret;
-use muninn::AppConfig;
 use muninn::MuninnEnvelopeV1;
+use muninn::ResolvedBuiltinStepConfig;
 use serde_json::{json, Value};
+use tracing::{error, warn};
 
 const BUILTIN_SYSTEM_PROMPT: &str = r#"You are Muninn, a minimal transcript corrector for developer dictation.
 
@@ -70,6 +71,26 @@ impl CliError {
     }
 }
 
+fn log_provider_error(error: &CliError) {
+    error!(
+        target: crate::logging::TARGET_PROVIDER,
+        provider = "refine",
+        code = error.code,
+        detail = %error.message,
+        "Refine step failed"
+    );
+}
+
+fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
+    warn!(
+        target: crate::logging::TARGET_PROVIDER,
+        provider = "refine",
+        code,
+        detail = detail.as_ref(),
+        "Refine provider warning"
+    );
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedRefineConfig {
     provider: RefineProvider,
@@ -102,6 +123,7 @@ pub fn run_as_internal_tool() -> ExitCode {
     match run_cli() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            log_provider_error(&error);
             eprintln!("{}", error.to_stderr_json());
             ExitCode::FAILURE
         }
@@ -154,10 +176,12 @@ where
             RefineProvider::OpenAi => {
                 let api_key = resolve_secret(get_env("OPENAI_API_KEY"), config.api_key.clone())
                     .ok_or_else(|| {
-                        CliError::new(
+                        let error = CliError::new(
                             "missing_openai_api_key",
                             "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in config",
-                        )
+                        );
+                        log_provider_warning(error.code, error.message());
+                        error
                     })?;
                 refine_with_openai(&api_key, config, &config.hint_prompt, &raw_text).await?
             }
@@ -170,10 +194,10 @@ where
 
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
-    config: &AppConfig,
+    config: &ResolvedBuiltinStepConfig,
 ) -> Result<MuninnEnvelopeV1, CliError> {
     let env_lookup = |key: &str| std::env::var(key).ok();
-    let resolved = resolved_config_from_app_config(config);
+    let resolved = resolved_config_from_builtin_steps(config);
     process_input(input.clone(), &env_lookup, &resolved).await
 }
 
@@ -208,29 +232,35 @@ async fn refine_with_openai(
         .send()
         .await
         .map_err(|source| {
-            CliError::new(
+            let error = CliError::new(
                 "http_request_failed",
                 format!("OpenAI refine request failed: {source}"),
-            )
+            );
+            log_provider_error(&error);
+            error
         })?;
 
     let status = response.status();
     let body = response.bytes().await.map_err(|source| {
-        CliError::new(
+        let error = CliError::new(
             "http_body_read_failed",
             format!("failed to read OpenAI refine response body: {source}"),
-        )
+        );
+        log_provider_error(&error);
+        error
     })?;
 
     if !status.is_success() {
-        return Err(CliError::new(
+        let error = CliError::new(
             "openai_http_error",
             format!(
                 "OpenAI refine request failed with status {}: {}",
                 status,
                 summarize_error_body(&body),
             ),
-        ));
+        );
+        log_provider_error(&error);
+        return Err(error);
     }
 
     extract_chat_completion_text(&body)
@@ -243,20 +273,24 @@ fn http_client() -> &'static reqwest::Client {
 
 fn extract_chat_completion_text(body: &[u8]) -> Result<String, CliError> {
     let value: Value = serde_json::from_slice(body).map_err(|source| {
-        CliError::new(
+        let error = CliError::new(
             "invalid_openai_response_json",
             format!("failed to parse OpenAI refine response JSON: {source}"),
-        )
+        );
+        log_provider_error(&error);
+        error
     })?;
 
     let Some(content) = value.pointer("/choices/0/message/content") else {
-        return Err(CliError::new(
+        let error = CliError::new(
             "missing_refine_text",
             format!(
                 "OpenAI refine response JSON did not include choices[0].message.content: {}",
                 summarize_json(&value),
             ),
-        ));
+        );
+        log_provider_error(&error);
+        return Err(error);
     };
 
     if let Some(text) = content.as_str() {
@@ -281,13 +315,15 @@ fn extract_chat_completion_text(body: &[u8]) -> Result<String, CliError> {
         }
     }
 
-    Err(CliError::new(
+    let error = CliError::new(
         "missing_refine_text",
         format!(
             "OpenAI refine response JSON did not include textual content: {}",
             summarize_json(&value),
         ),
-    ))
+    );
+    log_provider_warning(error.code, error.message());
+    Err(error)
 }
 
 fn apply_refinement(
@@ -301,6 +337,15 @@ fn apply_refinement(
             envelope.output.final_text = Some(text);
         }
         CandidateEvaluation::Reject(metrics) => {
+            warn!(
+                target: crate::logging::TARGET_PIPELINE,
+                code = "refine_rejected",
+                reasons = ?metrics.reasons,
+                length_delta_ratio = metrics.length_delta_ratio,
+                token_change_ratio = metrics.token_change_ratio,
+                new_word_count = metrics.new_word_count,
+                "refine output exceeded acceptance gate"
+            );
             envelope.errors.push(json!({
                 "code": "refine_rejected",
                 "message": "Refinement exceeded acceptance gate",
@@ -470,12 +515,21 @@ where
 }
 
 fn load_refine_config_from_config() -> ResolvedRefineConfig {
-    let defaults = AppConfig::default();
+    let defaults = muninn::AppConfig::default();
 
-    AppConfig::load()
-        .ok()
-        .map(|config| resolved_config_from_app_config(&config))
-        .unwrap_or_else(|| {
+    muninn::AppConfig::load()
+        .map(|config| {
+            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
+                &config,
+            ))
+        })
+        .inspect_err(|error| {
+            log_provider_warning(
+                "config_load_failed",
+                format!("failed to load AppConfig for refine step: {error}"),
+            );
+        })
+        .unwrap_or_else(|_| {
             let mut resolved = ResolvedRefineConfig::from_config(
                 &defaults.refine,
                 defaults.providers.openai.api_key,
@@ -485,7 +539,7 @@ fn load_refine_config_from_config() -> ResolvedRefineConfig {
         })
 }
 
-fn resolved_config_from_app_config(config: &AppConfig) -> ResolvedRefineConfig {
+fn resolved_config_from_builtin_steps(config: &ResolvedBuiltinStepConfig) -> ResolvedRefineConfig {
     let mut resolved =
         ResolvedRefineConfig::from_config(&config.refine, config.providers.openai.api_key.clone());
     resolved.hint_prompt = config.transcript.system_prompt.clone();
@@ -547,7 +601,8 @@ mod tests {
     }
 
     fn config() -> ResolvedRefineConfig {
-        let mut config = ResolvedRefineConfig::from_config(&AppConfig::default().refine, None);
+        let mut config =
+            ResolvedRefineConfig::from_config(&muninn::AppConfig::default().refine, None);
         config.hint_prompt = "Prefer minimal corrections for technical terms.".to_string();
         config
     }

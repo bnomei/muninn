@@ -224,6 +224,7 @@ impl AppConfig {
             voice_id: selection.voice_id,
             voice_glyph: selection.voice_glyph,
             fallback_reason: selection.fallback_reason,
+            builtin_steps: ResolvedBuiltinStepConfig::from_app_config(&effective_config),
             effective_config,
         }
     }
@@ -337,13 +338,10 @@ impl Default for IndicatorConfig {
 pub struct IndicatorColorsConfig {
     pub idle: String,
     pub recording: String,
-    #[serde(alias = "processing")]
     pub transcribing: String,
     pub pipeline: String,
-    #[serde(alias = "injecting")]
     pub output: String,
     pub cancelled: String,
-    #[serde(alias = "outer_ring")]
     pub outline: String,
     pub glyph: String,
 }
@@ -570,7 +568,7 @@ impl Default for RefineConfig {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum RefineProvider {
-    #[serde(rename = "openai", alias = "open_ai")]
+    #[serde(rename = "openai")]
     #[default]
     OpenAi,
 }
@@ -985,6 +983,25 @@ pub struct ResolvedUtteranceConfig {
     pub voice_glyph: Option<char>,
     pub fallback_reason: Option<String>,
     pub effective_config: AppConfig,
+    pub builtin_steps: ResolvedBuiltinStepConfig,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedBuiltinStepConfig {
+    pub transcript: TranscriptConfig,
+    pub refine: RefineConfig,
+    pub providers: ProvidersConfig,
+}
+
+impl ResolvedBuiltinStepConfig {
+    #[must_use]
+    pub fn from_app_config(config: &AppConfig) -> Self {
+        Self {
+            transcript: config.transcript.clone(),
+            refine: config.refine.clone(),
+            providers: config.providers.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1530,8 +1547,8 @@ on_error = "abort"
     }
 
     #[test]
-    fn accepts_legacy_refine_provider_open_ai_alias() {
-        let config = AppConfig::from_toml_str(
+    fn rejects_legacy_refine_provider_open_ai_alias() {
+        let error = AppConfig::from_toml_str(
             r#"
 [refine]
 provider = "open_ai"
@@ -1547,9 +1564,39 @@ timeout_ms = 100
 on_error = "abort"
 "#,
         )
-        .expect("legacy open_ai provider should parse");
+        .expect_err("legacy open_ai provider should fail");
 
-        assert_eq!(config.refine.provider, RefineProvider::OpenAi);
+        assert!(matches!(error, ConfigError::ParseToml { .. }));
+    }
+
+    #[test]
+    fn rejects_legacy_indicator_color_aliases() {
+        let error = AppConfig::from_toml_str(
+            r##"
+[indicator.colors]
+idle = "#111111"
+recording = "#222222"
+processing = "#333333"
+pipeline = "#444444"
+injecting = "#555555"
+cancelled = "#666666"
+outer_ring = "#777777"
+glyph = "#888888"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"##,
+        )
+        .expect_err("legacy indicator aliases should fail");
+
+        assert!(matches!(error, ConfigError::ParseToml { .. }));
     }
 
     #[test]

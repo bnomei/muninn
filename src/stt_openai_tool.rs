@@ -1,12 +1,13 @@
 use muninn::resolve_secret;
-use muninn::AppConfig;
 use muninn::MuninnEnvelopeV1;
+use muninn::ResolvedBuiltinStepConfig;
 use reqwest::multipart::{Form, Part};
 use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
+use tracing::{error, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
@@ -37,6 +38,26 @@ impl CliError {
     }
 }
 
+fn log_provider_error(error: &CliError) {
+    error!(
+        target: crate::logging::TARGET_PROVIDER,
+        provider = "openai",
+        code = error.code,
+        detail = %error.message,
+        "OpenAI transcription step failed"
+    );
+}
+
+fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
+    warn!(
+        target: crate::logging::TARGET_PROVIDER,
+        provider = "openai",
+        code,
+        detail = detail.as_ref(),
+        "OpenAI transcription step warning"
+    );
+}
+
 #[derive(Debug, Clone)]
 struct OpenAiResolvedConfig {
     api_key: Option<String>,
@@ -63,6 +84,7 @@ pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            log_provider_error(&error);
             eprintln!("{}", error.to_stderr_json());
             ExitCode::FAILURE
         }
@@ -112,10 +134,10 @@ where
 
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
-    config: &AppConfig,
+    config: &ResolvedBuiltinStepConfig,
 ) -> Result<MuninnEnvelopeV1, CliError> {
     let env_lookup = |key: &str| std::env::var(key).ok();
-    let resolved = resolved_config_from_app_config(config);
+    let resolved = resolved_config_from_builtin_steps(config);
     process_input(input.clone(), &env_lookup, &resolved).await
 }
 
@@ -138,6 +160,10 @@ where
     }
 
     let Some(api_key) = resolve_openai_api_key(get_env, config.api_key.clone()) else {
+        log_provider_warning(
+            "missing_openai_api_key",
+            "missing OpenAI API key; skipping OpenAI transcription",
+        );
         envelope.errors.push(json!({
             "code": "missing_openai_api_key",
             "message": "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in config"
@@ -152,10 +178,12 @@ where
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| {
-            CliError::new(
+            let error = CliError::new(
                 "missing_audio_wav_path",
                 "transcript.raw_text is missing and audio.wav_path is required for OpenAI transcription",
-            )
+            );
+            log_provider_warning(error.code, error.message());
+            error
         })?;
 
     let endpoint = config.endpoint.clone();
@@ -178,20 +206,24 @@ async fn transcribe_with_openai(
     let file_part = Part::file(&request.wav_path)
         .await
         .map_err(|source| {
-            CliError::new(
+            let error = CliError::new(
                 "audio_file_read_failed",
                 format!(
                     "failed to open audio file at {}: {source}",
                     request.wav_path.display()
                 ),
-            )
+            );
+            log_provider_error(&error);
+            error
         })?
         .mime_str(mime_for_audio_path(&request.wav_path))
         .map_err(|source| {
-            CliError::new(
+            let error = CliError::new(
                 "multipart_build_failed",
                 format!("failed to build multipart audio part: {source}"),
-            )
+            );
+            log_provider_error(&error);
+            error
         })?;
 
     let form = Form::new()
@@ -206,29 +238,35 @@ async fn transcribe_with_openai(
         .send()
         .await
         .map_err(|source| {
-            CliError::new(
+            let error = CliError::new(
                 "http_request_failed",
                 format!("OpenAI transcription request failed: {source}"),
-            )
+            );
+            log_provider_error(&error);
+            error
         })?;
 
     let status = response.status();
     let body = response.bytes().await.map_err(|source| {
-        CliError::new(
+        let error = CliError::new(
             "http_body_read_failed",
             format!("failed to read OpenAI response body: {source}"),
-        )
+        );
+        log_provider_error(&error);
+        error
     })?;
 
     if !status.is_success() {
-        return Err(CliError::new(
+        let error = CliError::new(
             "openai_http_error",
             format!(
                 "OpenAI transcription request failed with status {}: {}",
                 status,
                 summarize_error_body(&body)
             ),
-        ));
+        );
+        log_provider_error(&error);
+        return Err(error);
     }
 
     extract_transcript_text(&body)
@@ -243,6 +281,10 @@ fn apply_openai_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -
     envelope.transcript.provider = Some("openai".to_string());
 
     if transcript.trim().is_empty() {
+        log_provider_warning(
+            "empty_transcript_text",
+            "OpenAI transcription returned an empty transcript",
+        );
         envelope.transcript.raw_text = None;
         envelope.errors.push(json!({
             "code": "empty_transcript_text",
@@ -352,19 +394,28 @@ fn mime_for_audio_path(path: &Path) -> &'static str {
 }
 
 fn load_openai_config_from_config() -> OpenAiResolvedConfig {
-    let defaults = AppConfig::default().providers.openai;
+    let defaults = muninn::AppConfig::default().providers.openai;
 
-    AppConfig::load()
-        .ok()
-        .map(|config| resolved_config_from_app_config(&config))
-        .unwrap_or_else(|| OpenAiResolvedConfig {
+    muninn::AppConfig::load()
+        .map(|config| {
+            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
+                &config,
+            ))
+        })
+        .inspect_err(|error| {
+            log_provider_warning(
+                "config_load_failed",
+                format!("failed to load AppConfig for OpenAI provider: {error}"),
+            );
+        })
+        .unwrap_or_else(|_| OpenAiResolvedConfig {
             api_key: resolve_secret(None, defaults.api_key),
             endpoint: defaults.endpoint,
             model: defaults.model,
         })
 }
 
-fn resolved_config_from_app_config(config: &AppConfig) -> OpenAiResolvedConfig {
+fn resolved_config_from_builtin_steps(config: &ResolvedBuiltinStepConfig) -> OpenAiResolvedConfig {
     OpenAiResolvedConfig {
         api_key: resolve_secret(None, config.providers.openai.api_key.clone()),
         endpoint: config.providers.openai.endpoint.clone(),
