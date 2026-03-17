@@ -41,6 +41,12 @@ sample_rate_khz = 16
 # Local-first ordered provider route from spec 29.
 providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
 
+[providers.apple_speech]
+# Apple-managed local backend for macOS 26+ completed recordings.
+# locale = "en-US"
+# install_assets defaults to true and lets Muninn trigger the supported Apple asset install flow.
+# install_assets = true
+
 [pipeline]
 deadline_ms = 40000
 payload_format = "json_object"

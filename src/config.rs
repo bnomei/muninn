@@ -1083,6 +1083,7 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvidersConfig {
+    pub apple_speech: AppleSpeechProviderConfig,
     pub whisper_cpp: WhisperCppProviderConfig,
     pub openai: OpenAiProviderConfig,
     pub google: GoogleProviderConfig,
@@ -1090,7 +1091,37 @@ pub struct ProvidersConfig {
 
 impl ProvidersConfig {
     fn validate(&self) -> Result<(), ConfigValidationError> {
+        self.apple_speech.validate()?;
         self.whisper_cpp.validate()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppleSpeechProviderConfig {
+    pub locale: Option<String>,
+    pub install_assets: bool,
+}
+
+impl AppleSpeechProviderConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self
+            .locale
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ConfigValidationError::AppleSpeechLocaleMustNotBeEmpty);
+        }
+        Ok(())
+    }
+}
+
+impl Default for AppleSpeechProviderConfig {
+    fn default() -> Self {
+        Self {
+            locale: None,
+            install_assets: true,
+        }
     }
 }
 
@@ -1230,6 +1261,8 @@ pub enum ConfigValidationError {
         field_name: String,
         provider_ids: Vec<String>,
     },
+    #[error("providers.apple_speech.locale must not be empty")]
+    AppleSpeechLocaleMustNotBeEmpty,
     #[error("providers.whisper_cpp.model must not be empty")]
     WhisperCppModelMustNotBeEmpty,
     #[error("providers.whisper_cpp.model_dir must not be empty")]
@@ -1605,6 +1638,8 @@ mod tests {
         assert!(!config.logging.replay_enabled);
         assert!(config.logging.replay_retain_audio);
         assert_eq!(config.providers.openai.model, "gpt-4o-mini-transcribe");
+        assert_eq!(config.providers.apple_speech.locale, None);
+        assert!(config.providers.apple_speech.install_assets);
         assert_eq!(config.providers.whisper_cpp.model, None);
         assert_eq!(
             config.providers.whisper_cpp.model_dir,
@@ -1657,6 +1692,8 @@ mod tests {
         assert_eq!(config.indicator.colors.glyph, "#FFFFFF");
         assert!(config.recording.mono);
         assert_eq!(config.recording.sample_rate_khz, 16);
+        assert_eq!(config.providers.apple_speech.locale, None);
+        assert!(config.providers.apple_speech.install_assets);
         assert_eq!(config.providers.whisper_cpp.model, None);
         assert_eq!(
             config.providers.whisper_cpp.model_dir,
@@ -1754,6 +1791,62 @@ on_error = "abort"
                 model_dir: PathBuf::from("/tmp/muninn-models"),
                 device: WhisperCppDevicePreference::Cpu,
             }
+        );
+    }
+
+    #[test]
+    fn parses_apple_speech_provider_overrides() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[providers.apple_speech]
+locale = "en-IE"
+install_assets = false
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("apple speech provider overrides should parse");
+
+        assert_eq!(
+            config.providers.apple_speech,
+            super::AppleSpeechProviderConfig {
+                locale: Some("en-IE".to_string()),
+                install_assets: false,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_empty_apple_speech_locale() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[providers.apple_speech]
+locale = "   "
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect_err("apple speech locale must not be empty");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::AppleSpeechLocaleMustNotBeEmpty)
         );
     }
 
