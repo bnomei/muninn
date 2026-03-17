@@ -15,6 +15,7 @@ mod runtime_tray;
 mod runtime_worker;
 mod stt_google_tool;
 mod stt_openai_tool;
+mod stt_whisper_cpp_tool;
 
 use anyhow::{Context, Result};
 use muninn::config::resolve_config_path;

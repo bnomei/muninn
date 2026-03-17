@@ -164,6 +164,12 @@ replay_max_bytes = 52_428_800
 endpoint = "https://api.openai.com/v1/audio/transcriptions"
 model = "gpt-4o-mini-transcribe"
 
+[providers.whisper_cpp]
+# model defaults to "tiny.en", which resolves to ggml-tiny.en.bin under model_dir
+# model = "base.en"
+model_dir = "~/.local/share/muninn/models"
+device = "auto"
+
 [providers.google]
 # api_key = "set via GOOGLE_API_KEY"
 # token = "set via GOOGLE_STT_TOKEN"

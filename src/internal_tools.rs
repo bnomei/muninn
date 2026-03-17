@@ -10,7 +10,7 @@ use muninn::{
 };
 use serde_json::json;
 
-use crate::{refine, stt_google_tool, stt_openai_tool};
+use crate::{refine, stt_google_tool, stt_openai_tool, stt_whisper_cpp_tool};
 
 const INTERNAL_STEP_MARKER: &str = "__internal_step";
 
@@ -62,9 +62,7 @@ impl BuiltinStep {
             Self::SttAppleSpeech => {
                 run_unavailable_transcription_cli(TranscriptionProvider::AppleSpeech)
             }
-            Self::SttWhisperCpp => {
-                run_unavailable_transcription_cli(TranscriptionProvider::WhisperCpp)
-            }
+            Self::SttWhisperCpp => stt_whisper_cpp_tool::run_as_internal_tool(),
             Self::SttDeepgram => run_unavailable_transcription_cli(TranscriptionProvider::Deepgram),
             Self::SttOpenAi => stt_openai_tool::run_as_internal_tool(),
             Self::SttGoogle => stt_google_tool::run_as_internal_tool(),
@@ -82,10 +80,9 @@ impl BuiltinStep {
                 input,
                 TranscriptionProvider::AppleSpeech,
             )),
-            Self::SttWhisperCpp => Ok(execute_unavailable_transcription_step(
-                input,
-                TranscriptionProvider::WhisperCpp,
-            )),
+            Self::SttWhisperCpp => stt_whisper_cpp_tool::process_input_in_process(input, config)
+                .await
+                .map_err(map_internal_tool_error),
             Self::SttDeepgram => Ok(execute_unavailable_transcription_step(
                 input,
                 TranscriptionProvider::Deepgram,
@@ -158,12 +155,6 @@ fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> Transcr
             "apple_speech_backend_unavailable",
             "Apple Speech transcription is not available in this build yet",
         ),
-        TranscriptionProvider::WhisperCpp => TranscriptionAttempt::new(
-            provider,
-            TranscriptionAttemptOutcome::UnavailableAssets,
-            "missing_whisper_cpp_assets",
-            "whisper.cpp assets are not available in this build yet",
-        ),
         TranscriptionProvider::Deepgram
             if resolve_secret_from_env("DEEPGRAM_API_KEY", None).is_none() =>
         {
@@ -180,7 +171,9 @@ fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> Transcr
             "deepgram_backend_unavailable",
             "Deepgram transcription is not available in this build yet",
         ),
-        TranscriptionProvider::OpenAi | TranscriptionProvider::Google => {
+        TranscriptionProvider::WhisperCpp
+        | TranscriptionProvider::OpenAi
+        | TranscriptionProvider::Google => {
             unreachable!("implemented providers should not use the unavailable placeholder path")
         }
     }
@@ -280,6 +273,16 @@ impl InternalToolError for stt_google_tool::CliError {
 
     fn to_stderr_json(&self) -> String {
         stt_google_tool::CliError::to_stderr_json(self)
+    }
+}
+
+impl InternalToolError for stt_whisper_cpp_tool::CliError {
+    fn message(&self) -> &str {
+        stt_whisper_cpp_tool::CliError::message(self)
+    }
+
+    fn to_stderr_json(&self) -> String {
+        stt_whisper_cpp_tool::CliError::to_stderr_json(self)
     }
 }
 

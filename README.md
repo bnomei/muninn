@@ -102,12 +102,21 @@ If you already have explicit `stt_*` steps in `pipeline.steps`, Muninn still acc
 Muninn reads provider credentials from your environment or config and uses them directly for its built-in steps. Environment variables override config values.
 
 Setup:
+- Whisper.cpp: no API key is required; place a model under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file
 - OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg and for the default refine pass
 - Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the Google route leg
 - Deepgram: set `DEEPGRAM_API_KEY` if you keep the Deepgram leg enabled in your route
 - optional provider settings such as endpoints and models live in the config you control
 
-The shipped route order is local-first, but the current live STT backends are still OpenAI and Google. `apple_speech`, `whisper_cpp`, and `deepgram` already participate in route resolution and diagnostics, and they fall through cleanly until their concrete backends are available.
+The shipped route order is local-first. `whisper_cpp` is a live offline backend for completed recordings when a local model is present. `apple_speech` and `deepgram` still participate in route resolution and diagnostics, then fall through cleanly until their concrete backends are available.
+
+Whisper model lifecycle:
+- documented first-use default: `tiny.en`, resolved as `ggml-tiny.en.bin`
+- default model directory: `~/.local/share/muninn/models`
+- override surface: `[providers.whisper_cpp].model`, `[providers.whisper_cpp].model_dir`, and `[providers.whisper_cpp].device`
+- install behavior today: Muninn does not auto-download models; it records an actionable missing-model diagnostic and continues the ordered route
+- performance tradeoff: `tiny.en` is the fastest and smallest launchable default, while larger models such as `base.en` trade more disk and latency for better accuracy
+- acceleration: `device = "auto"` prefers Metal on Apple Silicon builds when available and uses CPU elsewhere; `device = "gpu"` is explicit and fails diagnostically on unsupported builds
 
 That makes Muninn AI-native even in BYOK mode. You are not just piping audio into someone else's transcript API and injecting whatever comes back. The default flow uses your STT provider for the first pass, then uses Muninn's own built-in prompt contract for a second pass that aligns the text to developer dictation.
 
@@ -218,18 +227,40 @@ In other words: resolve providers, transcribe with the first usable leg, run Mun
 It also defaults recording output to `mono = true` and `sample_rate_khz = 16`.
 Replay audio retention defaults to `replay_retain_audio = true`; set it to `false` if you only want replay metadata.
 
-### 3) Set provider env vars
+### 3) Install a local Whisper model
+
+If you want the default local-first offline route to stay local before falling back to cloud providers, install the default model once:
+
+```bash
+mkdir -p "$HOME/.local/share/muninn/models"
+curl -L \
+  -o "$HOME/.local/share/muninn/models/ggml-tiny.en.bin" \
+  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+```
+
+This matches the launchable default config:
+- `providers.whisper_cpp.model = "tiny.en"`
+- `providers.whisper_cpp.model_dir = "~/.local/share/muninn/models"`
+- `providers.whisper_cpp.device = "auto"`
+
+Boundary and tradeoffs:
+- Whisper.cpp is post-recording only in Muninn; there is no streaming or partial-result path in this backend
+- `tiny.en` is English-only and optimized for footprint and latency
+- moving up to a larger model such as `base.en` usually improves accuracy at the cost of more disk, memory, and inference time
+
+### 4) Set provider env vars
 
 Muninn now tries to load `./.env` from the current working directory by default. Existing shell environment variables still win over `.env` and config values. Set `MUNINN_LOAD_DOTENV=0`, `false`, or `no` if you want to disable this.
 
 | Concern | Variables | Notes |
 | --- | --- | --- |
+| Whisper.cpp transcription | none | Put a model file under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file. The backend runs on completed recordings only. |
 | OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
 | Deepgram transcription | `DEEPGRAM_API_KEY` | The route leg is normalized now; current builds record availability/failure diagnostics until a live backend lands. |
 | Google transcription | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google STT runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
 | Refine step | `OPENAI_API_KEY`, `MUNINN_REFINE_STUB_TEXT` | This is the second AI pass. `transcript.system_prompt` can give it voice/style hints. Stub text bypasses the network for refine. |
 
-### 4) Run the tray app
+### 5) Run the tray app
 
 ```bash
 MUNINN_CONFIG="$PWD/configs/config.sample.toml" cargo run
@@ -279,7 +310,7 @@ Optional macOS autostart:
 - login autostart does not inherit shell exports; prefer config-backed credentials, or make sure the LaunchAgent working directory contains the `.env` file you want Muninn to read
 - if you are using `Muninn.app`, prefer macOS Login Items over this LaunchAgent path
 
-### 5) Grant macOS permissions
+### 6) Grant macOS permissions
 
 Muninn needs these macOS permissions:
 
@@ -322,7 +353,7 @@ Use the fixtures in `tests/fixtures/` when you want example input.
 ## Built-In Step Behavior
 
 - `stt_apple_speech` is the macOS local route leg and currently records unsupported or unavailable runtime states before falling through
-- `stt_whisper_cpp` is the local-assets route leg and currently records missing-asset states before falling through
+- `stt_whisper_cpp` reads `audio.wav_path`, runs local whisper.cpp inference on completed recordings, writes `transcript.raw_text` on success, and records missing-model or unsupported-build diagnostics before falling through
 - `stt_deepgram` records missing `DEEPGRAM_API_KEY` or backend-unavailable states before falling through
 - `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it records structured failure details and lets later route legs run
 - `stt_google` fills `transcript.raw_text` when Google is configured, otherwise it records structured failure details and lets later route legs run
@@ -353,6 +384,8 @@ This profile now skips the local-first defaults while other profiles continue in
 ## Current Limits
 
 - Muninn currently supports macOS only.
+- Whisper.cpp model files are not auto-downloaded yet; place them in the configured model directory yourself.
+- Apple-native and Deepgram route legs still stop at normalized diagnostics until their live backends land.
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.
 - Provider-backed transcription needs realistic timeout budgets.

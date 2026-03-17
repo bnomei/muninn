@@ -110,6 +110,7 @@ impl AppConfig {
 
         self.refine.validate()?;
         self.transcription.validate("transcription.providers")?;
+        self.providers.validate()?;
 
         for (name, binding) in [
             ("push_to_talk", &self.hotkeys.push_to_talk),
@@ -1082,8 +1083,58 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvidersConfig {
+    pub whisper_cpp: WhisperCppProviderConfig,
     pub openai: OpenAiProviderConfig,
     pub google: GoogleProviderConfig,
+}
+
+impl ProvidersConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        self.whisper_cpp.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WhisperCppDevicePreference {
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WhisperCppProviderConfig {
+    pub model: Option<String>,
+    pub model_dir: PathBuf,
+    pub device: WhisperCppDevicePreference,
+}
+
+impl WhisperCppProviderConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self
+            .model
+            .as_deref()
+            .is_some_and(|value| value.trim().is_empty())
+        {
+            return Err(ConfigValidationError::WhisperCppModelMustNotBeEmpty);
+        }
+        if self.model_dir.as_os_str().is_empty() {
+            return Err(ConfigValidationError::WhisperCppModelDirMustNotBeEmpty);
+        }
+        Ok(())
+    }
+}
+
+impl Default for WhisperCppProviderConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            model_dir: PathBuf::from("~/.local/share/muninn/models"),
+            device: WhisperCppDevicePreference::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1179,6 +1230,10 @@ pub enum ConfigValidationError {
         field_name: String,
         provider_ids: Vec<String>,
     },
+    #[error("providers.whisper_cpp.model must not be empty")]
+    WhisperCppModelMustNotBeEmpty,
+    #[error("providers.whisper_cpp.model_dir must not be empty")]
+    WhisperCppModelDirMustNotBeEmpty,
     #[error("pipeline.deadline_ms must be greater than 0")]
     PipelineDeadlineMsMustBePositive,
     #[error("pipeline must include at least one step")]
@@ -1537,7 +1592,7 @@ mod tests {
 
     use super::{
         resolve_config_path_with, AppConfig, ConfigError, ConfigValidationError, PayloadFormat,
-        RefineProvider, TargetContextSnapshot, TriggerType,
+        RefineProvider, TargetContextSnapshot, TriggerType, WhisperCppDevicePreference,
     };
 
     #[test]
@@ -1550,6 +1605,15 @@ mod tests {
         assert!(!config.logging.replay_enabled);
         assert!(config.logging.replay_retain_audio);
         assert_eq!(config.providers.openai.model, "gpt-4o-mini-transcribe");
+        assert_eq!(config.providers.whisper_cpp.model, None);
+        assert_eq!(
+            config.providers.whisper_cpp.model_dir,
+            PathBuf::from("~/.local/share/muninn/models")
+        );
+        assert_eq!(
+            config.providers.whisper_cpp.device,
+            WhisperCppDevicePreference::Auto
+        );
         assert_eq!(config.refine.model, "gpt-4.1-mini");
         assert_eq!(config.indicator.colors.idle, "#636366");
         assert!(config.recording.mono);
@@ -1593,6 +1657,15 @@ mod tests {
         assert_eq!(config.indicator.colors.glyph, "#FFFFFF");
         assert!(config.recording.mono);
         assert_eq!(config.recording.sample_rate_khz, 16);
+        assert_eq!(config.providers.whisper_cpp.model, None);
+        assert_eq!(
+            config.providers.whisper_cpp.model_dir,
+            PathBuf::from("~/.local/share/muninn/models")
+        );
+        assert_eq!(
+            config.providers.whisper_cpp.device,
+            WhisperCppDevicePreference::Auto
+        );
         assert_eq!(config.refine.provider, RefineProvider::OpenAi);
         assert_eq!(
             config.transcript.system_prompt,
@@ -1649,6 +1722,90 @@ mod tests {
                 "stt_google",
                 "refine",
             ]
+        );
+    }
+
+    #[test]
+    fn parses_whisper_cpp_provider_overrides() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[providers.whisper_cpp]
+model = "base.en"
+model_dir = "/tmp/muninn-models"
+device = "cpu"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("whisper.cpp provider overrides should parse");
+
+        assert_eq!(
+            config.providers.whisper_cpp,
+            super::WhisperCppProviderConfig {
+                model: Some("base.en".to_string()),
+                model_dir: PathBuf::from("/tmp/muninn-models"),
+                device: WhisperCppDevicePreference::Cpu,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_empty_whisper_cpp_model() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[providers.whisper_cpp]
+model = "   "
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect_err("whisper.cpp model must not be empty");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::WhisperCppModelMustNotBeEmpty)
+        );
+    }
+
+    #[test]
+    fn rejects_empty_whisper_cpp_model_dir() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[providers.whisper_cpp]
+model_dir = ""
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect_err("whisper.cpp model dir must not be empty");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::WhisperCppModelDirMustNotBeEmpty)
         );
     }
 

@@ -41,6 +41,9 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 tray-icon = "0.21"
 uuid = { version = "1", features = ["serde", "v7"] }
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = "0.13.0"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6.2"
 core-graphics = "0.25"
@@ -54,6 +57,7 @@ objc2-foundation = { version = "0.2.2", features = ["NSString"] }
 objc2 = "0.6.4"
 rdev = "0.5"
 tracing-oslog = "0.3"
+whisper-rs = { version = "0.13.0", features = ["metal"] }
 
 [dev-dependencies]
 criterion = { package = "codspeed-criterion-compat", version = "4.3.0" }
