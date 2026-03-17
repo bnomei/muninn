@@ -90,7 +90,7 @@ impl InProcessStepExecutor for BuiltinStepExecutor {
         step: &PipelineStepConfig,
         input: &MuninnEnvelopeV1,
     ) -> Option<Result<MuninnEnvelopeV1, InProcessStepError>> {
-        let builtin = step_builtin(step)?;
+        let builtin = lookup_builtin_step(&step.cmd)?;
         Some(builtin.execute_in_process(input, &self.config).await)
     }
 }
@@ -105,55 +105,26 @@ pub fn maybe_handle_internal_step(args: &[String]) -> Option<ExitCode> {
 }
 
 pub fn rewrite_internal_tool_step(step: &mut PipelineStepConfig) -> Result<bool> {
-    if let Some(tool) = lookup_builtin_step(&step.cmd) {
-        step.cmd = tool.canonical_name().to_string();
-        step.io_mode = StepIoMode::EnvelopeJson;
-        return Ok(true);
-    }
-
-    let [marker, tool, remaining_args @ ..] = step.args.as_slice() else {
-        return Ok(false);
-    };
-    if marker != INTERNAL_STEP_MARKER {
-        return Ok(false);
-    }
-
-    let Some(tool) = lookup_builtin_step(tool) else {
+    let Some(tool) = lookup_builtin_step(&step.cmd) else {
         return Ok(false);
     };
 
     step.cmd = tool.canonical_name().to_string();
-    step.args = remaining_args.to_vec();
     step.io_mode = StepIoMode::EnvelopeJson;
     Ok(true)
 }
 
 pub fn is_transcription_step(step: &PipelineStepConfig) -> bool {
-    step_builtin(step).is_some_and(BuiltinStep::is_transcription)
+    lookup_builtin_step(&step.cmd).is_some_and(BuiltinStep::is_transcription)
 }
 
 pub fn lookup_builtin_step(raw: &str) -> Option<BuiltinStep> {
     match raw {
-        "muninn-stt-openai" => Some(BuiltinStep::SttOpenAi),
         "stt_openai" => Some(BuiltinStep::SttOpenAi),
-        "muninn-stt-google" => Some(BuiltinStep::SttGoogle),
         "stt_google" => Some(BuiltinStep::SttGoogle),
-        "muninn-refine" => Some(BuiltinStep::Refine),
         "refine" => Some(BuiltinStep::Refine),
         _ => None,
     }
-}
-
-fn step_builtin(step: &PipelineStepConfig) -> Option<BuiltinStep> {
-    lookup_builtin_step(&step.cmd).or_else(|| {
-        let [marker, tool, ..] = step.args.as_slice() else {
-            return None;
-        };
-        if marker != INTERNAL_STEP_MARKER {
-            return None;
-        }
-        lookup_builtin_step(tool)
-    })
 }
 
 fn map_internal_tool_error(error: impl InternalToolError) -> InProcessStepError {
@@ -244,36 +215,9 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_legacy_marker_form_to_canonical_builtin_name() {
-        let mut step = PipelineStepConfig {
-            id: "google".to_string(),
-            cmd: "/Applications/Muninn.app/Contents/MacOS/muninn".to_string(),
-            args: vec![
-                "__internal_step".to_string(),
-                "muninn-stt-google".to_string(),
-                "--example".to_string(),
-            ],
-            io_mode: StepIoMode::Auto,
-            timeout_ms: 100,
-            on_error: OnErrorPolicy::Continue,
-        };
-
-        let rewritten = rewrite_internal_tool_step(&mut step).expect("rewrite should succeed");
-
-        assert!(rewritten);
-        assert_eq!(step.cmd, "stt_google");
-        assert_eq!(step.args, vec!["--example"]);
-        assert_eq!(step.io_mode, StepIoMode::EnvelopeJson);
-    }
-
-    #[test]
-    fn lookup_builtin_step_normalizes_legacy_aliases() {
+    fn lookup_builtin_step_accepts_only_canonical_builtin_names() {
         assert_eq!(
             lookup_builtin_step("stt_openai").map(BuiltinStep::canonical_name),
-            Some("stt_openai")
-        );
-        assert_eq!(
-            lookup_builtin_step("muninn-stt-openai").map(BuiltinStep::canonical_name),
             Some("stt_openai")
         );
         assert_eq!(
@@ -281,17 +225,12 @@ mod tests {
             Some("stt_google")
         );
         assert_eq!(
-            lookup_builtin_step("muninn-stt-google").map(BuiltinStep::canonical_name),
-            Some("stt_google")
-        );
-        assert_eq!(
             lookup_builtin_step("refine").map(BuiltinStep::canonical_name),
             Some("refine")
         );
-        assert_eq!(
-            lookup_builtin_step("muninn-refine").map(BuiltinStep::canonical_name),
-            Some("refine")
-        );
+        assert_eq!(lookup_builtin_step("muninn-stt-openai"), None);
+        assert_eq!(lookup_builtin_step("muninn-stt-google"), None);
+        assert_eq!(lookup_builtin_step("muninn-refine"), None);
     }
 
     #[test]

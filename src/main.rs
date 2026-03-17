@@ -681,7 +681,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_pipeline_config_normalizes_legacy_internal_tool_steps() {
+    fn resolve_pipeline_config_leaves_noncanonical_builtin_refs_untouched() {
         let mut config = muninn::AppConfig::launchable_default();
         config.pipeline.steps = vec![
             PipelineStepConfig {
@@ -704,13 +704,19 @@ mod tests {
 
         let pipeline = resolve_pipeline_config(&config).expect("pipeline should resolve");
 
-        assert_eq!(pipeline.steps[0].cmd, "stt_openai");
+        assert_eq!(pipeline.steps[0].cmd, "muninn-stt-openai");
         assert_eq!(pipeline.steps[0].args, Vec::<String>::new());
-        assert_eq!(pipeline.steps[0].io_mode, StepIoMode::EnvelopeJson);
+        assert_eq!(pipeline.steps[0].io_mode, StepIoMode::Auto);
 
-        assert_eq!(pipeline.steps[1].cmd, "refine");
-        assert_eq!(pipeline.steps[1].args, Vec::<String>::new());
-        assert_eq!(pipeline.steps[1].io_mode, StepIoMode::EnvelopeJson);
+        assert_eq!(
+            pipeline.steps[1].cmd,
+            "/Applications/Muninn.app/Contents/MacOS/muninn"
+        );
+        assert_eq!(
+            pipeline.steps[1].args,
+            vec!["__internal_step".to_string(), "muninn-refine".to_string()]
+        );
+        assert_eq!(pipeline.steps[1].io_mode, StepIoMode::Auto);
     }
 
     #[test]

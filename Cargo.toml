@@ -1,6 +1,6 @@
 [package]
 name = "muninn-speach-to-text"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Bruno Meilick <b@bnomei.com>", "Muninn Contributors"]
 edition = "2021"
 license = "MIT"
