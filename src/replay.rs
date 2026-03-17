@@ -154,6 +154,7 @@ pub fn persist_replay(
 }
 
 fn redacted_config_snapshot(mut config: AppConfig) -> Value {
+    config.providers.deepgram.api_key = None;
     config.providers.openai.api_key = None;
     config.providers.google.api_key = None;
     config.providers.google.token = None;
@@ -503,6 +504,7 @@ mod tests {
         config.logging.replay_dir = root.to_path_buf();
         config.logging.replay_retention_days = 7;
         config.logging.replay_max_bytes = 10_000_000;
+        config.providers.deepgram.api_key = Some("secret-deepgram".to_string());
         config.providers.openai.api_key = Some("secret-openai".to_string());
         config.providers.google.api_key = Some("secret-google".to_string());
         config.providers.google.token = Some("secret-token".to_string());
@@ -606,6 +608,7 @@ mod tests {
         let config = sample_config(Path::new("/tmp/replay"));
         let snapshot = redacted_config_snapshot(config);
 
+        assert_eq!(snapshot["providers"]["deepgram"]["api_key"], Value::Null);
         assert_eq!(snapshot["providers"]["openai"]["api_key"], Value::Null);
         assert_eq!(snapshot["providers"]["google"]["api_key"], Value::Null);
         assert_eq!(snapshot["providers"]["google"]["token"], Value::Null);
@@ -719,6 +722,10 @@ mod tests {
             Value::String("muninn.replay.v1".to_string())
         );
         assert_eq!(record["utterance_id"], Value::String("utt-123".to_string()));
+        assert_eq!(
+            record["redacted_config"]["providers"]["deepgram"]["api_key"],
+            Value::Null
+        );
         assert_eq!(
             record["redacted_config"]["providers"]["openai"]["api_key"],
             Value::Null

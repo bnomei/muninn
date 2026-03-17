@@ -4,14 +4,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use muninn::config::{PipelineStepConfig, StepIoMode};
 use muninn::{
-    append_transcription_attempt, resolve_secret_from_env, InProcessStepError,
-    InProcessStepExecutor, MuninnEnvelopeV1, ResolvedBuiltinStepConfig, StepFailureKind,
-    TranscriptionAttempt, TranscriptionAttemptOutcome, TranscriptionProvider,
+    InProcessStepError, InProcessStepExecutor, MuninnEnvelopeV1, ResolvedBuiltinStepConfig,
+    StepFailureKind, TranscriptionProvider,
 };
-use serde_json::json;
 
 use crate::{
-    refine, stt_apple_speech_tool, stt_google_tool, stt_openai_tool, stt_whisper_cpp_tool,
+    refine, stt_apple_speech_tool, stt_deepgram_tool, stt_google_tool, stt_openai_tool,
+    stt_whisper_cpp_tool,
 };
 
 const INTERNAL_STEP_MARKER: &str = "__internal_step";
@@ -63,7 +62,7 @@ impl BuiltinStep {
         match self {
             Self::SttAppleSpeech => stt_apple_speech_tool::run_as_internal_tool(),
             Self::SttWhisperCpp => stt_whisper_cpp_tool::run_as_internal_tool(),
-            Self::SttDeepgram => run_unavailable_transcription_cli(TranscriptionProvider::Deepgram),
+            Self::SttDeepgram => stt_deepgram_tool::run_as_internal_tool(),
             Self::SttOpenAi => stt_openai_tool::run_as_internal_tool(),
             Self::SttGoogle => stt_google_tool::run_as_internal_tool(),
             Self::Refine => refine::run_as_internal_tool(),
@@ -82,10 +81,9 @@ impl BuiltinStep {
             Self::SttWhisperCpp => stt_whisper_cpp_tool::process_input_in_process(input, config)
                 .await
                 .map_err(map_internal_tool_error),
-            Self::SttDeepgram => Ok(execute_unavailable_transcription_step(
-                input,
-                TranscriptionProvider::Deepgram,
-            )),
+            Self::SttDeepgram => stt_deepgram_tool::process_input_in_process(input, config)
+                .await
+                .map_err(map_internal_tool_error),
             Self::SttOpenAi => stt_openai_tool::process_input_in_process(input, config)
                 .await
                 .map_err(map_internal_tool_error),
@@ -95,74 +93,6 @@ impl BuiltinStep {
             Self::Refine => refine::process_input_in_process(input, config)
                 .await
                 .map_err(map_internal_tool_error),
-        }
-    }
-}
-
-fn run_unavailable_transcription_cli(provider: TranscriptionProvider) -> ExitCode {
-    let attempt = unavailable_transcription_attempt(provider);
-    eprintln!(
-        "{}",
-        json!({
-            "error": {
-                "provider": provider.config_id(),
-                "code": attempt.code,
-                "message": attempt.detail,
-                "transcription_outcome": attempt.outcome,
-            }
-        })
-    );
-    ExitCode::FAILURE
-}
-
-fn execute_unavailable_transcription_step(
-    input: &MuninnEnvelopeV1,
-    provider: TranscriptionProvider,
-) -> MuninnEnvelopeV1 {
-    if input
-        .transcript
-        .raw_text
-        .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
-    {
-        return input.clone();
-    }
-
-    let attempt = unavailable_transcription_attempt(provider);
-    let mut envelope = input.clone();
-    append_transcription_attempt(&mut envelope, attempt.clone());
-    envelope.errors.push(json!({
-        "provider": provider.config_id(),
-        "code": attempt.code,
-        "message": attempt.detail,
-        "transcription_outcome": attempt.outcome,
-    }));
-    envelope
-}
-
-fn unavailable_transcription_attempt(provider: TranscriptionProvider) -> TranscriptionAttempt {
-    match provider {
-        TranscriptionProvider::Deepgram
-            if resolve_secret_from_env("DEEPGRAM_API_KEY", None).is_none() =>
-        {
-            TranscriptionAttempt::new(
-                provider,
-                TranscriptionAttemptOutcome::UnavailableCredentials,
-                "missing_deepgram_api_key",
-                "missing Deepgram API key; set DEEPGRAM_API_KEY before using the Deepgram route leg",
-            )
-        }
-        TranscriptionProvider::Deepgram => TranscriptionAttempt::new(
-            provider,
-            TranscriptionAttemptOutcome::UnavailableRuntimeCapability,
-            "deepgram_backend_unavailable",
-            "Deepgram transcription is not available in this build yet",
-        ),
-        TranscriptionProvider::AppleSpeech
-        | TranscriptionProvider::WhisperCpp
-        | TranscriptionProvider::OpenAi
-        | TranscriptionProvider::Google => {
-            unreachable!("implemented providers should not use the unavailable placeholder path")
         }
     }
 }
@@ -271,6 +201,16 @@ impl InternalToolError for stt_apple_speech_tool::CliError {
 
     fn to_stderr_json(&self) -> String {
         stt_apple_speech_tool::CliError::to_stderr_json(self)
+    }
+}
+
+impl InternalToolError for stt_deepgram_tool::CliError {
+    fn message(&self) -> &str {
+        stt_deepgram_tool::CliError::message(self)
+    }
+
+    fn to_stderr_json(&self) -> String {
+        stt_deepgram_tool::CliError::to_stderr_json(self)
     }
 }
 

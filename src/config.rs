@@ -1085,6 +1085,7 @@ impl Default for LoggingConfig {
 pub struct ProvidersConfig {
     pub apple_speech: AppleSpeechProviderConfig,
     pub whisper_cpp: WhisperCppProviderConfig,
+    pub deepgram: DeepgramProviderConfig,
     pub openai: OpenAiProviderConfig,
     pub google: GoogleProviderConfig,
 }
@@ -1164,6 +1165,26 @@ impl Default for WhisperCppProviderConfig {
             model: None,
             model_dir: PathBuf::from("~/.local/share/muninn/models"),
             device: WhisperCppDevicePreference::Auto,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepgramProviderConfig {
+    pub api_key: Option<String>,
+    pub endpoint: String,
+    pub model: String,
+    pub language: String,
+}
+
+impl Default for DeepgramProviderConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            endpoint: "https://api.deepgram.com/v1/listen".to_string(),
+            model: "nova-3".to_string(),
+            language: "en".to_string(),
         }
     }
 }
@@ -1649,6 +1670,12 @@ mod tests {
             config.providers.whisper_cpp.device,
             WhisperCppDevicePreference::Auto
         );
+        assert_eq!(
+            config.providers.deepgram.endpoint,
+            "https://api.deepgram.com/v1/listen"
+        );
+        assert_eq!(config.providers.deepgram.model, "nova-3");
+        assert_eq!(config.providers.deepgram.language, "en");
         assert_eq!(config.refine.model, "gpt-4.1-mini");
         assert_eq!(config.indicator.colors.idle, "#636366");
         assert!(config.recording.mono);
@@ -1703,6 +1730,12 @@ mod tests {
             config.providers.whisper_cpp.device,
             WhisperCppDevicePreference::Auto
         );
+        assert_eq!(
+            config.providers.deepgram.endpoint,
+            "https://api.deepgram.com/v1/listen"
+        );
+        assert_eq!(config.providers.deepgram.model, "nova-3");
+        assert_eq!(config.providers.deepgram.language, "en");
         assert_eq!(config.refine.provider, RefineProvider::OpenAi);
         assert_eq!(
             config.transcript.system_prompt,
@@ -1790,6 +1823,40 @@ on_error = "abort"
                 model: Some("base.en".to_string()),
                 model_dir: PathBuf::from("/tmp/muninn-models"),
                 device: WhisperCppDevicePreference::Cpu,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_deepgram_provider_overrides() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[providers.deepgram]
+api_key = "config-deepgram-key"
+endpoint = "https://api.deepgram.test/v1/listen"
+model = "nova-3-medical"
+language = "en-IE"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("Deepgram provider overrides should parse");
+
+        assert_eq!(
+            config.providers.deepgram,
+            super::DeepgramProviderConfig {
+                api_key: Some("config-deepgram-key".to_string()),
+                endpoint: "https://api.deepgram.test/v1/listen".to_string(),
+                model: "nova-3-medical".to_string(),
+                language: "en-IE".to_string(),
             }
         );
     }
