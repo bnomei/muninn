@@ -11,7 +11,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
@@ -54,11 +54,21 @@ fn log_provider_error(error: &CliError) {
 
 fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
     warn!(
-        target: crate::logging::TARGET_PROVIDER,
+        target: muninn::TARGET_PROVIDER,
         provider = "openai",
         code,
         detail = detail.as_ref(),
         "OpenAI transcription step warning"
+    );
+}
+
+fn log_provider_info(code: &'static str, detail: impl AsRef<str>) {
+    info!(
+        target: muninn::TARGET_PROVIDER,
+        provider = "openai",
+        code,
+        detail = detail.as_ref(),
+        "OpenAI transcription step info"
     );
 }
 
@@ -109,7 +119,7 @@ fn run() -> Result<(), CliError> {
     runtime.block_on(async {
         let envelope = read_envelope_from_reader(io::stdin().lock())?;
 
-        let config = load_openai_config_from_config();
+        let config = load_openai_config_from_config()?;
         let env_lookup = |key: &str| std::env::var(key).ok();
         let output = process_input(envelope, &env_lookup, &config).await?;
 
@@ -130,8 +140,25 @@ where
     match prepare_envelope(input, get_env, config)? {
         PreparedEnvelope::Ready(envelope) => Ok(envelope),
         PreparedEnvelope::NeedsTranscription(request) => {
+            let started = std::time::Instant::now();
+            log_provider_info("stt_started", "starting live OpenAI transcription request");
             match transcribe_with_openai(&request).await {
-                Ok(transcript) => Ok(apply_openai_transcript(request.envelope, transcript)),
+                Ok(transcript) => {
+                    let code = if transcript.trim().is_empty() {
+                        "stt_empty_transcript"
+                    } else {
+                        "stt_finished"
+                    };
+                    info!(
+                        target: muninn::TARGET_PROVIDER,
+                        provider = "openai",
+                        code,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        transcript_len = transcript.trim().len(),
+                        "OpenAI transcription attempt completed"
+                    );
+                    Ok(apply_openai_transcript(request.envelope, transcript))
+                }
                 Err(error) => Ok(apply_openai_transcription_failure(request.envelope, &error)),
             }
         }
@@ -156,12 +183,20 @@ where
     F: Fn(&str) -> Option<String>,
 {
     if has_non_empty_raw_text(&envelope) {
+        log_provider_info(
+            "stt_skipped_existing_raw_text",
+            "skipping OpenAI transcription because transcript.raw_text is already present",
+        );
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
     if let Some(stub_text) = resolve_secret(get_env("MUNINN_OPENAI_STUB_TEXT"), None) {
         envelope.transcript.provider = Some("openai".to_string());
         envelope.transcript.raw_text = Some(stub_text);
+        log_provider_info(
+            "stt_used_stub_text",
+            "using MUNINN_OPENAI_STUB_TEXT instead of live OpenAI transcription",
+        );
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
@@ -328,6 +363,10 @@ fn apply_openai_transcript(mut envelope: MuninnEnvelopeV1, transcript: String) -
             ),
         );
         envelope.transcript.raw_text = Some(transcript);
+        log_provider_info(
+            "produced_transcript",
+            "OpenAI transcription produced transcript text",
+        );
     }
 
     envelope
@@ -451,26 +490,19 @@ fn mime_for_audio_path(path: &Path) -> &'static str {
     }
 }
 
-fn load_openai_config_from_config() -> OpenAiResolvedConfig {
+fn load_openai_config_from_config() -> Result<OpenAiResolvedConfig, CliError> {
     let defaults = muninn::AppConfig::default().providers.openai;
 
-    muninn::AppConfig::load()
-        .map(|config| {
-            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
-                &config,
-            ))
-        })
-        .inspect_err(|error| {
-            log_provider_warning(
-                "config_load_failed",
-                format!("failed to load AppConfig for OpenAI provider: {error}"),
-            );
-        })
-        .unwrap_or_else(|_| OpenAiResolvedConfig {
+    muninn::load_builtin_step_config(
+        "OpenAI provider",
+        || OpenAiResolvedConfig {
             api_key: resolve_secret(None, defaults.api_key),
             endpoint: defaults.endpoint,
             model: defaults.model,
-        })
+        },
+        resolved_config_from_builtin_steps,
+    )
+    .map_err(|message| CliError::new("provider_config_load_failed", message))
 }
 
 fn resolved_config_from_builtin_steps(config: &ResolvedBuiltinStepConfig) -> OpenAiResolvedConfig {

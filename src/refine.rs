@@ -8,7 +8,7 @@ use muninn::resolve_secret;
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
 use serde_json::{json, Value};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const BUILTIN_SYSTEM_PROMPT: &str = r#"You are Muninn, a minimal transcript corrector for developer dictation.
 
@@ -91,6 +91,16 @@ fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
     );
 }
 
+fn log_provider_info(code: &'static str, detail: impl AsRef<str>) {
+    info!(
+        target: muninn::TARGET_PROVIDER,
+        provider = "refine",
+        code,
+        detail = detail.as_ref(),
+        "Refine provider info"
+    );
+}
+
 #[derive(Debug, Clone)]
 struct ResolvedRefineConfig {
     provider: RefineProvider,
@@ -144,7 +154,7 @@ fn run_cli() -> Result<(), CliError> {
     runtime.block_on(async {
         let envelope = read_envelope_from_reader(io::stdin().lock())?;
 
-        let config = load_refine_config_from_config();
+        let config = load_refine_config_from_config()?;
         let env_lookup = |key: &str| std::env::var(key).ok();
         let output = process_input(envelope, &env_lookup, &config).await?;
 
@@ -164,16 +174,26 @@ where
 {
     let Some(raw_text) = non_empty_text(&envelope.transcript.raw_text).map(ToOwned::to_owned)
     else {
+        log_provider_info(
+            "refine_skipped_no_raw_text",
+            "skipping refine because transcript.raw_text is not present",
+        );
         return Ok(envelope);
     };
 
     let candidate = if let Some(stub_text) =
         resolve_secret(get_env("MUNINN_REFINE_STUB_TEXT"), None)
     {
+        log_provider_info(
+            "refine_used_stub_text",
+            "using MUNINN_REFINE_STUB_TEXT instead of live refine provider",
+        );
         stub_text
     } else {
         match config.provider {
             RefineProvider::OpenAi => {
+                let started = std::time::Instant::now();
+                log_provider_info("refine_started", "starting live OpenAI refine request");
                 let api_key = resolve_secret(get_env("OPENAI_API_KEY"), config.api_key.clone())
                     .ok_or_else(|| {
                         let error = CliError::new(
@@ -183,7 +203,17 @@ where
                         log_provider_warning(error.code, error.message());
                         error
                     })?;
-                refine_with_openai(&api_key, config, &config.hint_prompt, &raw_text).await?
+                let candidate =
+                    refine_with_openai(&api_key, config, &config.hint_prompt, &raw_text).await?;
+                info!(
+                    target: muninn::TARGET_PROVIDER,
+                    provider = "refine",
+                    code = "refine_finished",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    candidate_len = candidate.trim().len(),
+                    "refine attempt completed"
+                );
+                candidate
             }
         }
     };
@@ -330,6 +360,14 @@ fn apply_refinement(
 ) {
     match evaluate_candidate(raw_text, candidate, config) {
         CandidateEvaluation::Accept(text) => {
+            info!(
+                target: muninn::TARGET_PROVIDER,
+                provider = "refine",
+                code = "refine_accepted",
+                changed = raw_text.trim() != text.trim(),
+                output_len = text.len(),
+                "refine output accepted"
+            );
             envelope.output.final_text = Some(text);
         }
         CandidateEvaluation::Reject(metrics) => {
@@ -518,29 +556,22 @@ where
     })
 }
 
-fn load_refine_config_from_config() -> ResolvedRefineConfig {
+fn load_refine_config_from_config() -> Result<ResolvedRefineConfig, CliError> {
     let defaults = muninn::AppConfig::default();
 
-    muninn::AppConfig::load()
-        .map(|config| {
-            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
-                &config,
-            ))
-        })
-        .inspect_err(|error| {
-            log_provider_warning(
-                "config_load_failed",
-                format!("failed to load AppConfig for refine step: {error}"),
-            );
-        })
-        .unwrap_or_else(|_| {
+    muninn::load_builtin_step_config(
+        "refine step",
+        || {
             let mut resolved = ResolvedRefineConfig::from_config(
                 &defaults.refine,
                 defaults.providers.openai.api_key,
             );
             resolved.hint_prompt = defaults.transcript.system_prompt;
             resolved
-        })
+        },
+        resolved_config_from_builtin_steps,
+    )
+    .map_err(|message| CliError::new("provider_config_load_failed", message))
 }
 
 fn resolved_config_from_builtin_steps(config: &ResolvedBuiltinStepConfig) -> ResolvedRefineConfig {

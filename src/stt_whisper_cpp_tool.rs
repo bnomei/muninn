@@ -10,7 +10,7 @@ use muninn::{
     TranscriptionProvider,
 };
 use serde_json::json;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 const DEFAULT_MODEL_ID: &str = "tiny.en";
@@ -66,6 +66,16 @@ fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
         code,
         detail = detail.as_ref(),
         "Whisper.cpp transcription step warning"
+    );
+}
+
+fn log_provider_info(code: &'static str, detail: impl AsRef<str>) {
+    info!(
+        target: muninn::TARGET_PROVIDER,
+        provider = "whisper_cpp",
+        code,
+        detail = detail.as_ref(),
+        "Whisper.cpp transcription step info"
     );
 }
 
@@ -142,7 +152,7 @@ fn run() -> Result<(), CliError> {
 
     runtime.block_on(async {
         let envelope = read_envelope_from_reader(io::stdin().lock())?;
-        let config = load_whisper_cpp_config_from_config();
+        let config = load_whisper_cpp_config_from_config()?;
         let output = process_input(envelope, &config).await?;
         write_envelope_to_writer(io::stdout().lock(), &output)?;
         Ok(())
@@ -160,11 +170,31 @@ async fn process_input(
                 envelope,
                 inference,
             } = request;
+            let started = std::time::Instant::now();
+            log_provider_info(
+                "stt_started",
+                "starting Whisper.cpp transcription worker task",
+            );
             let join_result =
                 tokio::task::spawn_blocking(move || transcribe_with_whisper_cpp(&inference)).await;
 
             match join_result {
-                Ok(Ok(transcript)) => Ok(apply_whisper_transcript(envelope, transcript)),
+                Ok(Ok(transcript)) => {
+                    let code = if transcript.trim().is_empty() {
+                        "stt_empty_transcript"
+                    } else {
+                        "stt_finished"
+                    };
+                    info!(
+                        target: muninn::TARGET_PROVIDER,
+                        provider = "whisper_cpp",
+                        code,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        transcript_len = transcript.trim().len(),
+                        "Whisper.cpp transcription attempt completed"
+                    );
+                    Ok(apply_whisper_transcript(envelope, transcript))
+                }
                 Ok(Err(error)) => Ok(apply_whisper_transcription_failure(envelope, &error)),
                 Err(error) => Ok(apply_whisper_transcription_failure(
                     envelope,
@@ -191,6 +221,10 @@ fn prepare_envelope(
     config: &WhisperCppResolvedConfig,
 ) -> Result<PreparedEnvelope, CliError> {
     if has_non_empty_raw_text(&envelope) {
+        log_provider_info(
+            "stt_skipped_existing_raw_text",
+            "skipping Whisper.cpp transcription because transcript.raw_text is already present",
+        );
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
@@ -697,6 +731,10 @@ fn apply_whisper_transcript(
             ),
         );
         envelope.transcript.raw_text = Some(transcript);
+        log_provider_info(
+            "produced_transcript",
+            "Whisper.cpp transcription produced transcript text",
+        );
     }
 
     envelope
@@ -732,26 +770,19 @@ fn has_non_empty_raw_text(envelope: &MuninnEnvelopeV1) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn load_whisper_cpp_config_from_config() -> WhisperCppResolvedConfig {
+fn load_whisper_cpp_config_from_config() -> Result<WhisperCppResolvedConfig, CliError> {
     let defaults = muninn::AppConfig::default().providers.whisper_cpp;
 
-    muninn::AppConfig::load()
-        .map(|config| {
-            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
-                &config,
-            ))
-        })
-        .inspect_err(|error| {
-            log_provider_warning(
-                "config_load_failed",
-                format!("failed to load AppConfig for Whisper.cpp provider: {error}"),
-            );
-        })
-        .unwrap_or(WhisperCppResolvedConfig {
+    muninn::load_builtin_step_config(
+        "Whisper.cpp provider",
+        || WhisperCppResolvedConfig {
             model: defaults.model,
             model_dir: defaults.model_dir,
             device: defaults.device,
-        })
+        },
+        resolved_config_from_builtin_steps,
+    )
+    .map_err(|message| CliError::new("provider_config_load_failed", message))
 }
 
 fn resolved_config_from_builtin_steps(

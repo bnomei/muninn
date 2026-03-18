@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use anyhow::{anyhow, Context, Result};
 use muninn::config::PipelineConfig;
 use muninn::{
@@ -10,7 +13,7 @@ use muninn::{
 use tao::event_loop::EventLoopProxy;
 use tracing::{debug, error, info, warn};
 
-use crate::runtime_tray::{EventLoopIndicator, UserEvent};
+use crate::runtime_tray::{send_user_event, EventLoopIndicator, UserEvent};
 use crate::{logging, runtime_pipeline, HOTKEY_RECOVERY_DELAY, OUTPUT_INDICATOR_MIN_DURATION};
 
 #[derive(Debug, Clone)]
@@ -32,9 +35,13 @@ pub(crate) fn spawn_runtime_worker(
         {
             Ok(runtime) => runtime,
             Err(error) => {
-                let _ = proxy.send_event(UserEvent::RuntimeFailure(format!(
-                    "building runtime worker: {error}"
-                )));
+                let message = format!("building runtime worker: {error}");
+                logging::log_runtime_worker_failed("runtime_build", message.clone());
+                send_user_event(
+                    &proxy,
+                    UserEvent::RuntimeFailure(message),
+                    "runtime_worker_build_failure",
+                );
                 return;
             }
         };
@@ -42,7 +49,13 @@ pub(crate) fn spawn_runtime_worker(
         let indicator = EventLoopIndicator::new(proxy.clone());
         let worker = RuntimeWorker::new(config, preflight, indicator);
         if let Err(error) = runtime.block_on(worker.run(runtime_events)) {
-            let _ = proxy.send_event(UserEvent::RuntimeFailure(format!("{error:#}")));
+            let message = format!("{error:#}");
+            logging::log_runtime_worker_failed("runtime_run", message.clone());
+            send_user_event(
+                &proxy,
+                UserEvent::RuntimeFailure(message),
+                "runtime_worker_run_failure",
+            );
         }
     });
 }
@@ -56,9 +69,25 @@ where
     indicator: I,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ActiveUtterance {
     resolved: ResolvedUtteranceConfig,
+    pipeline: PipelineConfig,
+    runner: Arc<PipelineRunner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PreparedUtteranceCacheKey {
+    profile_id: String,
+    voice_id: Option<String>,
+}
+
+struct PreparedUtteranceCacheEntry {
+    effective_config: AppConfig,
+    builtin_steps: ResolvedBuiltinStepConfig,
+    pipeline: PipelineConfig,
+    runner: Arc<PipelineRunner>,
+    transcription_route: muninn::ResolvedTranscriptionRoute,
 }
 
 impl<I> RuntimeWorker<I>
@@ -85,7 +114,9 @@ where
             self.config.app.strict_step_contract,
             ResolvedBuiltinStepConfig::from_app_config(&self.config),
         );
+        let replay_persist = runtime_pipeline::ReplayPersistenceService::spawn();
         let mut active_utterance: Option<ActiveUtterance> = None;
+        let mut prepared_utterance_cache = HashMap::new();
         let mut coordinator = RuntimeFlowCoordinator::new(
             self.indicator,
             MacosAudioRecorder::new(self.config.recording.clone()),
@@ -150,9 +181,20 @@ where
                                 &mut runner,
                                 *new_config,
                             )?;
-                            coordinator
-                                .recorder_mut()
-                                .set_recording_config(self.config.recording.clone());
+                            prepared_utterance_cache.clear();
+                            if matches!(
+                                coordinator.state(),
+                                AppState::RecordingPushToTalk | AppState::RecordingDone
+                            ) {
+                                info!(
+                                    target: logging::TARGET_CONFIG,
+                                    "deferred recorder output-config reload until active capture completes"
+                                );
+                            } else {
+                                coordinator
+                                    .recorder_mut()
+                                    .set_recording_config(self.config.recording.clone());
+                            }
                             continue;
                         }
                         None => return Err(anyhow!("runtime event channel closed")),
@@ -186,26 +228,41 @@ where
                     ) {
                         continue;
                     }
-                    let resolved = self
-                        .config
-                        .resolve_effective_config(capture_frontmost_target_context());
-                    if let Some(reason) = resolved.fallback_reason.as_deref() {
+                    let prepared = prepare_active_utterance(
+                        &self.config,
+                        capture_frontmost_target_context(),
+                        &mut prepared_utterance_cache,
+                    )?;
+                    if let Some(reason) = prepared.resolved.fallback_reason.as_deref() {
                         info!(
                             target: logging::TARGET_RUNTIME,
-                            profile = %resolved.profile_id,
+                            profile = %prepared.resolved.profile_id,
                             reason,
                             "using default contextual profile"
                         );
                     }
                     coordinator
                         .recorder_mut()
-                        .set_recording_config(resolved.effective_config.recording.clone());
+                        .set_recording_config(prepared.resolved.effective_config.recording.clone());
                     let started = std::time::Instant::now();
                     coordinator
-                        .start_push_to_talk(resolved.voice_glyph)
+                        .start_push_to_talk(prepared.resolved.voice_glyph)
                         .await
                         .context("starting push-to-talk recording flow")?;
-                    active_utterance = Some(ActiveUtterance { resolved });
+                    logging::log_recording_started(
+                        &prepared.resolved.profile_id,
+                        prepared.resolved.voice_id.as_deref(),
+                        prepared.resolved.voice_glyph,
+                        "push_to_talk",
+                        prepared
+                            .resolved
+                            .effective_config
+                            .recording
+                            .sample_rate_hz(),
+                        prepared.resolved.effective_config.recording.mono,
+                        recording_source_name(recording_source),
+                    );
+                    active_utterance = Some(prepared);
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
                         "push-to-talk recording started"
@@ -227,26 +284,41 @@ where
                     ) {
                         continue;
                     }
-                    let resolved = self
-                        .config
-                        .resolve_effective_config(capture_frontmost_target_context());
-                    if let Some(reason) = resolved.fallback_reason.as_deref() {
+                    let prepared = prepare_active_utterance(
+                        &self.config,
+                        capture_frontmost_target_context(),
+                        &mut prepared_utterance_cache,
+                    )?;
+                    if let Some(reason) = prepared.resolved.fallback_reason.as_deref() {
                         info!(
                             target: logging::TARGET_RUNTIME,
-                            profile = %resolved.profile_id,
+                            profile = %prepared.resolved.profile_id,
                             reason,
                             "using default contextual profile"
                         );
                     }
                     coordinator
                         .recorder_mut()
-                        .set_recording_config(resolved.effective_config.recording.clone());
+                        .set_recording_config(prepared.resolved.effective_config.recording.clone());
                     let started = std::time::Instant::now();
                     coordinator
-                        .start_done_mode(resolved.voice_glyph)
+                        .start_done_mode(prepared.resolved.voice_glyph)
                         .await
                         .context("starting done-mode recording flow")?;
-                    active_utterance = Some(ActiveUtterance { resolved });
+                    logging::log_recording_started(
+                        &prepared.resolved.profile_id,
+                        prepared.resolved.voice_id.as_deref(),
+                        prepared.resolved.voice_glyph,
+                        "done_mode",
+                        prepared
+                            .resolved
+                            .effective_config
+                            .recording
+                            .sample_rate_hz(),
+                        prepared.resolved.effective_config.recording.mono,
+                        recording_source_name(recording_source),
+                    );
+                    active_utterance = Some(prepared);
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
                         "done-mode recording started"
@@ -271,19 +343,18 @@ where
                     AppEvent::PttReleased | AppEvent::DoneTogglePressed,
                     AppState::Processing,
                 ) => {
-                    let resolved = active_utterance
-                        .take()
-                        .map(|utterance| utterance.resolved)
-                        .unwrap_or_else(|| {
-                            self.config
-                                .resolve_effective_config(capture_frontmost_target_context())
-                        });
-                    let effective_pipeline =
-                        runtime_pipeline::resolve_pipeline_config(&resolved.effective_config)?;
-                    let effective_runner = runtime_pipeline::build_pipeline_runner(
-                        resolved.effective_config.app.strict_step_contract,
-                        resolved.builtin_steps.clone(),
-                    );
+                    let ActiveUtterance {
+                        resolved,
+                        pipeline: effective_pipeline,
+                        runner: effective_runner,
+                    } = match active_utterance.take() {
+                        Some(utterance) => utterance,
+                        None => prepare_active_utterance(
+                            &self.config,
+                            capture_frontmost_target_context(),
+                            &mut prepared_utterance_cache,
+                        )?,
+                    };
                     let processing_indicator =
                         runtime_pipeline::initial_processing_indicator(&effective_pipeline);
                     let stopped = std::time::Instant::now();
@@ -306,7 +377,15 @@ where
                         Ok(None) => continue,
                         Err(error) => {
                             let (_, indicator, _) = coordinator.processing_parts();
-                            let _ = indicator.set_state(IndicatorState::Idle).await;
+                            if let Err(reset_error) =
+                                indicator.set_state(IndicatorState::Idle).await
+                            {
+                                warn!(
+                                    target: logging::TARGET_RUNTIME,
+                                    error = %reset_error,
+                                    "failed to reset indicator after recording stop failure"
+                                );
+                            }
                             return Err(error).context("stopping recording");
                         }
                     };
@@ -320,8 +399,9 @@ where
                         runtime_pipeline::ProcessingContext {
                             resolved: &resolved,
                             pipeline: &effective_pipeline,
-                            runner: &effective_runner,
+                            runner: effective_runner.as_ref(),
                             injector,
+                            replay_persist: &replay_persist,
                         },
                         indicator,
                         state,
@@ -336,7 +416,13 @@ where
                         );
                         let (state, indicator, _) = coordinator.processing_parts();
                         *state = AppState::Idle;
-                        let _ = indicator.set_state(IndicatorState::Idle).await;
+                        if let Err(reset_error) = indicator.set_state(IndicatorState::Idle).await {
+                            warn!(
+                                target: logging::TARGET_RUNTIME,
+                                error = %reset_error,
+                                "failed to reset indicator after processing failure"
+                            );
+                        }
                     }
                     drain_busy_input_backlog(
                         &mut hotkeys,
@@ -344,6 +430,7 @@ where
                         &mut self.config,
                         &mut pipeline,
                         &mut runner,
+                        &mut prepared_utterance_cache,
                     )?;
                 }
                 _ => {
@@ -352,6 +439,60 @@ where
             }
         }
     }
+}
+
+fn prepare_active_utterance(
+    config: &AppConfig,
+    target_context: muninn::TargetContextSnapshot,
+    cache: &mut HashMap<PreparedUtteranceCacheKey, PreparedUtteranceCacheEntry>,
+) -> Result<ActiveUtterance> {
+    let selection = config.resolve_profile_selection(&target_context);
+    let cache_key = PreparedUtteranceCacheKey {
+        profile_id: selection.profile_id.clone(),
+        voice_id: selection.voice_id.clone(),
+    };
+
+    if let Some(entry) = cache.get(&cache_key) {
+        return Ok(ActiveUtterance {
+            resolved: ResolvedUtteranceConfig {
+                target_context,
+                matched_rule_id: selection.matched_rule_id,
+                profile_id: selection.profile_id,
+                voice_id: selection.voice_id,
+                voice_glyph: selection.voice_glyph,
+                fallback_reason: selection.fallback_reason,
+                transcription_route: entry.transcription_route.clone(),
+                effective_config: entry.effective_config.clone(),
+                builtin_steps: entry.builtin_steps.clone(),
+            },
+            pipeline: entry.pipeline.clone(),
+            runner: Arc::clone(&entry.runner),
+        });
+    }
+
+    let resolved = config.resolve_effective_config(target_context);
+    let pipeline = runtime_pipeline::resolve_pipeline_config(&resolved.effective_config)?;
+    let runner = Arc::new(runtime_pipeline::build_pipeline_runner(
+        resolved.effective_config.app.strict_step_contract,
+        resolved.builtin_steps.clone(),
+    ));
+
+    cache.insert(
+        cache_key,
+        PreparedUtteranceCacheEntry {
+            effective_config: resolved.effective_config.clone(),
+            builtin_steps: resolved.builtin_steps.clone(),
+            pipeline: pipeline.clone(),
+            runner: Arc::clone(&runner),
+            transcription_route: resolved.transcription_route.clone(),
+        },
+    );
+
+    Ok(ActiveUtterance {
+        resolved,
+        pipeline,
+        runner,
+    })
 }
 
 async fn refresh_permissions_status_with<A>(permissions: &A) -> Result<PermissionPreflightStatus>
@@ -375,6 +516,13 @@ pub(crate) struct RecordingPermissionRefresh {
 pub(crate) enum RecordingStartSource {
     Hotkey,
     Tray,
+}
+
+fn recording_source_name(source: RecordingStartSource) -> &'static str {
+    match source {
+        RecordingStartSource::Hotkey => "hotkey",
+        RecordingStartSource::Tray => "tray",
+    }
 }
 
 pub(crate) async fn refresh_recording_permissions_for_user_action<A>(
@@ -583,6 +731,7 @@ fn drain_busy_input_backlog(
     current_config: &mut AppConfig,
     pipeline: &mut PipelineConfig,
     runner: &mut PipelineRunner,
+    prepared_utterance_cache: &mut HashMap<PreparedUtteranceCacheKey, PreparedUtteranceCacheEntry>,
 ) -> Result<()> {
     let mut dropped_hotkeys = 0_usize;
     while let Some(result) = hotkeys.try_next_event() {
@@ -614,6 +763,7 @@ fn drain_busy_input_backlog(
 
     let applied_config_reload = if let Some(config) = latest_config {
         runtime_pipeline::apply_live_config_reload(current_config, pipeline, runner, *config)?;
+        prepared_utterance_cache.clear();
         true
     } else {
         false

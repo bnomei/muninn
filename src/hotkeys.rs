@@ -8,7 +8,7 @@ use tracing::warn;
 
 use crate::{
     HotkeyAction, HotkeyEvent, HotkeyEventKind, HotkeyEventSource, MacosAdapterError,
-    MacosAdapterResult,
+    MacosAdapterResult, TARGET_HOTKEY,
 };
 
 /// Platform-specific key type: `rdev::Key` on macOS, opaque u32 elsewhere.
@@ -347,21 +347,37 @@ impl HotkeyDropDiagnostics {
 }
 
 fn record_hotkey_queue_drop(payload_kind: &'static str) {
-    let Some(warning) = hotkey_drop_diagnostics()
-        .lock()
-        .ok()
-        .and_then(|mut diagnostics| diagnostics.record_drop_at(Instant::now()))
-    else {
+    let Some(warning) = take_hotkey_drop_warning(hotkey_drop_diagnostics(), payload_kind) else {
         return;
     };
 
     warn!(
-        target: "hotkey",
+        target: TARGET_HOTKEY,
         payload_kind,
         dropped_events = warning.dropped_events,
         queue_capacity = HOTKEY_EVENT_BUFFER_CAPACITY,
         "dropping hotkey listener payload because hotkey event queue is full"
     );
+}
+
+fn take_hotkey_drop_warning(
+    diagnostics_mutex: &Mutex<HotkeyDropDiagnostics>,
+    payload_kind: &'static str,
+) -> Option<HotkeyDropWarning> {
+    match diagnostics_mutex.lock() {
+        Ok(mut diagnostics) => diagnostics.record_drop_at(Instant::now()),
+        Err(poisoned) => {
+            warn!(
+                target: TARGET_HOTKEY,
+                payload_kind,
+                "hotkey drop diagnostics mutex poisoned; recovering"
+            );
+            let mut diagnostics = poisoned.into_inner();
+            let warning = diagnostics.record_drop_at(Instant::now());
+            diagnostics_mutex.clear_poison();
+            warning
+        }
+    }
 }
 
 fn hotkey_drop_diagnostics() -> &'static Mutex<HotkeyDropDiagnostics> {
@@ -797,6 +813,26 @@ mod drop_diagnostic_tests {
         assert!(
             receiver.try_recv().is_err(),
             "full-queue drop should not enqueue the second event"
+        );
+    }
+
+    #[test]
+    fn hotkey_drop_diagnostics_recovers_after_mutex_poison() {
+        let diagnostics = Mutex::new(HotkeyDropDiagnostics::default());
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = diagnostics
+                .lock()
+                .expect("diagnostics lock should succeed before poison");
+            panic!("poison diagnostics");
+        }));
+
+        assert_eq!(
+            take_hotkey_drop_warning(&diagnostics, "event"),
+            Some(HotkeyDropWarning { dropped_events: 1 })
+        );
+        assert!(
+            diagnostics.lock().is_ok(),
+            "recovered diagnostics should clear poison"
         );
     }
 }

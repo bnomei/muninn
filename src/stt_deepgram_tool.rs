@@ -13,7 +13,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::OnceLock;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const PROVIDER_ID: &str = "deepgram";
 const DEFAULT_ENDPOINT: &str = "https://api.deepgram.com/v1/listen";
@@ -66,6 +66,16 @@ fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
         code,
         detail = detail.as_ref(),
         "Deepgram transcription step warning"
+    );
+}
+
+fn log_provider_info(code: &'static str, detail: impl AsRef<str>) {
+    info!(
+        target: muninn::TARGET_PROVIDER,
+        provider = PROVIDER_ID,
+        code,
+        detail = detail.as_ref(),
+        "Deepgram transcription step info"
     );
 }
 
@@ -139,8 +149,28 @@ where
     match prepare_envelope(input, get_env, config)? {
         PreparedEnvelope::Ready(envelope) => Ok(envelope),
         PreparedEnvelope::NeedsTranscription(request) => {
+            let started = std::time::Instant::now();
+            log_provider_info(
+                "stt_started",
+                "starting live Deepgram transcription request",
+            );
             match transcribe_with_deepgram(&request).await {
-                Ok(transcript) => Ok(apply_deepgram_transcript(request.envelope, transcript)),
+                Ok(transcript) => {
+                    let code = if transcript.trim().is_empty() {
+                        "stt_empty_transcript"
+                    } else {
+                        "stt_finished"
+                    };
+                    info!(
+                        target: muninn::TARGET_PROVIDER,
+                        provider = PROVIDER_ID,
+                        code,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        transcript_len = transcript.trim().len(),
+                        "Deepgram transcription attempt completed"
+                    );
+                    Ok(apply_deepgram_transcript(request.envelope, transcript))
+                }
                 Err(error) => Ok(apply_deepgram_transcription_failure(
                     request.envelope,
                     &error,
@@ -168,12 +198,20 @@ where
     F: Fn(&str) -> Option<String>,
 {
     if has_non_empty_raw_text(&envelope) {
+        log_provider_info(
+            "stt_skipped_existing_raw_text",
+            "skipping Deepgram transcription because transcript.raw_text is already present",
+        );
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
     if let Some(stub_text) = resolve_secret(get_env("MUNINN_DEEPGRAM_STUB_TEXT"), None) {
         envelope.transcript.provider = Some(PROVIDER_ID.to_string());
         envelope.transcript.raw_text = Some(stub_text);
+        log_provider_info(
+            "stt_used_stub_text",
+            "using MUNINN_DEEPGRAM_STUB_TEXT instead of live Deepgram transcription",
+        );
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
@@ -338,6 +376,10 @@ fn apply_deepgram_transcript(
             ),
         );
         envelope.transcript.raw_text = Some(transcript);
+        log_provider_info(
+            "produced_transcript",
+            "Deepgram transcription produced transcript text",
+        );
     }
 
     envelope

@@ -1,5 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -18,11 +21,14 @@ use uuid::Uuid;
 
 use crate::{internal_tools, logging, replay};
 
+const REPLAY_PERSIST_QUEUE_CAPACITY: usize = 8;
+
 pub(crate) struct ProcessingContext<'a> {
     pub(crate) resolved: &'a ResolvedUtteranceConfig,
     pub(crate) pipeline: &'a PipelineConfig,
     pub(crate) runner: &'a PipelineRunner,
     pub(crate) injector: &'a MacosTextInjector,
+    pub(crate) replay_persist: &'a ReplayPersistenceService,
 }
 
 pub(crate) async fn process_and_inject<I>(
@@ -63,7 +69,9 @@ where
         let missing_credentials_feedback = should_show_missing_credentials_feedback(&outcome);
         let permissions = MacosPermissionsAdapter::new();
 
-        spawn_replay_persist(replay_config, envelope, outcome, route, replay_recorded);
+        context
+            .replay_persist
+            .enqueue(replay_config, envelope, outcome, route, replay_recorded);
 
         *state = state.on_event(AppEvent::ProcessingFinished);
 
@@ -378,22 +386,20 @@ fn log_pipeline_outcome_diagnostics(outcome: &PipelineOutcome) {
         }
     }
 
-    let Some(last_step) = trace.last() else {
-        return;
-    };
+    for entry in trace {
+        if entry.stderr.trim().is_empty() {
+            continue;
+        }
 
-    if last_step.stderr.trim().is_empty() {
-        return;
+        warn!(
+            target: logging::TARGET_PIPELINE,
+            step_id = %entry.id,
+            exit_status = ?entry.exit_status,
+            timed_out = entry.timed_out,
+            stderr_len = entry.stderr.len(),
+            "pipeline step emitted stderr (redacted)"
+        );
     }
-
-    warn!(
-        target: logging::TARGET_PIPELINE,
-        step_id = %last_step.id,
-        exit_status = ?last_step.exit_status,
-        timed_out = last_step.timed_out,
-        stderr_len = last_step.stderr.len(),
-        "pipeline step emitted stderr (redacted)"
-    );
 }
 
 fn build_envelope(
@@ -469,10 +475,6 @@ fn log_transcription_route_diagnostics(outcome: &PipelineOutcome) {
     };
 
     let attempts = transcription_attempts(envelope);
-    if attempts.is_empty() {
-        return;
-    }
-
     let route = resolved_transcription_route(envelope)
         .map(|route| {
             route
@@ -483,6 +485,16 @@ fn log_transcription_route_diagnostics(outcome: &PipelineOutcome) {
                 .join(" -> ")
         })
         .unwrap_or_else(|| "<unknown>".to_string());
+
+    if attempts.is_empty() {
+        info!(
+            target: logging::TARGET_PIPELINE,
+            route = %route,
+            "transcription route carried no provider attempts"
+        );
+        return;
+    }
+
     let attempt_summary = attempts
         .iter()
         .map(|attempt| format!("{}:{}", attempt.provider, attempt.code))
@@ -537,33 +549,146 @@ fn cleanup_recording_file(path: &Path) {
     }
 }
 
-fn spawn_replay_persist(
-    resolved: Option<ResolvedUtteranceConfig>,
+struct ReplayPersistRequest {
+    resolved: ResolvedUtteranceConfig,
     envelope: MuninnEnvelopeV1,
     outcome: PipelineOutcome,
     route: muninn::InjectionRoute,
     recorded: muninn::RecordedAudio,
-) {
-    let Some(resolved) = resolved else {
-        return;
-    };
-    drop(tokio::task::spawn_blocking(
-        move || match replay::persist_replay(resolved, envelope, outcome, route, recorded) {
-            Ok(Some(path)) => {
-                info!(
-                    target: logging::TARGET_RUNTIME,
-                    replay_dir = %path.display(),
-                    "persisted replay artifact"
-                );
+}
+
+pub(crate) struct ReplayPersistenceService {
+    sender: Option<SyncSender<ReplayPersistRequest>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl ReplayPersistenceService {
+    pub(crate) fn spawn() -> Self {
+        let (sender, receiver) =
+            sync_channel::<ReplayPersistRequest>(REPLAY_PERSIST_QUEUE_CAPACITY);
+        let worker = std::thread::spawn(move || {
+            let mut stores = HashMap::<std::path::PathBuf, replay::ReplayStore>::new();
+            while let Ok(request) = receiver.recv() {
+                let spec = match replay::replay_store_spec(&request.resolved.effective_config) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        warn!(
+                            target: logging::TARGET_RUNTIME,
+                            error = %error,
+                            "failed to resolve replay store configuration"
+                        );
+                        continue;
+                    }
+                };
+
+                let store = match stores.entry(spec.root.clone()) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.get_mut().update_limits(&spec);
+                        entry.into_mut()
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        match replay::ReplayStore::open(spec.clone()) {
+                            Ok(store) => entry.insert(store),
+                            Err(error) => {
+                                warn!(
+                                    target: logging::TARGET_RUNTIME,
+                                    replay_root = %spec.root.display(),
+                                    error = %error,
+                                    "failed to initialize replay persistence store"
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                match store.persist(
+                    request.resolved,
+                    request.envelope,
+                    request.outcome,
+                    request.route,
+                    request.recorded,
+                ) {
+                    Ok(Some(path)) => {
+                        info!(
+                            target: logging::TARGET_RUNTIME,
+                            replay_dir = %path.display(),
+                            "persisted replay artifact"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            target: logging::TARGET_RUNTIME,
+                            error = %error,
+                            "failed to persist replay artifact"
+                        );
+                    }
+                }
             }
-            Ok(None) => {}
-            Err(error) => {
+        });
+
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        }
+    }
+
+    pub(crate) fn enqueue(
+        &self,
+        resolved: Option<ResolvedUtteranceConfig>,
+        envelope: MuninnEnvelopeV1,
+        outcome: PipelineOutcome,
+        route: muninn::InjectionRoute,
+        recorded: muninn::RecordedAudio,
+    ) {
+        let Some(resolved) = resolved else {
+            return;
+        };
+        let Some(sender) = self.sender.as_ref() else {
+            warn!(
+                target: logging::TARGET_RUNTIME,
+                "dropping replay persistence request because service is shut down"
+            );
+            return;
+        };
+        let request = ReplayPersistRequest {
+            resolved,
+            envelope,
+            outcome,
+            route,
+            recorded,
+        };
+        match sender.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_request)) => {
                 warn!(
                     target: logging::TARGET_RUNTIME,
-                    error = %error,
-                    "failed to persist replay artifact"
+                    queue_capacity = REPLAY_PERSIST_QUEUE_CAPACITY,
+                    "dropping replay persistence request because replay queue is full"
                 );
             }
-        },
-    ));
+            Err(TrySendError::Disconnected(_request)) => {
+                warn!(
+                    target: logging::TARGET_RUNTIME,
+                    "dropping replay persistence request because replay worker is unavailable"
+                );
+            }
+        }
+    }
+}
+
+impl Drop for ReplayPersistenceService {
+    fn drop(&mut self) {
+        let _ = self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            if let Err(error) = worker.join() {
+                warn!(
+                    target: logging::TARGET_RUNTIME,
+                    error = ?error,
+                    "failed to join replay persistence worker"
+                );
+            }
+        }
+    }
 }

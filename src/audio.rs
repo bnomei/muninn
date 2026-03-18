@@ -4,7 +4,9 @@ use std::time::Instant;
 use async_trait::async_trait;
 
 use crate::config::RecordingConfig;
-use crate::{AudioRecorder, MacosAdapterError, MacosAdapterResult, RecordedAudio};
+use crate::{
+    AudioRecorder, MacosAdapterError, MacosAdapterResult, RecordedAudio, TARGET_RECORDING,
+};
 
 const MAX_BUFFERED_RECORDING_SECS: usize = 180;
 
@@ -130,7 +132,7 @@ impl AudioRecorder for MacosAudioRecorder {
             let output_mono = self.output_config.mono;
             self.started_at = Some(Instant::now());
             tracing::debug!(
-                target: "recording",
+                target: TARGET_RECORDING,
                 capture_sample_rate_hz,
                 capture_channels,
                 output_sample_rate_hz,
@@ -195,7 +197,7 @@ impl AudioRecorder for MacosAudioRecorder {
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             if samples.is_empty() {
                 tracing::warn!(
-                    target: "recording",
+                    target: TARGET_RECORDING,
                     capture_sample_rate_hz = engine.sample_rate,
                     capture_channels = engine.channels,
                     output_sample_rate_hz = self.output_config.sample_rate_hz(),
@@ -213,7 +215,7 @@ impl AudioRecorder for MacosAudioRecorder {
                 .map(|metadata| metadata.len())
                 .unwrap_or_default();
             tracing::debug!(
-                target: "recording",
+                target: TARGET_RECORDING,
                 wav_path = %wav_path.display(),
                 wav_bytes,
                 buffered_samples = samples.len(),
@@ -318,7 +320,11 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
     let capture = Arc::new(Mutex::new(CaptureBuffer::default()));
     let sample_budget = max_buffered_samples(config.sample_rate.0, config.channels);
     let error_callback = |error| {
-        tracing::error!(target: "recording", %error, "muninn audio stream error");
+        tracing::error!(
+            target: TARGET_RECORDING,
+            %error,
+            "muninn audio stream error"
+        );
     };
 
     let stream = match selection.sample_format {
@@ -346,7 +352,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
     }?;
 
     tracing::debug!(
-        target: "recording",
+        target: TARGET_RECORDING,
         capture_sample_format = ?selection.sample_format,
         capture_sample_rate_hz = config.sample_rate.0,
         capture_channels = config.channels,

@@ -120,27 +120,28 @@ pub(super) async fn run_command(
     let status = match timeout(timeout_budget, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(source)) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = drain_reader(stdout_reader).await;
+            let (stderr, cleanup_notes) =
+                cleanup_after_command_failure(&mut child, stdout_reader, stderr_reader).await;
             return Err(CommandError {
                 kind: CommandErrorKind::Wait,
-                details: source.to_string(),
+                details: format_command_error_details(source.to_string(), cleanup_notes),
                 timed_out: false,
                 exit_status: None,
-                stderr: drain_reader(stderr_reader).await.unwrap_or_default(),
+                stderr,
             });
         }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = drain_reader(stdout_reader).await;
+            let (stderr, cleanup_notes) =
+                cleanup_after_command_failure(&mut child, stdout_reader, stderr_reader).await;
             return Err(CommandError {
                 kind: CommandErrorKind::Timeout,
-                details: timeout_budget.as_millis().to_string(),
+                details: format_command_error_details(
+                    timeout_budget.as_millis().to_string(),
+                    cleanup_notes,
+                ),
                 timed_out: true,
                 exit_status: None,
-                stderr: drain_reader(stderr_reader).await.unwrap_or_default(),
+                stderr,
             });
         }
     };
@@ -214,4 +215,42 @@ async fn drain_reader(
             "failed to join stdout/stderr collection task: {source}"
         ))),
     }
+}
+
+async fn cleanup_after_command_failure(
+    child: &mut tokio::process::Child,
+    stdout_reader: JoinHandle<io::Result<CapturedOutput>>,
+    stderr_reader: JoinHandle<io::Result<CapturedOutput>>,
+) -> (CapturedOutput, Vec<String>) {
+    let mut cleanup_notes = Vec::new();
+
+    if let Err(source) = child.kill().await {
+        cleanup_notes.push(format!("child kill during cleanup failed: {source}"));
+    }
+
+    if let Err(source) = child.wait().await {
+        cleanup_notes.push(format!("child wait during cleanup failed: {source}"));
+    }
+
+    if let Err(source) = drain_reader(stdout_reader).await {
+        cleanup_notes.push(format!("stdout drain during cleanup failed: {source}"));
+    }
+
+    let stderr = match drain_reader(stderr_reader).await {
+        Ok(stderr) => stderr,
+        Err(source) => {
+            cleanup_notes.push(format!("stderr drain during cleanup failed: {source}"));
+            CapturedOutput::default()
+        }
+    };
+
+    (stderr, cleanup_notes)
+}
+
+fn format_command_error_details(primary: String, cleanup_notes: Vec<String>) -> String {
+    if cleanup_notes.is_empty() {
+        return primary;
+    }
+
+    format!("{primary}; {}", cleanup_notes.join("; "))
 }

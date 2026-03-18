@@ -1,8 +1,8 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
@@ -20,6 +20,7 @@ use muninn::TargetContextSnapshot;
 use muninn::TranscriptionRouteSource;
 use serde::Serialize;
 use serde_json::{Map, Value};
+use tracing::warn;
 
 const REDACTED_VALUE: &str = "[redacted]";
 const REPLAY_PRUNE_THROTTLE_SECS: u64 = 60;
@@ -30,7 +31,13 @@ const SECRET_KEYS: &[&str] = &[
     "token",
     "google_stt_token",
 ];
-static LAST_REPLAY_PRUNE_AT_SECS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ReplayStoreSpec {
+    pub(crate) root: PathBuf,
+    pub(crate) retention_days: u32,
+    pub(crate) max_bytes: u64,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct ReplayRecord {
@@ -71,6 +78,111 @@ struct ReplayEntryMeta {
     bytes: u64,
 }
 
+pub(crate) struct ReplayStore {
+    root: PathBuf,
+    retention_days: u32,
+    max_bytes: u64,
+    last_prune_secs: u64,
+    entries: Vec<ReplayEntryMeta>,
+}
+
+pub(crate) fn replay_store_spec(config: &AppConfig) -> Result<ReplayStoreSpec> {
+    Ok(ReplayStoreSpec {
+        root: expand_replay_dir(&config.logging.replay_dir)
+            .context("resolving replay_dir to an absolute path")?,
+        retention_days: config.logging.replay_retention_days,
+        max_bytes: config.logging.replay_max_bytes,
+    })
+}
+
+impl ReplayStore {
+    pub(crate) fn open(spec: ReplayStoreSpec) -> Result<Self> {
+        fs::create_dir_all(&spec.root)
+            .with_context(|| format!("creating replay root {}", spec.root.display()))?;
+
+        Ok(Self {
+            entries: collect_replay_entries(&spec.root)?,
+            root: spec.root,
+            retention_days: spec.retention_days,
+            max_bytes: spec.max_bytes,
+            last_prune_secs: 0,
+        })
+    }
+
+    pub(crate) fn update_limits(&mut self, spec: &ReplayStoreSpec) {
+        self.retention_days = spec.retention_days;
+        self.max_bytes = spec.max_bytes;
+    }
+
+    pub(crate) fn persist(
+        &mut self,
+        resolved: ResolvedUtteranceConfig,
+        input_envelope: MuninnEnvelopeV1,
+        outcome: PipelineOutcome,
+        route: InjectionRoute,
+        recorded: RecordedAudio,
+    ) -> Result<Option<PathBuf>> {
+        if !resolved.effective_config.logging.replay_enabled {
+            return Ok(None);
+        }
+
+        let now = SystemTime::now();
+        let artifact_dir = write_replay_artifact(
+            &self.root,
+            &resolved,
+            input_envelope,
+            outcome,
+            route,
+            recorded,
+        )?;
+        self.record_artifact(&artifact_dir, now)?;
+        self.maybe_prune(now)?;
+        Ok(Some(artifact_dir))
+    }
+
+    fn record_artifact(&mut self, artifact_dir: &Path, modified_at: SystemTime) -> Result<()> {
+        let bytes = recursive_size(artifact_dir)?;
+        self.entries.retain(|entry| entry.path != artifact_dir);
+        self.entries.push(ReplayEntryMeta {
+            path: artifact_dir.to_path_buf(),
+            modified_at,
+            bytes,
+        });
+        Ok(())
+    }
+
+    fn maybe_prune(&mut self, now: SystemTime) -> Result<()> {
+        let now_secs = seconds_since_epoch(now);
+        if !should_prune_replay(self.last_prune_secs, now_secs, REPLAY_PRUNE_THROTTLE_SECS) {
+            return Ok(());
+        }
+
+        self.last_prune_secs = now_secs;
+        self.prune(now)
+    }
+
+    fn prune(&mut self, now: SystemTime) -> Result<()> {
+        self.entries.retain(|entry| entry.path.exists());
+        let removals = plan_replay_prune(&self.entries, now, self.retention_days, self.max_bytes);
+        let removal_set = removals.iter().cloned().collect::<HashSet<_>>();
+
+        for path in removals {
+            if path.is_dir() {
+                fs::remove_dir_all(&path)
+                    .with_context(|| format!("removing replay artifact dir {}", path.display()))?;
+            } else if path.exists() {
+                fs::remove_file(&path)
+                    .with_context(|| format!("removing replay artifact file {}", path.display()))?;
+            }
+        }
+
+        self.entries
+            .retain(|entry| !removal_set.contains(&entry.path));
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
 pub fn persist_replay(
     resolved: ResolvedUtteranceConfig,
     input_envelope: MuninnEnvelopeV1,
@@ -78,16 +190,24 @@ pub fn persist_replay(
     route: InjectionRoute,
     recorded: RecordedAudio,
 ) -> Result<Option<PathBuf>> {
-    let config = &resolved.effective_config;
-    if !config.logging.replay_enabled {
+    if !resolved.effective_config.logging.replay_enabled {
         return Ok(None);
     }
 
-    let replay_root = expand_replay_dir(&config.logging.replay_dir)
-        .context("resolving replay_dir to an absolute path")?;
-    fs::create_dir_all(&replay_root)
-        .with_context(|| format!("creating replay root {}", replay_root.display()))?;
+    let spec = replay_store_spec(&resolved.effective_config)?;
+    let mut store = ReplayStore::open(spec)?;
+    store.persist(resolved, input_envelope, outcome, route, recorded)
+}
 
+fn write_replay_artifact(
+    replay_root: &Path,
+    resolved: &ResolvedUtteranceConfig,
+    input_envelope: MuninnEnvelopeV1,
+    outcome: PipelineOutcome,
+    route: InjectionRoute,
+    recorded: RecordedAudio,
+) -> Result<PathBuf> {
+    let config = &resolved.effective_config;
     let artifact_dir = replay_root.join(artifact_dir_name(&input_envelope));
     fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("creating replay artifact dir {}", artifact_dir.display()))?;
@@ -100,22 +220,27 @@ pub fn persist_replay(
     ) {
         Ok(path) => path,
         Err(error) => {
-            warnings.push(format!("audio_retention_failed: {error:#}"));
+            let detail = format!("audio_retention_failed: {error:#}");
+            warn!(
+                target: muninn::TARGET_RUNTIME,
+                code = "audio_retention_failed",
+                detail = detail.as_str(),
+                "replay persistence warning"
+            );
+            warnings.push(detail);
             None
         }
     };
-    let replay_retention_days = config.logging.replay_retention_days;
-    let replay_max_bytes = config.logging.replay_max_bytes;
     let refine_context = replay_refine_context(config);
     let redacted_config = redacted_config_snapshot(config.clone());
     let resolution = ReplayResolutionContext {
-        target_context: resolved.target_context,
-        matched_rule_id: resolved.matched_rule_id,
-        profile_id: resolved.profile_id,
-        voice_id: resolved.voice_id,
+        target_context: resolved.target_context.clone(),
+        matched_rule_id: resolved.matched_rule_id.clone(),
+        profile_id: resolved.profile_id.clone(),
+        voice_id: resolved.voice_id.clone(),
         voice_glyph: resolved.voice_glyph,
-        fallback_reason: resolved.fallback_reason,
-        transcription_route: resolved.transcription_route,
+        fallback_reason: resolved.fallback_reason.clone(),
+        transcription_route: resolved.transcription_route.clone(),
     };
 
     let record = ReplayRecord {
@@ -143,14 +268,7 @@ pub fn persist_replay(
         .flush()
         .with_context(|| format!("flushing replay record at {}", record_path.display()))?;
 
-    maybe_prune_replay_root(
-        &replay_root,
-        replay_retention_days,
-        replay_max_bytes,
-        SystemTime::now(),
-    )?;
-
-    Ok(Some(artifact_dir))
+    Ok(artifact_dir)
 }
 
 fn redacted_config_snapshot(mut config: AppConfig) -> Value {
@@ -345,29 +463,6 @@ fn retain_audio_file(source: &Path, target: &Path) -> Result<()> {
     }
 }
 
-fn maybe_prune_replay_root(
-    root: &Path,
-    retention_days: u32,
-    max_bytes: u64,
-    now: SystemTime,
-) -> Result<()> {
-    let now_secs = seconds_since_epoch(now);
-    let last_prune_secs = LAST_REPLAY_PRUNE_AT_SECS.load(Ordering::Relaxed);
-    if !should_prune_replay(last_prune_secs, now_secs, REPLAY_PRUNE_THROTTLE_SECS) {
-        return Ok(());
-    }
-
-    match LAST_REPLAY_PRUNE_AT_SECS.compare_exchange(
-        last_prune_secs,
-        now_secs,
-        Ordering::SeqCst,
-        Ordering::SeqCst,
-    ) {
-        Ok(_) => prune_replay_root(root, retention_days, max_bytes),
-        Err(_) => Ok(()),
-    }
-}
-
 fn should_prune_replay(last_prune_secs: u64, now_secs: u64, interval_secs: u64) -> bool {
     last_prune_secs == 0 || now_secs.saturating_sub(last_prune_secs) >= interval_secs
 }
@@ -376,23 +471,6 @@ fn seconds_since_epoch(now: SystemTime) -> u64 {
     now.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn prune_replay_root(root: &Path, retention_days: u32, max_bytes: u64) -> Result<()> {
-    let entries = collect_replay_entries(root)?;
-    let removals = plan_replay_prune(&entries, SystemTime::now(), retention_days, max_bytes);
-
-    for path in removals {
-        if path.is_dir() {
-            fs::remove_dir_all(&path)
-                .with_context(|| format!("removing replay artifact dir {}", path.display()))?;
-        } else if path.exists() {
-            fs::remove_file(&path)
-                .with_context(|| format!("removing replay artifact file {}", path.display()))?;
-        }
-    }
-
-    Ok(())
 }
 
 fn collect_replay_entries(root: &Path) -> Result<Vec<ReplayEntryMeta>> {

@@ -193,28 +193,71 @@ impl AppConfig {
         target_context: TargetContextSnapshot,
     ) -> ResolvedUtteranceConfig {
         let selection = self.resolve_profile_selection(&target_context);
-        let mut effective_config = self.clone();
+        let mut recording = self.recording.clone();
+        let mut pipeline = self.pipeline.clone();
+        let mut transcription = self.transcription.clone();
+        let mut transcript = self.transcript.clone();
+        let mut refine = self.refine.clone();
 
         if let Some(voice_id) = selection.voice_id.as_deref() {
             if let Some(voice) = self.voices.get(voice_id) {
-                voice.apply_to(
-                    &mut effective_config.transcript,
-                    &mut effective_config.refine,
-                );
+                voice.apply_to(&mut transcript, &mut refine);
             }
         }
 
         if let Some(profile) = self.profiles.get(&selection.profile_id) {
-            profile.apply_to(&mut effective_config);
+            if let Some(recording_overrides) = profile.recording.as_ref() {
+                recording_overrides.apply_to(&mut recording);
+            }
+            if let Some(pipeline_overrides) = profile.pipeline.as_ref() {
+                pipeline_overrides.apply_to(&mut pipeline);
+            }
+            if let Some(transcription_overrides) = profile.transcription.as_ref() {
+                transcription_overrides.apply_to(&mut transcription);
+            }
+            if let Some(transcript_overrides) = profile.transcript.as_ref() {
+                transcript_overrides.apply_to(&mut transcript);
+            }
+            if let Some(refine_overrides) = profile.refine.as_ref() {
+                refine_overrides.apply_to(&mut refine);
+            }
         }
 
-        effective_config.transcript.materialize_system_prompt();
+        transcript.materialize_system_prompt();
 
-        let transcription_route = resolve_transcription_route(&effective_config);
-        effective_config.pipeline = expand_pipeline_with_transcription_route(
-            &effective_config.pipeline,
-            &transcription_route,
-        );
+        let transcription_route = resolve_transcription_route_from_parts(&transcription, &pipeline);
+        let pipeline = expand_pipeline_with_transcription_route(&pipeline, &transcription_route);
+        let providers = self.providers.clone();
+        let logging = self.logging.clone();
+        let replay_snapshot_enabled = logging.replay_enabled;
+        let effective_config = AppConfig {
+            app: self.app.clone(),
+            hotkeys: self.hotkeys.clone(),
+            indicator: self.indicator.clone(),
+            recording,
+            pipeline,
+            scoring: self.scoring.clone(),
+            transcription,
+            transcript,
+            refine,
+            logging,
+            providers,
+            voices: if replay_snapshot_enabled {
+                self.voices.clone()
+            } else {
+                BTreeMap::new()
+            },
+            profiles: if replay_snapshot_enabled {
+                self.profiles.clone()
+            } else {
+                BTreeMap::new()
+            },
+            profile_rules: if replay_snapshot_enabled {
+                self.profile_rules.clone()
+            } else {
+                Vec::new()
+            },
+        };
 
         ResolvedUtteranceConfig {
             target_context,
@@ -784,24 +827,6 @@ impl ProfileConfig {
             refine.validate(profile_id)?;
         }
         Ok(())
-    }
-
-    fn apply_to(&self, config: &mut AppConfig) {
-        if let Some(recording) = self.recording.as_ref() {
-            recording.apply_to(&mut config.recording);
-        }
-        if let Some(pipeline) = self.pipeline.as_ref() {
-            pipeline.apply_to(&mut config.pipeline);
-        }
-        if let Some(transcription) = self.transcription.as_ref() {
-            transcription.apply_to(&mut config.transcription);
-        }
-        if let Some(transcript) = self.transcript.as_ref() {
-            transcript.apply_to(&mut config.transcript);
-        }
-        if let Some(refine) = self.refine.as_ref() {
-            refine.apply_to(&mut config.refine);
-        }
     }
 }
 
@@ -1628,8 +1653,11 @@ fn validate_profile_rules(config: &AppConfig) -> Result<(), ConfigValidationErro
     Ok(())
 }
 
-fn resolve_transcription_route(config: &AppConfig) -> ResolvedTranscriptionRoute {
-    if let Some(providers) = config.transcription.providers.clone() {
+fn resolve_transcription_route_from_parts(
+    transcription: &TranscriptionConfig,
+    pipeline: &PipelineConfig,
+) -> ResolvedTranscriptionRoute {
+    if let Some(providers) = transcription.providers.clone() {
         return ResolvedTranscriptionRoute {
             providers,
             source: TranscriptionRouteSource::ExplicitConfig,
@@ -1637,7 +1665,7 @@ fn resolve_transcription_route(config: &AppConfig) -> ResolvedTranscriptionRoute
     }
 
     ResolvedTranscriptionRoute {
-        providers: infer_transcription_route_from_pipeline(&config.pipeline),
+        providers: infer_transcription_route_from_pipeline(pipeline),
         source: TranscriptionRouteSource::PipelineInferred,
     }
 }

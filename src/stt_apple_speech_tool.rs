@@ -14,7 +14,7 @@ use muninn::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -72,6 +72,16 @@ fn log_provider_warning(code: &'static str, detail: impl AsRef<str>) {
     );
 }
 
+fn log_provider_info(code: &'static str, detail: impl AsRef<str>) {
+    info!(
+        target: muninn::TARGET_PROVIDER,
+        provider = PROVIDER_ID,
+        code,
+        detail = detail.as_ref(),
+        "Apple Speech transcription step info"
+    );
+}
+
 #[derive(Debug, Clone)]
 struct AppleSpeechResolvedConfig {
     locale: Option<String>,
@@ -125,7 +135,7 @@ pub fn run_as_internal_tool() -> ExitCode {
 
 fn run() -> Result<(), CliError> {
     let envelope = read_envelope_from_reader(io::stdin().lock())?;
-    let config = load_apple_speech_config_from_config();
+    let config = load_apple_speech_config_from_config()?;
     let output = process_input(envelope, config)?;
     write_envelope_to_writer(io::stdout().lock(), &output)?;
     Ok(())
@@ -160,13 +170,40 @@ where
 {
     match prepare_envelope(input, &config)? {
         PreparedEnvelope::Ready(envelope) => Ok(envelope),
-        PreparedEnvelope::NeedsTranscription(request) => match run_helper(&request.helper) {
-            Ok(response) => Ok(apply_apple_speech_response(request.envelope, response)),
-            Err(error) => Ok(apply_apple_speech_transcription_failure(
-                request.envelope,
-                &error,
-            )),
-        },
+        PreparedEnvelope::NeedsTranscription(request) => {
+            let started = std::time::Instant::now();
+            log_provider_info(
+                "stt_started",
+                "starting Apple Speech helper transcription request",
+            );
+            match run_helper(&request.helper) {
+                Ok(response) => {
+                    info!(
+                        target: muninn::TARGET_PROVIDER,
+                        provider = PROVIDER_ID,
+                        code = match response.outcome {
+                            TranscriptionAttemptOutcome::ProducedTranscript => "stt_finished",
+                            TranscriptionAttemptOutcome::EmptyTranscript => "stt_empty_transcript",
+                            _ => "stt_completed_without_transcript",
+                        },
+                        elapsed_ms = started.elapsed().as_millis(),
+                        transcript_len = response
+                            .transcript
+                            .as_deref()
+                            .map(str::trim)
+                            .map(str::len)
+                            .unwrap_or(0),
+                        outcome = ?response.outcome,
+                        "Apple Speech transcription attempt completed"
+                    );
+                    Ok(apply_apple_speech_response(request.envelope, response))
+                }
+                Err(error) => Ok(apply_apple_speech_transcription_failure(
+                    request.envelope,
+                    &error,
+                )),
+            }
+        }
     }
 }
 
@@ -187,8 +224,33 @@ pub(crate) async fn process_input_in_process(
                 ));
             }
 
+            let started = std::time::Instant::now();
+            log_provider_info(
+                "stt_started",
+                "starting Apple Speech async helper transcription request",
+            );
             match invoke_apple_speech_helper_async(&request.helper).await {
-                Ok(response) => Ok(apply_apple_speech_response(request.envelope, response)),
+                Ok(response) => {
+                    info!(
+                        target: muninn::TARGET_PROVIDER,
+                        provider = PROVIDER_ID,
+                        code = match response.outcome {
+                            TranscriptionAttemptOutcome::ProducedTranscript => "stt_finished",
+                            TranscriptionAttemptOutcome::EmptyTranscript => "stt_empty_transcript",
+                            _ => "stt_completed_without_transcript",
+                        },
+                        elapsed_ms = started.elapsed().as_millis(),
+                        transcript_len = response
+                            .transcript
+                            .as_deref()
+                            .map(str::trim)
+                            .map(str::len)
+                            .unwrap_or(0),
+                        outcome = ?response.outcome,
+                        "Apple Speech transcription attempt completed"
+                    );
+                    Ok(apply_apple_speech_response(request.envelope, response))
+                }
                 Err(error) => Ok(apply_apple_speech_transcription_failure(
                     request.envelope,
                     &error,
@@ -203,6 +265,10 @@ fn prepare_envelope(
     config: &AppleSpeechResolvedConfig,
 ) -> Result<PreparedEnvelope, CliError> {
     if has_non_empty_raw_text(&envelope) {
+        log_provider_info(
+            "stt_skipped_existing_raw_text",
+            "skipping Apple Speech transcription because transcript.raw_text is already present",
+        );
         return Ok(PreparedEnvelope::Ready(envelope));
     }
 
@@ -523,25 +589,18 @@ fn has_non_empty_raw_text(envelope: &MuninnEnvelopeV1) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn load_apple_speech_config_from_config() -> AppleSpeechResolvedConfig {
+fn load_apple_speech_config_from_config() -> Result<AppleSpeechResolvedConfig, CliError> {
     let defaults = muninn::AppConfig::default().providers.apple_speech;
 
-    muninn::AppConfig::load()
-        .map(|config| {
-            resolved_config_from_builtin_steps(&muninn::ResolvedBuiltinStepConfig::from_app_config(
-                &config,
-            ))
-        })
-        .inspect_err(|error| {
-            log_provider_warning(
-                "config_load_failed",
-                format!("failed to load AppConfig for Apple Speech provider: {error}"),
-            );
-        })
-        .unwrap_or(AppleSpeechResolvedConfig {
+    muninn::load_builtin_step_config(
+        "Apple Speech provider",
+        || AppleSpeechResolvedConfig {
             locale: defaults.locale,
             install_assets: defaults.install_assets,
-        })
+        },
+        resolved_config_from_builtin_steps,
+    )
+    .map_err(|message| CliError::new("provider_config_load_failed", message))
 }
 
 fn resolved_config_from_builtin_steps(
@@ -633,12 +692,18 @@ fn write_helper_atomically(path: &Path) -> Result<(), CliError> {
     })?;
 
     fs::rename(&temp_path, path).map_err(|source| {
-        let _ = fs::remove_file(&temp_path);
+        let cleanup_note = match fs::remove_file(&temp_path) {
+            Ok(()) => String::new(),
+            Err(cleanup_error) => format!(
+                "; failed to remove staged Apple Speech helper at {}: {cleanup_error}",
+                temp_path.display()
+            ),
+        };
         CliError::new(
             "apple_speech_helper_write_failed",
             format!(
-                "failed to materialize Apple Speech helper at {}: {source}",
-                path.display()
+                "failed to materialize Apple Speech helper at {}: {source}{cleanup_note}",
+                path.display(),
             ),
         )
     })

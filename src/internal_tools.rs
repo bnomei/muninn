@@ -121,11 +121,20 @@ impl InProcessStepExecutor for BuiltinStepExecutor {
 }
 
 pub fn maybe_handle_internal_step(args: &[String]) -> Option<ExitCode> {
-    if args.len() < 3 || args[1] != INTERNAL_STEP_MARKER {
+    if args.get(1).map(String::as_str) != Some(INTERNAL_STEP_MARKER) {
         return None;
     }
 
-    let tool = lookup_builtin_step(&args[2])?;
+    let Some(step_name) = args.get(2).map(String::as_str) else {
+        eprintln!("muninn internal step failed: missing step name after {INTERNAL_STEP_MARKER}");
+        return Some(ExitCode::FAILURE);
+    };
+
+    let Some(tool) = lookup_builtin_step(step_name) else {
+        eprintln!("muninn internal step failed: unknown internal step '{step_name}'");
+        return Some(ExitCode::FAILURE);
+    };
+
     Some(tool.run_as_internal_tool())
 }
 
@@ -237,7 +246,8 @@ impl InternalToolError for refine::CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
+    use muninn::config::{ConfigValidationError, OnErrorPolicy, PipelineStepConfig, StepIoMode};
+    use std::path::PathBuf;
 
     #[test]
     fn normalizes_internal_tool_step_to_canonical_builtin_name() {
@@ -316,5 +326,51 @@ mod tests {
         assert!(BuiltinStep::SttOpenAi.is_transcription());
         assert!(BuiltinStep::SttGoogle.is_transcription());
         assert!(!BuiltinStep::Refine.is_transcription());
+    }
+
+    #[test]
+    fn internal_step_invocation_rejects_unknown_step_name() {
+        let args = vec![
+            "muninn".to_string(),
+            "__internal_step".to_string(),
+            "unknown_step".to_string(),
+        ];
+
+        assert_eq!(maybe_handle_internal_step(&args), Some(ExitCode::FAILURE));
+    }
+
+    #[test]
+    fn builtin_step_config_loader_uses_defaults_only_for_missing_config() {
+        let resolved = muninn::resolve_builtin_step_config_from_load_result(
+            "OpenAI provider",
+            Err(muninn::ConfigError::NotFound {
+                path: PathBuf::from("/tmp/missing-config.toml"),
+            }),
+            || "default-value".to_string(),
+            |_| "resolved-value".to_string(),
+        )
+        .expect("missing config should fall back to defaults");
+
+        assert_eq!(resolved, "default-value");
+    }
+
+    #[test]
+    fn builtin_step_config_loader_rejects_invalid_config() {
+        let resolved = muninn::resolve_builtin_step_config_from_load_result(
+            "OpenAI provider",
+            Err(muninn::ConfigError::Validation(
+                ConfigValidationError::RefineEndpointMustNotBeEmpty,
+            )),
+            || "default-value".to_string(),
+            |_| "resolved-value".to_string(),
+        );
+
+        assert_eq!(
+            resolved,
+            Err(
+                "failed to load AppConfig for OpenAI provider: refine.endpoint must not be empty"
+                    .to_string()
+            )
+        );
     }
 }

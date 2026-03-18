@@ -110,7 +110,11 @@ fn run_debug_record(duration_arg: Option<&String>) -> Result<()> {
         .unwrap_or(3)
         .max(1);
     let config = AppConfig::load().context("loading AppConfig for __debug_record")?;
-    let _ = logging::init_logging(&config);
+    if let Err(error) = logging::init_logging(&config) {
+        eprintln!(
+            "muninn logging warning: failed to initialize logging for __debug_record: {error:#}"
+        );
+    }
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -199,10 +203,8 @@ fn maybe_load_dotenv() {
     let dotenv_path = match std::env::current_dir() {
         Ok(current_dir) => dotenv_path_for_dir(&current_dir),
         Err(error) => {
-            warn!(
-                target: logging::TARGET_CONFIG,
-                %error,
-                "failed to resolve current working directory for .env loading"
+            eprintln!(
+                "muninn config warning: failed to resolve current working directory for .env loading: {error}"
             );
             return;
         }
@@ -226,11 +228,9 @@ fn maybe_load_dotenv() {
             );
         }
         Err(error) => {
-            warn!(
-                target: logging::TARGET_CONFIG,
-                path = %dotenv_path.display(),
-                %error,
-                "failed to load .env file"
+            eprintln!(
+                "muninn config warning: failed to load .env file at {}: {error}",
+                dotenv_path.display()
             );
         }
     }
@@ -268,7 +268,12 @@ fn flush_pending_config_reload(
                 "runtime worker channel closed before queued config reload could be forwarded"
             );
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => unreachable!(),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                target: logging::TARGET_CONFIG,
+                "unexpected runtime queue payload while forwarding queued config reload"
+            );
+        }
     }
 }
 

@@ -3,8 +3,9 @@ use std::time::Duration;
 use crate::{
     AppEvent, AppState, AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind,
     IndicatorAdapter, IndicatorState, InjectionRoute, MacosAdapterResult, RecordedAudio,
-    RecordingMode, TextInjector,
+    RecordingMode, TextInjector, TARGET_RUNTIME,
 };
+use tracing::warn;
 
 #[derive(Debug)]
 pub struct RuntimeFlowCoordinator<I, R, T>
@@ -149,7 +150,13 @@ where
         self.state = self.state.on_event(AppEvent::InjectionFinished);
         if let Err(error) = route_result {
             if matches!(self.indicator.state().await, Ok(IndicatorState::Pipeline)) {
-                let _ = self.indicator.set_state(IndicatorState::Idle).await;
+                if let Err(reset_error) = self.indicator.set_state(IndicatorState::Idle).await {
+                    warn!(
+                        target: TARGET_RUNTIME,
+                        error = %reset_error,
+                        "failed to reset indicator after injection failure"
+                    );
+                }
             }
             return Err(error);
         }
@@ -175,7 +182,13 @@ where
             .set_state_with_glyph(IndicatorState::Recording { mode }, glyph)
             .await?;
         if let Err(error) = self.recorder.start_recording().await {
-            let _ = self.indicator.set_state(IndicatorState::Idle).await;
+            if let Err(reset_error) = self.indicator.set_state(IndicatorState::Idle).await {
+                warn!(
+                    target: TARGET_RUNTIME,
+                    error = %reset_error,
+                    "failed to reset indicator after recording start failure"
+                );
+            }
             return Err(error);
         }
         self.state = next;
@@ -200,7 +213,13 @@ where
         let recorded = match self.recorder.stop_recording().await {
             Ok(recorded) => recorded,
             Err(error) => {
-                let _ = self.indicator.set_state(IndicatorState::Idle).await;
+                if let Err(reset_error) = self.indicator.set_state(IndicatorState::Idle).await {
+                    warn!(
+                        target: TARGET_RUNTIME,
+                        error = %reset_error,
+                        "failed to reset indicator after recording stop failure"
+                    );
+                }
                 return Err(error);
             }
         };

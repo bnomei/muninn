@@ -11,6 +11,8 @@ use tao::event_loop::EventLoopProxy;
 use tracing::warn;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
+use crate::logging;
+
 #[derive(Debug, Clone)]
 pub(crate) enum UserEvent {
     TrayEvent(TrayIconEvent),
@@ -27,8 +29,22 @@ pub(crate) enum UserEvent {
 
 pub(crate) fn install_tray_event_bridge(proxy: EventLoopProxy<UserEvent>) {
     TrayIconEvent::set_event_handler(Some(move |event| {
-        let _ = proxy.send_event(UserEvent::TrayEvent(event));
+        send_user_event(&proxy, UserEvent::TrayEvent(event), "tray_event_bridge");
     }));
+}
+
+pub(crate) fn send_user_event(
+    proxy: &EventLoopProxy<UserEvent>,
+    event: UserEvent,
+    context: &'static str,
+) -> bool {
+    match proxy.send_event(event) {
+        Ok(()) => true,
+        Err(error) => {
+            logging::log_proxy_send_failed(context, format!("{error:?}"));
+            false
+        }
+    }
 }
 
 pub(crate) fn build_tray_icon(icon: Icon) -> Result<tray_icon::TrayIcon> {
@@ -47,13 +63,15 @@ pub(crate) fn update_tray_appearance(
     indicator_config: &IndicatorConfig,
 ) {
     let visible_state = visible_indicator_state(state, indicator_config);
-    if let Err(error) = tray_icon.set_icon(Some(indicator_icon(
-        visible_state,
-        active_glyph,
-        preview_glyph,
-        indicator_config,
-    ))) {
-        warn!(%error, "failed to update tray icon");
+    match indicator_icon(visible_state, active_glyph, preview_glyph, indicator_config) {
+        Ok(icon) => {
+            if let Err(error) = tray_icon.set_icon(Some(icon)) {
+                warn!(%error, "failed to update tray icon");
+            }
+        }
+        Err(error) => {
+            warn!(%error, "failed to build tray icon");
+        }
     }
     if let Err(error) = tray_icon.set_tooltip(Some(indicator_tooltip(state))) {
         warn!(%error, "failed to update tray tooltip");
@@ -96,6 +114,51 @@ impl EventLoopIndicator {
     }
 }
 
+fn write_indicator_cache<T: Copy>(
+    mutex: &Mutex<T>,
+    value: T,
+    cache: &'static str,
+    context: &'static str,
+) {
+    match mutex.lock() {
+        Ok(mut guard) => {
+            *guard = value;
+        }
+        Err(poisoned) => {
+            warn!(
+                target: logging::TARGET_RUNTIME,
+                cache,
+                context,
+                "indicator cache mutex poisoned; recovering"
+            );
+            let mut guard = poisoned.into_inner();
+            *guard = value;
+            mutex.clear_poison();
+        }
+    }
+}
+
+fn read_indicator_cache<T: Copy>(
+    mutex: &Mutex<T>,
+    cache: &'static str,
+) -> muninn::MacosAdapterResult<T> {
+    match mutex.lock() {
+        Ok(guard) => Ok(*guard),
+        Err(poisoned) => {
+            warn!(
+                target: logging::TARGET_RUNTIME,
+                cache,
+                "indicator cache mutex poisoned; recovering"
+            );
+            let guard = poisoned.into_inner();
+            let value = *guard;
+            drop(guard);
+            mutex.clear_poison();
+            Ok(value)
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl IndicatorAdapter for EventLoopIndicator {
     async fn initialize(&mut self) -> muninn::MacosAdapterResult<()> {
@@ -112,15 +175,13 @@ impl IndicatorAdapter for EventLoopIndicator {
         glyph: Option<char>,
     ) -> muninn::MacosAdapterResult<()> {
         self.sequence.fetch_add(1, Ordering::SeqCst);
-        if let Ok(mut guard) = self.state.lock() {
-            *guard = state;
-        }
-        if let Ok(mut guard) = self.glyph.lock() {
-            *guard = glyph;
-        }
-        let _ = self
-            .proxy
-            .send_event(UserEvent::IndicatorUpdated { state, glyph });
+        write_indicator_cache(&self.state, state, "state", "indicator_set_state");
+        write_indicator_cache(&self.glyph, glyph, "glyph", "indicator_set_state");
+        send_user_event(
+            &self.proxy,
+            UserEvent::IndicatorUpdated { state, glyph },
+            "indicator_set_state",
+        );
         Ok(())
     }
 
@@ -143,15 +204,13 @@ impl IndicatorAdapter for EventLoopIndicator {
         fallback_glyph: Option<char>,
     ) -> muninn::MacosAdapterResult<()> {
         let generation = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        if let Ok(mut guard) = self.state.lock() {
-            *guard = state;
-        }
-        if let Ok(mut guard) = self.glyph.lock() {
-            *guard = glyph;
-        }
-        let _ = self
-            .proxy
-            .send_event(UserEvent::IndicatorUpdated { state, glyph });
+        write_indicator_cache(&self.state, state, "state", "indicator_set_temporary_state");
+        write_indicator_cache(&self.glyph, glyph, "glyph", "indicator_set_temporary_state");
+        send_user_event(
+            &self.proxy,
+            UserEvent::IndicatorUpdated { state, glyph },
+            "indicator_set_temporary_state",
+        );
 
         let proxy = self.proxy.clone();
         let state = Arc::clone(&self.state);
@@ -170,31 +229,37 @@ impl IndicatorAdapter for EventLoopIndicator {
             {
                 return;
             }
-            if let Ok(mut guard) = state.lock() {
-                *guard = fallback_state;
-            }
-            if let Ok(mut guard) = stored_glyph.lock() {
-                *guard = fallback_glyph;
-            }
-            let _ = proxy.send_event(UserEvent::IndicatorUpdated {
-                state: fallback_state,
-                glyph: fallback_glyph,
-            });
+            write_indicator_cache(
+                state.as_ref(),
+                fallback_state,
+                "state",
+                "indicator_reset_temporary_state",
+            );
+            write_indicator_cache(
+                stored_glyph.as_ref(),
+                fallback_glyph,
+                "glyph",
+                "indicator_reset_temporary_state",
+            );
+            send_user_event(
+                &proxy,
+                UserEvent::IndicatorUpdated {
+                    state: fallback_state,
+                    glyph: fallback_glyph,
+                },
+                "indicator_reset_temporary_state",
+            );
         });
 
         Ok(())
     }
 
     async fn state(&self) -> muninn::MacosAdapterResult<IndicatorState> {
-        self.state.lock().map(|guard| *guard).map_err(|_| {
-            muninn::MacosAdapterError::operation_failed("indicator", "state mutex poisoned")
-        })
+        read_indicator_cache(&self.state, "state")
     }
 
     async fn indicator_glyph(&self) -> muninn::MacosAdapterResult<Option<char>> {
-        self.glyph.lock().map(|guard| *guard).map_err(|_| {
-            muninn::MacosAdapterError::operation_failed("indicator", "glyph mutex poisoned")
-        })
+        read_indicator_cache(&self.glyph, "glyph")
     }
 }
 
@@ -203,49 +268,49 @@ pub(crate) fn indicator_icon(
     active_glyph: Option<char>,
     preview_glyph: Option<char>,
     indicator_config: &IndicatorConfig,
-) -> Icon {
+) -> Result<Icon> {
     let glyph = resolved_indicator_glyph(state, active_glyph, preview_glyph);
     let rgba = match state {
         IndicatorState::Idle => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.idle),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.idle)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             glyph,
         ),
         IndicatorState::Recording { .. } => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.recording),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.recording)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             glyph,
         ),
         IndicatorState::Transcribing => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.transcribing),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.transcribing)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             glyph,
         ),
         IndicatorState::Pipeline => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.pipeline),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.pipeline)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             glyph,
         ),
         IndicatorState::Output => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.output),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.output)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             glyph,
         ),
         IndicatorState::MissingCredentials => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.cancelled),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.cancelled)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             IndicatorGlyph::Question,
         ),
         IndicatorState::Cancelled => menu_bar_icon_rgba(
-            parse_hex_rgb(&indicator_config.colors.cancelled),
-            parse_hex_rgb(&indicator_config.colors.outline),
-            parse_hex_rgb(&indicator_config.colors.glyph),
+            parse_hex_rgb(&indicator_config.colors.cancelled)?,
+            parse_hex_rgb(&indicator_config.colors.outline)?,
+            parse_hex_rgb(&indicator_config.colors.glyph)?,
             glyph,
         ),
     };
@@ -254,7 +319,7 @@ pub(crate) fn indicator_icon(
         crate::INDICATOR_ICON_SIZE_PX,
         crate::INDICATOR_ICON_SIZE_PX,
     )
-    .expect("building indicator icon")
+    .context("building indicator icon")
 }
 
 pub(crate) fn resolved_indicator_glyph(
@@ -476,14 +541,52 @@ fn write_rgba(buffer: &mut [u8], idx: usize, color: [u8; 3]) {
     buffer[idx + 3] = 0xff;
 }
 
-fn parse_hex_rgb(value: &str) -> [u8; 3] {
-    let hex = value
-        .strip_prefix('#')
-        .expect("indicator colors must validate before runtime");
+fn parse_hex_rgb(value: &str) -> Result<[u8; 3]> {
+    let Some(hex) = value.strip_prefix('#') else {
+        anyhow::bail!("indicator color must start with '#': {value}");
+    };
+    if hex.len() != 6 {
+        anyhow::bail!("indicator color must be exactly 6 hex digits: {value}");
+    }
+
     let parse_component = |start| {
         u8::from_str_radix(&hex[start..start + 2], 16)
-            .expect("indicator colors must validate before runtime")
+            .with_context(|| format!("indicator color contains invalid hex digits: {value}"))
     };
 
-    [parse_component(0), parse_component(2), parse_component(4)]
+    Ok([
+        parse_component(0)?,
+        parse_component(2)?,
+        parse_component(4)?,
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn indicator_cache_recovers_after_mutex_poison() {
+        let state = Mutex::new(IndicatorState::Idle);
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = state.lock().expect("lock should succeed before poison");
+            panic!("poison state cache");
+        }));
+
+        write_indicator_cache(&state, IndicatorState::Pipeline, "state", "test");
+
+        assert_eq!(
+            read_indicator_cache(&state, "state").expect("recovered state should read"),
+            IndicatorState::Pipeline
+        );
+        assert!(state.lock().is_ok(), "recovered cache should clear poison");
+    }
+
+    #[test]
+    fn parse_hex_rgb_rejects_invalid_colors_without_panicking() {
+        assert!(parse_hex_rgb("112233").is_err());
+        assert!(parse_hex_rgb("#11223").is_err());
+        assert!(parse_hex_rgb("#11zz33").is_err());
+    }
 }

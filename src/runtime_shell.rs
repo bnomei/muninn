@@ -13,7 +13,7 @@ use tracing::{error, info, warn};
 use tray_icon::{MouseButton, TrayIconEvent};
 
 use crate::runtime_tray::{
-    build_tray_icon, indicator_icon, install_tray_event_bridge, map_tray_event,
+    build_tray_icon, indicator_icon, install_tray_event_bridge, map_tray_event, send_user_event,
     update_tray_appearance, UserEvent,
 };
 use crate::runtime_worker::{spawn_runtime_worker, RuntimeMessage};
@@ -76,6 +76,7 @@ impl AppRuntime {
             tokio::sync::mpsc::channel::<RuntimeMessage>(crate::RUNTIME_EVENT_BUFFER_CAPACITY);
         let mut runtime_event_rx = Some(runtime_event_rx);
         let mut pending_config_reload: Option<Box<AppConfig>> = None;
+        let mut pending_config_reload_retry_scheduled = false;
         let mut preview_context = capture_frontmost_target_context();
         let mut preview_selection = current_config.resolve_profile_selection(&preview_context);
         let tray_icon = Some(build_tray_icon(indicator_icon(
@@ -83,7 +84,7 @@ impl AppRuntime {
             None,
             preview_selection.voice_glyph,
             &indicator_config,
-        ))?);
+        )?)?);
         let mut last_indicator_state = IndicatorState::Idle;
         let mut last_active_glyph = None;
 
@@ -103,9 +104,14 @@ impl AppRuntime {
                         "runtime bootstrap complete"
                     );
 
-                    let runtime_events = runtime_event_rx
-                        .take()
-                        .expect("runtime event receiver should only be taken once");
+                    let Some(runtime_events) = runtime_event_rx.take() else {
+                        error!(
+                            target: logging::TARGET_RUNTIME,
+                            "runtime worker receiver unexpectedly missing during startup"
+                        );
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    };
                     spawn_runtime_worker(
                         runtime_config.clone(),
                         preflight,
@@ -142,7 +148,12 @@ impl AppRuntime {
                             ))
                             | Err(tokio::sync::mpsc::error::TrySendError::Closed(
                                 RuntimeMessage::ReloadConfig(_),
-                            )) => unreachable!("tray forwarding only sends app events"),
+                            )) => {
+                                warn!(
+                                    target: logging::TARGET_RUNTIME,
+                                    "unexpected runtime queue payload while forwarding tray interaction"
+                                );
+                            }
                         }
                     }
 
@@ -207,7 +218,10 @@ impl AppRuntime {
                             RuntimeMessage::ReloadConfig(config),
                         )) => {
                             pending_config_reload = Some(config);
-                            schedule_pending_config_reload_retry(&proxy);
+                            if !pending_config_reload_retry_scheduled {
+                                pending_config_reload_retry_scheduled = true;
+                                schedule_pending_config_reload_retry(&proxy);
+                            }
                             info!(
                                 target: logging::TARGET_CONFIG,
                                 "queued latest config reload for next available runtime slot"
@@ -221,7 +235,12 @@ impl AppRuntime {
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Full(
                             RuntimeMessage::AppEvent(_),
-                        )) => unreachable!("config reload forwarding only sends reload messages"),
+                        )) => {
+                            warn!(
+                                target: logging::TARGET_CONFIG,
+                                "unexpected runtime queue payload while forwarding config reload"
+                            );
+                        }
                     }
                 }
                 Event::UserEvent(UserEvent::ConfigReloadFailed(message)) => {
@@ -232,7 +251,9 @@ impl AppRuntime {
                     );
                 }
                 Event::UserEvent(UserEvent::RetryPendingConfigReload) => {
+                    pending_config_reload_retry_scheduled = false;
                     if pending_config_reload.is_some() {
+                        pending_config_reload_retry_scheduled = true;
                         schedule_pending_config_reload_retry(&proxy);
                     }
                 }
@@ -262,6 +283,10 @@ fn schedule_pending_config_reload_retry(proxy: &EventLoopProxy<UserEvent>) {
     let proxy = proxy.clone();
     std::thread::spawn(move || {
         std::thread::sleep(CONFIG_RELOAD_RETRY_DELAY);
-        let _ = proxy.send_event(UserEvent::RetryPendingConfigReload);
+        send_user_event(
+            &proxy,
+            UserEvent::RetryPendingConfigReload,
+            "pending_config_reload_retry",
+        );
     });
 }

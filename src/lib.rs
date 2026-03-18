@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use tracing::warn;
 
 pub mod audio;
 pub mod config;
@@ -22,6 +23,61 @@ pub mod secrets;
 pub mod state;
 pub mod target_context;
 pub mod transcription;
+
+pub const TARGET_RUNTIME: &str = "runtime";
+pub const TARGET_PIPELINE: &str = "pipeline";
+pub const TARGET_PROVIDER: &str = "provider";
+pub const TARGET_CONFIG: &str = "config";
+pub const TARGET_HOTKEY: &str = "hotkey";
+pub const TARGET_RECORDING: &str = "recording";
+pub const TARGET_DEFAULT: &str = "default";
+
+#[doc(hidden)]
+pub fn load_builtin_step_config<T, FDefaults, FResolved>(
+    step_label: &'static str,
+    on_not_found: FDefaults,
+    resolve: FResolved,
+) -> Result<T, String>
+where
+    FDefaults: FnOnce() -> T,
+    FResolved: FnOnce(&ResolvedBuiltinStepConfig) -> T,
+{
+    resolve_builtin_step_config_from_load_result(
+        step_label,
+        AppConfig::load(),
+        on_not_found,
+        resolve,
+    )
+}
+
+#[doc(hidden)]
+pub fn resolve_builtin_step_config_from_load_result<T, FDefaults, FResolved>(
+    step_label: &'static str,
+    load_result: Result<AppConfig, ConfigError>,
+    on_not_found: FDefaults,
+    resolve: FResolved,
+) -> Result<T, String>
+where
+    FDefaults: FnOnce() -> T,
+    FResolved: FnOnce(&ResolvedBuiltinStepConfig) -> T,
+{
+    load_result
+        .map(|config| resolve(&ResolvedBuiltinStepConfig::from_app_config(&config)))
+        .or_else(|error| match &error {
+            ConfigError::NotFound { .. } => {
+                warn!(
+                    target: TARGET_CONFIG,
+                    step = step_label,
+                    error = %error,
+                    "built-in step config missing; using default provider settings"
+                );
+                Ok(on_not_found())
+            }
+            _ => Err(format!(
+                "failed to load AppConfig for {step_label}: {error}"
+            )),
+        })
+}
 
 pub use audio::MacosAudioRecorder;
 pub use config::{
