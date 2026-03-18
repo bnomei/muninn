@@ -1,5 +1,5 @@
 [package]
-name = "muninn-speach-to-text"
+name = "muninn-speech-to-text"
 version = "0.2.0"
 authors = ["Bruno Meilick <b@bnomei.com>", "Muninn Contributors"]
 edition = "2021"
@@ -9,7 +9,7 @@ description = "AI-native macOS menu bar dictation for developers."
 readme = "README.md"
 repository = "https://github.com/bnomei/muninn"
 homepage = "https://github.com/bnomei/muninn"
-documentation = "https://docs.rs/muninn-speach-to-text"
+documentation = "https://docs.rs/muninn-speech-to-text"
 keywords = ["dictation", "speech-to-text", "macos", "voice", "automation"]
 default-run = "muninn"
 autobins = false

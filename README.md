@@ -1,10 +1,10 @@
 # muninn
 
-[![Crates.io Version](https://img.shields.io/crates/v/muninn-speach-to-text)](https://crates.io/crates/muninn-speach-to-text)
+[![Crates.io Version](https://img.shields.io/crates/v/muninn-speech-to-text)](https://crates.io/crates/muninn-speech-to-text)
 [![CI](https://img.shields.io/github/actions/workflow/status/bnomei/muninn/ci.yml?branch=main)](https://github.com/bnomei/muninn/actions/workflows/ci.yml)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json&style=flat)](https://codspeed.io/bnomei/muninn?utm_source=badge)
-[![Crates.io Downloads](https://img.shields.io/crates/d/muninn-speach-to-text)](https://crates.io/crates/muninn-speach-to-text)
-[![License](https://img.shields.io/crates/l/muninn-speach-to-text)](https://crates.io/crates/muninn-speach-to-text)
+[![Crates.io Downloads](https://img.shields.io/crates/d/muninn-speech-to-text)](https://crates.io/crates/muninn-speech-to-text)
+[![License](https://img.shields.io/crates/l/muninn-speech-to-text)](https://crates.io/crates/muninn-speech-to-text)
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
@@ -103,7 +103,7 @@ Muninn reads provider credentials from your environment or config and uses them 
 
 Setup:
 - Apple Speech: no API key is required; this local leg requires macOS 26+ and Apple-managed Speech assets for the selected locale
-- Whisper.cpp: no API key is required; place a model under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file
+- Whisper.cpp: no API key is required; Muninn auto-downloads the selected or default model on first use when it knows the canonical upstream file name, or you can still point `providers.whisper_cpp.model` at a local `.bin` file
 - Deepgram: set `DEEPGRAM_API_KEY`; Muninn uses the prerecorded `/v1/listen` API with `model = "nova-3"`, `language = "en"`, and smart formatting enabled by default
 - OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg and for the default refine pass
 - Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the Google route leg
@@ -115,7 +115,9 @@ Whisper model lifecycle:
 - documented first-use default: `tiny.en`, resolved as `ggml-tiny.en.bin`
 - default model directory: `~/.local/share/muninn/models`
 - override surface: `[providers.whisper_cpp].model`, `[providers.whisper_cpp].model_dir`, and `[providers.whisper_cpp].device`
-- install behavior today: Muninn does not auto-download models; it records an actionable missing-model diagnostic and continues the ordered route
+- install behavior today: Muninn auto-downloads the selected/default canonical Whisper model into `providers.whisper_cpp.model_dir` on first use; explicit custom paths still need you to place the file there yourself
+- first-use tradeoff: the first utterance that needs a missing model will block on the download before transcription starts
+- explicit-path failure mode: if you point `providers.whisper_cpp.model` at a custom absolute/tilde path and the file is missing, Muninn records an actionable missing-model diagnostic and continues the ordered route
 - performance tradeoff: `tiny.en` is the fastest and smallest launchable default, while larger models such as `base.en` trade more disk and latency for better accuracy
 - acceleration: `device = "auto"` prefers Metal on Apple Silicon builds when available and uses CPU elsewhere; `device = "gpu"` is explicit and fails diagnostically on unsupported builds
 
@@ -262,9 +264,9 @@ In other words: resolve providers, transcribe with the first usable leg, run Mun
 It also defaults recording output to `mono = true` and `sample_rate_khz = 16`.
 Replay audio retention defaults to `replay_retain_audio = true`; set it to `false` if you only want replay metadata.
 
-### 3) Install a local Whisper model
+### 3) Optional: preinstall a local Whisper model
 
-If you want the default local-first offline route to stay local before falling back to cloud providers, install the default model once:
+Muninn auto-downloads the selected/default canonical Whisper model on first use. If you want to avoid first-use latency, pre-warm the cache once:
 
 ```bash
 mkdir -p "$HOME/.local/share/muninn/models"
@@ -278,6 +280,8 @@ This matches the launchable default config:
 - `providers.whisper_cpp.model_dir = "~/.local/share/muninn/models"`
 - `providers.whisper_cpp.device = "auto"`
 
+If you use an explicit custom path such as `providers.whisper_cpp.model = "~/models/custom.bin"` and that file is missing, Muninn will log `missing_whisper_cpp_model`, skip refine because `transcript.raw_text` is still empty, and a local-only Whisper route will inject nothing.
+
 Boundary and tradeoffs:
 - Whisper.cpp is post-recording only in Muninn; there is no streaming or partial-result path in this backend
 - `tiny.en` is English-only and optimized for footprint and latency
@@ -290,7 +294,7 @@ Muninn now tries to load `./.env` from the current working directory by default.
 | Concern | Variables | Notes |
 | --- | --- | --- |
 | Apple Speech transcription | none | Configure `[providers.apple_speech]` (`locale` and `install_assets`) in config; this provider is completed-recording only, requires macOS 26+, and uses Apple-managed assets |
-| Whisper.cpp transcription | none | Put a model file under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file. The backend runs on completed recordings only. |
+| Whisper.cpp transcription | none | Muninn auto-downloads the selected/default canonical model into `providers.whisper_cpp.model_dir` on first use. If you point `providers.whisper_cpp.model` at a custom local path and that file is missing, Muninn logs `missing_whisper_cpp_model` and a local-only Whisper route produces no injected text. |
 | Deepgram transcription | `DEEPGRAM_API_KEY`, optional `DEEPGRAM_STT_ENDPOINT`, optional `DEEPGRAM_STT_MODEL`, optional `DEEPGRAM_STT_LANGUAGE`, optional `MUNINN_DEEPGRAM_STUB_TEXT` | Deepgram is the preferred cloud route leg for prerecorded uploads; Muninn sends the completed recording with `smart_format=true`, and stub text is only an optional bypass. |
 | OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
 | Google transcription | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google STT runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
@@ -398,7 +402,7 @@ Use the fixtures in `tests/fixtures/` when you want example input.
 
 ### Ordered transcription provider routing
 
-Spec 29 introduces `[transcription].providers` as the ordered STT route that the runtime resolves before it hands a concrete pipeline to the runner. The shipped default list is local-first: `apple_speech`, `whisper_cpp`, `deepgram`, `openai`, then `google`. During execution Muninn records which provider was attempted, why it succeeded or failed, and whether the normalized route metadata allows the next provider to run.
+v0.2.0 introduces `[transcription].providers` as the ordered STT route that the runtime resolves before it hands a concrete pipeline to the runner. The shipped default list is local-first: `apple_speech`, `whisper_cpp`, `deepgram`, `openai`, then `google`. During execution Muninn records which provider was attempted, why it succeeded or failed, and whether the normalized route metadata allows the next provider to run.
 
 Profiles can override only the provider order for their context, without re-encoding raw pipeline steps. For example, a mail profile that prefers the cloud leg can narrow the chain:
 
@@ -420,7 +424,6 @@ This profile now skips the local-first defaults while other profiles continue in
 ## Current Limits
 
 - Muninn currently supports macOS only.
-- Whisper.cpp model files are not auto-downloaded yet; place them in the configured model directory yourself.
 - Deepgram is currently a prerecorded-upload backend only; streaming and provider-specific vocabulary prompting remain out of scope here.
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.

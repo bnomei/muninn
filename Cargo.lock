@@ -1842,7 +1842,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "muninn-speach-to-text"
+name = "muninn-speech-to-text"
 version = "0.2.0"
 dependencies = [
  "anyhow",
