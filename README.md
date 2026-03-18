@@ -138,6 +138,21 @@ system_prompt = "Prefer minimal corrections. Focus on technical terms, developer
 
 It does not change the speaker's voice or the STT provider. It steers the second-pass text transformation. The shipped default hint is intentionally light-touch: preserve wording, fix technical tokens, and avoid stylistic rewrites. If `refine` is unsure, or if a change is too aggressive, Muninn keeps the original transcript instead of forcing a rewrite. If you want a stronger opinionated output, you can change that prompt, add extra pipeline filters, or attach a custom envelope-aware step.
 
+If you want bounded vocabulary biasing without introducing a dedicated provider subsystem, append a small JSON block through the same hint surface:
+
+```toml
+[transcript]
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn","whisper.cpp","Deepgram","Cargo.toml"],"commands":["cargo test -q","rg --files"],"paths":["src/config.rs",".env"]}
+"""
+```
+
+`system_prompt_append` is generic prompt composition. Muninn does not parse the JSON or translate it into provider-native adaptation APIs. It simply forwards the extra block into the built-in `refine` pass. That means:
+- users who do nothing keep the current STT and refine behavior
+- prompt-based vocabulary biasing is best-effort only
+- provider-native vocabulary and adaptation features remain out of scope
+
 Replay artifacts redact provider secrets before they are written.
 When replay logging retains audio, Muninn prefers a filesystem hard link and falls back to a copy.
 
@@ -147,6 +162,8 @@ Muninn can now resolve different refine styles from the current app context. It 
 
 Use `voices` to define refine-oriented behavior plus an optional one-letter tray glyph. Use `profiles` to choose a voice and optionally add per-context recording, pipeline, transcript, or refine overrides on top. Voice here means text-shaping behavior, not audio voice.
 
+Use `system_prompt` when you want a full replacement. Use `system_prompt_append` when you want to layer another bounded hint block, such as context-specific vocabulary JSON, without copying the whole base prompt.
+
 ```toml
 [app]
 profile = "default"
@@ -154,6 +171,10 @@ profile = "default"
 [voices.codex]
 indicator_glyph = "C"
 system_prompt = "Prefer terse developer dictation. Keep commands, flags, file names, and code tokens intact."
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Codex","Muninn","Cargo.toml"],"commands":["cargo test -q","cargo clippy -q --all-targets -- -D warnings"]}
+"""
 
 [voices.terminal]
 indicator_glyph = "T"
@@ -171,6 +192,11 @@ voice = "terminal"
 
 [profiles.mail]
 voice = "mail"
+[profiles.mail.transcript]
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Siobhan","Niamh","Muninn"],"products":["Deepgram"]}
+"""
 
 [[profile_rules]]
 id = "codex-app"

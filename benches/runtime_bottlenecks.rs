@@ -364,6 +364,7 @@ fn profiled_config(rule_count: usize) -> (AppConfig, TargetContextSnapshot) {
                 voice: Some(voice_id),
                 transcript: Some(TranscriptOverrides {
                     system_prompt: Some(format!("profile prompt {index}")),
+                    system_prompt_append: None,
                 }),
                 ..ProfileConfig::default()
             },

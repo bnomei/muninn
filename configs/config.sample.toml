@@ -88,6 +88,12 @@ acronym_min_margin = 0.15
 # Give refine a light voice/style hint.
 # Keep it conservative, or tune it to your own editorial style.
 system_prompt = "Prefer minimal corrections. Focus on technical terms, developer tools, package names, commands, flags, file names, paths, env vars, acronyms, and obvious dictation errors. If uncertain, keep the original wording."
+# Optional generic append surface for bounded hint blocks such as vocabulary JSON.
+# Muninn forwards this to the built-in refine prompt as plain text.
+# system_prompt_append = """
+# Vocabulary JSON:
+# {"terms":["Muninn","whisper.cpp","Deepgram","Cargo.toml"],"commands":["cargo test -q","rg --files"],"paths":["src/config.rs",".env"]}
+# """
 
 [refine]
 provider = "openai"
@@ -108,6 +114,10 @@ max_new_word_count = 2
 # [voices.codex]
 # indicator_glyph = "C"
 # system_prompt = "Prefer terse developer dictation. Keep code tokens, commands, file names, flags, and package names intact."
+# system_prompt_append = """
+# Vocabulary JSON:
+# {"terms":["Codex","Cargo.toml","Muninn"],"commands":["cargo test -q","cargo clippy -q --all-targets -- -D warnings"]}
+# """
 #
 # [voices.terminal]
 # indicator_glyph = "T"
@@ -125,6 +135,11 @@ max_new_word_count = 2
 #
 # [profiles.mail]
 # voice = "mail"
+# [profiles.mail.transcript]
+# system_prompt_append = """
+# Vocabulary JSON:
+# {"terms":["Siobhan","Niamh","Muninn"],"products":["Deepgram"]}
+# """
 
 # Example cloud-focused override for one profile.
 # [profiles.mail.transcription]
