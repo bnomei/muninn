@@ -113,7 +113,7 @@ fn run() -> Result<(), CliError> {
                 "runtime_init_failed",
                 format!("failed to initialize async runtime: {source}"),
             )
-    })?;
+        })?;
 
     runtime.block_on(async {
         let envelope = read_envelope_from_reader(io::stdin().lock())?;
