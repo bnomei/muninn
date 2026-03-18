@@ -1093,7 +1093,8 @@ pub struct ProvidersConfig {
 impl ProvidersConfig {
     fn validate(&self) -> Result<(), ConfigValidationError> {
         self.apple_speech.validate()?;
-        self.whisper_cpp.validate()
+        self.whisper_cpp.validate()?;
+        self.deepgram.validate()
     }
 }
 
@@ -1186,6 +1187,21 @@ impl Default for DeepgramProviderConfig {
             model: "nova-3".to_string(),
             language: "en".to_string(),
         }
+    }
+}
+
+impl DeepgramProviderConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self.endpoint.trim().is_empty() {
+            return Err(ConfigValidationError::DeepgramEndpointMustNotBeEmpty);
+        }
+        if self.model.trim().is_empty() {
+            return Err(ConfigValidationError::DeepgramModelMustNotBeEmpty);
+        }
+        if self.language.trim().is_empty() {
+            return Err(ConfigValidationError::DeepgramLanguageMustNotBeEmpty);
+        }
+        Ok(())
     }
 }
 
@@ -1288,6 +1304,12 @@ pub enum ConfigValidationError {
     WhisperCppModelMustNotBeEmpty,
     #[error("providers.whisper_cpp.model_dir must not be empty")]
     WhisperCppModelDirMustNotBeEmpty,
+    #[error("providers.deepgram.endpoint must not be empty")]
+    DeepgramEndpointMustNotBeEmpty,
+    #[error("providers.deepgram.model must not be empty")]
+    DeepgramModelMustNotBeEmpty,
+    #[error("providers.deepgram.language must not be empty")]
+    DeepgramLanguageMustNotBeEmpty,
     #[error("pipeline.deadline_ms must be greater than 0")]
     PipelineDeadlineMsMustBePositive,
     #[error("pipeline must include at least one step")]
@@ -1966,6 +1988,34 @@ on_error = "abort"
         assert_eq!(
             error.to_validation_error(),
             Some(ConfigValidationError::WhisperCppModelDirMustNotBeEmpty)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_deepgram_provider_values() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[providers.deepgram]
+endpoint = ""
+model = "nova-3"
+language = "en"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect_err("empty Deepgram endpoint must fail");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::DeepgramEndpointMustNotBeEmpty)
         );
     }
 

@@ -113,12 +113,12 @@ fn run() -> Result<(), CliError> {
                 "runtime_init_failed",
                 format!("failed to initialize async runtime: {source}"),
             )
-        })?;
+    })?;
 
     runtime.block_on(async {
         let envelope = read_envelope_from_reader(io::stdin().lock())?;
 
-        let config = load_deepgram_config_from_config();
+        let config = load_deepgram_config_from_config()?;
         let env_lookup = |key: &str| std::env::var(key).ok();
         let output = process_input(envelope, &env_lookup, &config).await?;
 
@@ -373,19 +373,26 @@ fn extract_deepgram_transcript_text(body: &[u8]) -> Result<String, CliError> {
         )
     })?;
 
-    let transcript = value
+    let channels = value
         .get("results")
         .and_then(|results| results.get("channels"))
         .and_then(Value::as_array)
         .into_iter()
-        .flatten()
-        .filter_map(|channel| channel.get("alternatives").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|alternative| alternative.get("transcript").and_then(Value::as_str))
-        .next()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
+        .flatten();
+
+    let transcript = channels
+        .map(|channel| {
+            channel
+                .get("alternatives")
+                .and_then(Value::as_array)
+                .and_then(|alternatives| alternatives.first())
+                .and_then(|alternative| alternative.get("transcript"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
 
     if !transcript.is_empty() || value.get("results").is_some() {
         return Ok(transcript);
@@ -506,7 +513,7 @@ fn mime_for_audio_path(path: &Path) -> &'static str {
     }
 }
 
-fn load_deepgram_config_from_config() -> DeepgramResolvedConfig {
+fn load_deepgram_config_from_config() -> Result<DeepgramResolvedConfig, CliError> {
     let defaults = muninn::AppConfig::default().providers.deepgram;
 
     muninn::AppConfig::load()
@@ -515,17 +522,24 @@ fn load_deepgram_config_from_config() -> DeepgramResolvedConfig {
                 &config,
             ))
         })
-        .inspect_err(|error| {
-            log_provider_warning(
-                "config_load_failed",
+        .or_else(|error| match &error {
+            muninn::ConfigError::NotFound { .. } => {
+                log_provider_warning(
+                    "config_load_failed",
+                    format!("failed to load AppConfig for Deepgram provider: {error}"),
+                );
+
+                Ok(DeepgramResolvedConfig {
+                    api_key: resolve_secret(None, defaults.api_key),
+                    endpoint: defaults.endpoint,
+                    model: defaults.model,
+                    language: defaults.language,
+                })
+            }
+            _ => Err(CliError::new(
+                "missing_provider_config",
                 format!("failed to load AppConfig for Deepgram provider: {error}"),
-            );
-        })
-        .unwrap_or_else(|_| DeepgramResolvedConfig {
-            api_key: resolve_secret(None, defaults.api_key),
-            endpoint: defaults.endpoint,
-            model: defaults.model,
-            language: defaults.language,
+            )),
         })
 }
 
