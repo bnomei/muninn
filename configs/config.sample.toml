@@ -187,6 +187,7 @@ model = "gpt-4o-mini-transcribe"
 
 [providers.whisper_cpp]
 # model defaults to "tiny.en", which resolves to ggml-tiny.en.bin under model_dir
+# Muninn auto-downloads the selected/default canonical model into model_dir on first use.
 # model = "base.en"
 model_dir = "~/.local/share/muninn/models"
 device = "auto"

@@ -1,6 +1,8 @@
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use muninn::config::WhisperCppDevicePreference;
 use muninn::MuninnEnvelopeV1;
@@ -19,6 +21,8 @@ const DEFAULT_MODEL_FILENAME: &str = "ggml-tiny.en.bin";
 const DEFAULT_LANGUAGE: &str = "en";
 const MODEL_DOWNLOAD_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 const TARGET_SAMPLE_RATE_HZ: u32 = 16_000;
+const MODEL_DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const MODEL_DOWNLOAD_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
@@ -93,6 +97,12 @@ struct PreparedTranscriptionRequest {
 }
 
 #[derive(Debug, Clone)]
+struct PendingModelDownloadRequest {
+    request: PreparedTranscriptionRequest,
+    model: WhisperModelSpec,
+}
+
+#[derive(Debug, Clone)]
 struct WhisperInferenceRequest {
     wav_path: PathBuf,
     model_label: String,
@@ -103,6 +113,7 @@ struct WhisperInferenceRequest {
 #[derive(Debug)]
 enum PreparedEnvelope {
     Ready(MuninnEnvelopeV1),
+    NeedsModelDownload(PendingModelDownloadRequest),
     NeedsTranscription(PreparedTranscriptionRequest),
 }
 
@@ -126,6 +137,22 @@ struct WhisperModelSpec {
     label: String,
     path: PathBuf,
     download_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelAvailability {
+    Downloaded,
+    ReusedExistingDownload,
+}
+
+struct ModelDownloadLock {
+    path: PathBuf,
+}
+
+impl Drop for ModelDownloadLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 pub fn run_as_internal_tool() -> ExitCode {
@@ -165,46 +192,75 @@ async fn process_input(
 ) -> Result<MuninnEnvelopeV1, CliError> {
     match prepare_envelope(input, config)? {
         PreparedEnvelope::Ready(envelope) => Ok(envelope),
-        PreparedEnvelope::NeedsTranscription(request) => {
-            let PreparedTranscriptionRequest {
-                envelope,
-                inference,
-            } = request;
-            let started = std::time::Instant::now();
-            log_provider_info(
-                "stt_started",
-                "starting Whisper.cpp transcription worker task",
-            );
-            let join_result =
-                tokio::task::spawn_blocking(move || transcribe_with_whisper_cpp(&inference)).await;
-
-            match join_result {
-                Ok(Ok(transcript)) => {
-                    let code = if transcript.trim().is_empty() {
-                        "stt_empty_transcript"
-                    } else {
-                        "stt_finished"
+        PreparedEnvelope::NeedsModelDownload(download) => {
+            match ensure_model_available(&download.model).await {
+                Ok(availability) => {
+                    let detail = match availability {
+                        ModelAvailability::Downloaded => format!(
+                            "downloaded Whisper.cpp model `{}` to {}",
+                            download.model.label,
+                            download.model.path.display()
+                        ),
+                        ModelAvailability::ReusedExistingDownload => format!(
+                            "reused Whisper.cpp model `{}` after waiting for an in-flight download",
+                            download.model.label
+                        ),
                     };
-                    info!(
-                        target: muninn::TARGET_PROVIDER,
-                        provider = "whisper_cpp",
-                        code,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        transcript_len = transcript.trim().len(),
-                        "Whisper.cpp transcription attempt completed"
-                    );
-                    Ok(apply_whisper_transcript(envelope, transcript))
+                    log_provider_info("model_download_finished", detail);
+                    run_transcription_request(download.request).await
                 }
-                Ok(Err(error)) => Ok(apply_whisper_transcription_failure(envelope, &error)),
-                Err(error) => Ok(apply_whisper_transcription_failure(
-                    envelope,
-                    &CliError::new(
-                        "whisper_cpp_task_failed",
-                        format!("whisper.cpp worker task failed: {error}"),
-                    ),
+                Err(error) => Ok(apply_whisper_asset_failure(
+                    download.request.envelope,
+                    &error,
+                    Some(&download.model.path),
+                    download.model.download_url.as_deref(),
                 )),
             }
         }
+        PreparedEnvelope::NeedsTranscription(request) => run_transcription_request(request).await,
+    }
+}
+
+async fn run_transcription_request(
+    request: PreparedTranscriptionRequest,
+) -> Result<MuninnEnvelopeV1, CliError> {
+    let PreparedTranscriptionRequest {
+        envelope,
+        inference,
+    } = request;
+    let started = std::time::Instant::now();
+    log_provider_info(
+        "stt_started",
+        "starting Whisper.cpp transcription worker task",
+    );
+    let join_result =
+        tokio::task::spawn_blocking(move || transcribe_with_whisper_cpp(&inference)).await;
+
+    match join_result {
+        Ok(Ok(transcript)) => {
+            let code = if transcript.trim().is_empty() {
+                "stt_empty_transcript"
+            } else {
+                "stt_finished"
+            };
+            info!(
+                target: muninn::TARGET_PROVIDER,
+                provider = "whisper_cpp",
+                code,
+                elapsed_ms = started.elapsed().as_millis(),
+                transcript_len = transcript.trim().len(),
+                "Whisper.cpp transcription attempt completed"
+            );
+            Ok(apply_whisper_transcript(envelope, transcript))
+        }
+        Ok(Err(error)) => Ok(apply_whisper_transcription_failure(envelope, &error)),
+        Err(error) => Ok(apply_whisper_transcription_failure(
+            envelope,
+            &CliError::new(
+                "whisper_cpp_task_failed",
+                format!("whisper.cpp worker task failed: {error}"),
+            ),
+        )),
     }
 }
 
@@ -214,6 +270,77 @@ pub(crate) async fn process_input_in_process(
 ) -> Result<MuninnEnvelopeV1, CliError> {
     let resolved = resolved_config_from_builtin_steps(config);
     process_input(input.clone(), &resolved).await
+}
+
+async fn ensure_model_available(model: &WhisperModelSpec) -> Result<ModelAvailability, CliError> {
+    if model.path.exists() {
+        return Ok(ModelAvailability::ReusedExistingDownload);
+    }
+
+    let download_url = model
+        .download_url
+        .as_deref()
+        .ok_or_else(|| CliError::new("missing_whisper_cpp_model", missing_model_detail(model)))?;
+
+    let parent = model.path.parent().ok_or_else(|| {
+        CliError::new(
+            "whisper_cpp_model_parent_missing",
+            format!(
+                "cannot auto-download whisper.cpp model `{}` because {} has no parent directory",
+                model.label,
+                model.path.display()
+            ),
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|source| {
+        CliError::new(
+            "whisper_cpp_model_dir_create_failed",
+            format!(
+                "failed to create whisper.cpp model directory {}: {source}",
+                parent.display()
+            ),
+        )
+    })?;
+
+    let lock_path = model_download_lock_path(&model.path)?;
+    let deadline = tokio::time::Instant::now() + MODEL_DOWNLOAD_WAIT_TIMEOUT;
+
+    loop {
+        if model.path.exists() {
+            return Ok(ModelAvailability::ReusedExistingDownload);
+        }
+
+        match try_acquire_model_download_lock(&lock_path)? {
+            Some(_lock) => {
+                if model.path.exists() {
+                    return Ok(ModelAvailability::ReusedExistingDownload);
+                }
+
+                log_provider_info(
+                    "model_download_started",
+                    format!(
+                        "auto-downloading Whisper.cpp model `{}` from {}",
+                        model.label, download_url
+                    ),
+                );
+                download_model_to_path(model, download_url).await?;
+                return Ok(ModelAvailability::Downloaded);
+            }
+            None => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(CliError::new(
+                        "whisper_cpp_model_download_timeout",
+                        format!(
+                            "timed out waiting for whisper.cpp model `{}` to become available at {}",
+                            model.label,
+                            model.path.display()
+                        ),
+                    ));
+                }
+                tokio::time::sleep(MODEL_DOWNLOAD_WAIT_INTERVAL).await;
+            }
+        }
+    }
 }
 
 fn prepare_envelope(
@@ -269,47 +396,37 @@ fn prepare_envelope(
     let model = match resolve_model_spec(config) {
         Ok(model) => model,
         Err(error) => {
-            append_transcription_attempt(
-                &mut envelope,
-                TranscriptionAttempt::new(
-                    TranscriptionProvider::WhisperCpp,
-                    TranscriptionAttemptOutcome::UnavailableAssets,
-                    error.code,
-                    error.message(),
-                ),
-            );
-            log_provider_warning(error.code, error.message());
-            envelope.errors.push(json!({
-                "provider": "whisper_cpp",
-                "code": error.code,
-                "message": error.message(),
-                "transcription_outcome": "unavailable_assets",
-            }));
-            return Ok(PreparedEnvelope::Ready(envelope));
+            return Ok(PreparedEnvelope::Ready(apply_whisper_asset_failure(
+                envelope, &error, None, None,
+            )));
         }
     };
 
     if !model.path.exists() {
-        let detail = missing_model_detail(&model);
-        append_transcription_attempt(
-            &mut envelope,
-            TranscriptionAttempt::new(
-                TranscriptionProvider::WhisperCpp,
-                TranscriptionAttemptOutcome::UnavailableAssets,
-                "missing_whisper_cpp_model",
-                &detail,
-            ),
-        );
-        log_provider_warning("missing_whisper_cpp_model", &detail);
-        envelope.errors.push(json!({
-            "provider": "whisper_cpp",
-            "code": "missing_whisper_cpp_model",
-            "message": detail,
-            "model_path": model.path.display().to_string(),
-            "download_url": model.download_url,
-            "transcription_outcome": "unavailable_assets",
-        }));
-        return Ok(PreparedEnvelope::Ready(envelope));
+        if model.download_url.is_some() {
+            return Ok(PreparedEnvelope::NeedsModelDownload(
+                PendingModelDownloadRequest {
+                    request: PreparedTranscriptionRequest {
+                        envelope,
+                        inference: WhisperInferenceRequest {
+                            wav_path,
+                            model_label: model.label.clone(),
+                            model_path: model.path.clone(),
+                            device,
+                        },
+                    },
+                    model,
+                },
+            ));
+        }
+
+        let error = CliError::new("missing_whisper_cpp_model", missing_model_detail(&model));
+        return Ok(PreparedEnvelope::Ready(apply_whisper_asset_failure(
+            envelope,
+            &error,
+            Some(&model.path),
+            None,
+        )));
     }
 
     Ok(PreparedEnvelope::NeedsTranscription(
@@ -463,6 +580,207 @@ fn missing_model_detail(model: &WhisperModelSpec) -> String {
             model.path.display(),
         ),
     }
+}
+
+fn apply_whisper_asset_failure(
+    mut envelope: MuninnEnvelopeV1,
+    error: &CliError,
+    model_path: Option<&Path>,
+    download_url: Option<&str>,
+) -> MuninnEnvelopeV1 {
+    append_transcription_attempt(
+        &mut envelope,
+        TranscriptionAttempt::new(
+            TranscriptionProvider::WhisperCpp,
+            TranscriptionAttemptOutcome::UnavailableAssets,
+            error.code,
+            error.message(),
+        ),
+    );
+    log_provider_warning(error.code, error.message());
+
+    let mut payload = json!({
+        "provider": "whisper_cpp",
+        "code": error.code,
+        "message": error.message(),
+        "transcription_outcome": "unavailable_assets",
+    });
+
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(model_path) = model_path {
+            object.insert(
+                "model_path".to_string(),
+                json!(model_path.display().to_string()),
+            );
+        }
+        if let Some(download_url) = download_url {
+            object.insert("download_url".to_string(), json!(download_url));
+        }
+    }
+
+    envelope.errors.push(payload);
+    envelope
+}
+
+fn model_download_lock_path(model_path: &Path) -> Result<PathBuf, CliError> {
+    let file_name = model_path.file_name().ok_or_else(|| {
+        CliError::new(
+            "whisper_cpp_model_download_failed",
+            format!(
+                "cannot derive lock path for whisper.cpp model {}",
+                model_path.display()
+            ),
+        )
+    })?;
+    Ok(model_path.with_file_name(format!(".{}.download.lock", file_name.to_string_lossy())))
+}
+
+fn try_acquire_model_download_lock(
+    lock_path: &Path,
+) -> Result<Option<ModelDownloadLock>, CliError> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(lock_path)
+    {
+        Ok(mut lock_file) => {
+            let _ = writeln!(lock_file, "pid={}", std::process::id());
+            Ok(Some(ModelDownloadLock {
+                path: lock_path.to_path_buf(),
+            }))
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(source) => Err(CliError::new(
+            "whisper_cpp_model_download_lock_failed",
+            format!(
+                "failed to acquire whisper.cpp model download lock {}: {source}",
+                lock_path.display()
+            ),
+        )),
+    }
+}
+
+async fn download_model_to_path(
+    model: &WhisperModelSpec,
+    download_url: &str,
+) -> Result<(), CliError> {
+    let parent = model.path.parent().ok_or_else(|| {
+        CliError::new(
+            "whisper_cpp_model_parent_missing",
+            format!(
+                "cannot write whisper.cpp model `{}` because {} has no parent directory",
+                model.label,
+                model.path.display()
+            ),
+        )
+    })?;
+    let temp_path = parent.join(format!(
+        ".{}.download-{}-{}",
+        model
+            .path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_else(|| "model.bin".to_string()),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or_default()
+    ));
+
+    let response = reqwest::get(download_url).await.map_err(|source| {
+        CliError::new(
+            "whisper_cpp_model_download_failed",
+            format!(
+                "failed to start downloading whisper.cpp model `{}` from {}: {source}",
+                model.label, download_url
+            ),
+        )
+    })?;
+    if !response.status().is_success() {
+        return Err(CliError::new(
+            "whisper_cpp_model_download_failed",
+            format!(
+                "failed to download whisper.cpp model `{}` from {}: HTTP {}",
+                model.label,
+                download_url,
+                response.status()
+            ),
+        ));
+    }
+
+    let result = async {
+        let mut response = response;
+        let mut file = File::create(&temp_path).map_err(|source| {
+            CliError::new(
+                "whisper_cpp_model_write_failed",
+                format!(
+                    "failed to create temporary whisper.cpp model file {}: {source}",
+                    temp_path.display()
+                ),
+            )
+        })?;
+
+        while let Some(chunk) = response.chunk().await.map_err(|source| {
+            CliError::new(
+                "whisper_cpp_model_download_failed",
+                format!(
+                    "failed while downloading whisper.cpp model `{}` from {}: {source}",
+                    model.label, download_url
+                ),
+            )
+        })? {
+            file.write_all(&chunk).map_err(|source| {
+                CliError::new(
+                    "whisper_cpp_model_write_failed",
+                    format!(
+                        "failed writing whisper.cpp model `{}` to {}: {source}",
+                        model.label,
+                        temp_path.display()
+                    ),
+                )
+            })?;
+        }
+
+        file.flush().map_err(|source| {
+            CliError::new(
+                "whisper_cpp_model_write_failed",
+                format!(
+                    "failed flushing whisper.cpp model `{}` to {}: {source}",
+                    model.label,
+                    temp_path.display()
+                ),
+            )
+        })?;
+
+        if model.path.exists() {
+            let _ = fs::remove_file(&temp_path);
+            return Ok(());
+        }
+
+        match fs::rename(&temp_path, &model.path) {
+            Ok(()) => Ok(()),
+            Err(_) if model.path.exists() => {
+                let _ = fs::remove_file(&temp_path);
+                Ok(())
+            }
+            Err(source) => Err(CliError::new(
+                "whisper_cpp_model_write_failed",
+                format!(
+                    "failed to move whisper.cpp model `{}` into {}: {source}",
+                    model.label,
+                    model.path.display()
+                ),
+            )),
+        }
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    result
 }
 
 fn transcribe_with_whisper_cpp(request: &WhisperInferenceRequest) -> Result<String, CliError> {
@@ -944,7 +1262,7 @@ mod tests {
                 );
                 assert_eq!(envelope.transcript.provider.as_deref(), Some("legacy"));
             }
-            PreparedEnvelope::NeedsTranscription(_) => {
+            PreparedEnvelope::NeedsModelDownload(_) | PreparedEnvelope::NeedsTranscription(_) => {
                 panic!("existing raw text should skip whisper transcription")
             }
         }
@@ -955,6 +1273,37 @@ mod tests {
         let dir = tempdir().expect("temp dir");
         let prepared = prepare_envelope(baseline_envelope(), &config(dir.path().join("models")))
             .expect("missing model should be recoverable");
+
+        match prepared {
+            PreparedEnvelope::NeedsModelDownload(download) => {
+                assert_eq!(
+                    download.model.path,
+                    dir.path().join("models").join(DEFAULT_MODEL_FILENAME)
+                );
+                assert_eq!(download.model.label, DEFAULT_MODEL_ID);
+                assert_eq!(
+                    download.model.download_url.as_deref(),
+                    Some("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin")
+                );
+            }
+            PreparedEnvelope::Ready(_) | PreparedEnvelope::NeedsTranscription(_) => {
+                panic!("missing default model should trigger auto-download")
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_envelope_records_missing_explicit_model_as_unavailable_assets() {
+        let dir = tempdir().expect("temp dir");
+        let prepared = prepare_envelope(
+            baseline_envelope(),
+            &WhisperCppResolvedConfig {
+                model: Some("/tmp/custom-whisper.bin".to_string()),
+                model_dir: dir.path().join("models"),
+                device: WhisperCppDevicePreference::Auto,
+            },
+        )
+        .expect("missing explicit model should be recoverable");
 
         match prepared {
             PreparedEnvelope::Ready(envelope) => {
@@ -968,8 +1317,8 @@ mod tests {
                     Some(&json!("missing_whisper_cpp_model"))
                 );
             }
-            PreparedEnvelope::NeedsTranscription(_) => {
-                panic!("missing model should not attempt inference")
+            PreparedEnvelope::NeedsModelDownload(_) | PreparedEnvelope::NeedsTranscription(_) => {
+                panic!("explicit custom model path should not auto-download")
             }
         }
     }
