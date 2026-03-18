@@ -109,6 +109,7 @@ impl AppConfig {
         }
 
         self.refine.validate()?;
+        self.transcript.validate("transcript")?;
         self.transcription.validate("transcription.providers")?;
         self.providers.validate()?;
 
@@ -206,6 +207,8 @@ impl AppConfig {
         if let Some(profile) = self.profiles.get(&selection.profile_id) {
             profile.apply_to(&mut effective_config);
         }
+
+        effective_config.transcript.materialize_system_prompt();
 
         let transcription_route = resolve_transcription_route(&effective_config);
         effective_config.pipeline = expand_pipeline_with_transcription_route(
@@ -495,13 +498,41 @@ impl Default for ScoringConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptConfig {
     pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_append: Option<String>,
 }
 
 impl Default for TranscriptConfig {
     fn default() -> Self {
         Self {
             system_prompt: "Prefer minimal corrections. Focus on technical terms, developer tools, package names, commands, flags, file names, paths, env vars, acronyms, and obvious dictation errors. If uncertain, keep the original wording.".to_string(),
+            system_prompt_append: None,
         }
+    }
+}
+
+impl TranscriptConfig {
+    fn validate(&self, field_prefix: &str) -> Result<(), ConfigValidationError> {
+        validate_prompt_fragment(&self.system_prompt, format!("{field_prefix}.system_prompt"))?;
+
+        if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
+            validate_prompt_fragment(
+                system_prompt_append,
+                format!("{field_prefix}.system_prompt_append"),
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn append_system_prompt(&mut self, fragment: &str) {
+        append_prompt_fragment(&mut self.system_prompt_append, fragment);
+    }
+
+    fn materialize_system_prompt(&mut self) {
+        self.system_prompt =
+            compose_prompt_text(&self.system_prompt, self.system_prompt_append.as_deref());
+        self.system_prompt_append = None;
     }
 }
 
@@ -626,6 +657,8 @@ pub struct VoiceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_append: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
@@ -665,6 +698,16 @@ impl VoiceConfig {
             }
         }
 
+        if let Some(system_prompt) = self.system_prompt.as_deref() {
+            validate_prompt_fragment(system_prompt, format!("voices.{voice_id}.system_prompt"))?;
+        }
+        if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
+            validate_prompt_fragment(
+                system_prompt_append,
+                format!("voices.{voice_id}.system_prompt_append"),
+            )?;
+        }
+
         validate_optional_refine_fields(
             self.temperature,
             self.max_output_tokens,
@@ -678,6 +721,9 @@ impl VoiceConfig {
     fn apply_to(&self, transcript: &mut TranscriptConfig, refine: &mut RefineConfig) {
         if let Some(system_prompt) = self.system_prompt.as_ref() {
             transcript.system_prompt = system_prompt.clone();
+        }
+        if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
+            transcript.append_system_prompt(system_prompt_append);
         }
         if let Some(temperature) = self.temperature {
             refine.temperature = temperature;
@@ -826,16 +872,23 @@ impl PipelineOverrides {
 pub struct TranscriptOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt_append: Option<String>,
 }
 
 impl TranscriptOverrides {
     fn validate(&self, profile_id: &str) -> Result<(), ConfigValidationError> {
         if let Some(system_prompt) = self.system_prompt.as_deref() {
-            if system_prompt.trim().is_empty() {
-                return Err(ConfigValidationError::ConfigIdentifierMustNotBeEmpty {
-                    field_name: format!("profiles.{profile_id}.transcript.system_prompt"),
-                });
-            }
+            validate_prompt_fragment(
+                system_prompt,
+                format!("profiles.{profile_id}.transcript.system_prompt"),
+            )?;
+        }
+        if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
+            validate_prompt_fragment(
+                system_prompt_append,
+                format!("profiles.{profile_id}.transcript.system_prompt_append"),
+            )?;
         }
         Ok(())
     }
@@ -843,6 +896,9 @@ impl TranscriptOverrides {
     fn apply_to(&self, transcript: &mut TranscriptConfig) {
         if let Some(system_prompt) = self.system_prompt.as_ref() {
             transcript.system_prompt = system_prompt.clone();
+        }
+        if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
+            transcript.append_system_prompt(system_prompt_append);
         }
     }
 }
@@ -1050,8 +1106,11 @@ pub struct ResolvedBuiltinStepConfig {
 impl ResolvedBuiltinStepConfig {
     #[must_use]
     pub fn from_app_config(config: &AppConfig) -> Self {
+        let mut transcript = config.transcript.clone();
+        transcript.materialize_system_prompt();
+
         Self {
-            transcript: config.transcript.clone(),
+            transcript,
             refine: config.refine.clone(),
             providers: config.providers.clone(),
         }
@@ -1423,6 +1482,48 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<(), ConfigValida
     Ok(())
 }
 
+fn validate_prompt_fragment(
+    value: &str,
+    field_name: impl Into<String>,
+) -> Result<(), ConfigValidationError> {
+    let field_name = field_name.into();
+    if value.trim().is_empty() {
+        return Err(ConfigValidationError::ConfigIdentifierMustNotBeEmpty { field_name });
+    }
+    Ok(())
+}
+
+fn append_prompt_fragment(target: &mut Option<String>, fragment: &str) {
+    let fragment = fragment.trim();
+    if fragment.is_empty() {
+        return;
+    }
+
+    if let Some(existing) = target.as_mut() {
+        let normalized = existing.trim().to_string();
+        existing.clear();
+        existing.push_str(&normalized);
+
+        if !existing.is_empty() {
+            existing.push_str("\n\n");
+        }
+        existing.push_str(fragment);
+    } else {
+        *target = Some(fragment.to_string());
+    }
+}
+
+fn compose_prompt_text(base: &str, append: Option<&str>) -> String {
+    let base = base.trim();
+    let append = append.map(str::trim).filter(|value| !value.is_empty());
+
+    match append {
+        Some(fragment) if !base.is_empty() => format!("{base}\n\n{fragment}"),
+        Some(fragment) => fragment.to_string(),
+        None => base.to_string(),
+    }
+}
+
 fn validate_pipeline_steps(steps: &[PipelineStepConfig]) -> Result<(), ConfigValidationError> {
     let mut seen_ids = HashSet::new();
     for step in steps {
@@ -1702,6 +1803,7 @@ mod tests {
         assert_eq!(config.indicator.colors.idle, "#636366");
         assert!(config.recording.mono);
         assert_eq!(config.recording.sample_rate_khz, 16);
+        assert_eq!(config.transcript.system_prompt_append, None);
     }
 
     #[test]
@@ -1763,6 +1865,7 @@ mod tests {
             config.transcript.system_prompt,
             "Prefer minimal corrections. Focus on technical terms, developer tools, package names, commands, flags, file names, paths, env vars, acronyms, and obvious dictation errors. If uncertain, keep the original wording."
         );
+        assert_eq!(config.transcript.system_prompt_append, None);
     }
 
     #[test]
@@ -2882,6 +2985,114 @@ on_error = "abort"
         assert_eq!(
             resolved.effective_config.refine.max_token_change_ratio,
             0.60
+        );
+    }
+
+    #[test]
+    fn resolve_effective_config_appends_prompt_fragments_from_base_voice_and_profile() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[transcript]
+system_prompt = "base prompt"
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn"]}
+"""
+
+[voices.codex]
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Deepgram"]}
+"""
+
+[profiles.default]
+
+[profiles.codex]
+voice = "codex"
+[profiles.codex.transcript]
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Cargo.toml"]}
+"""
+
+[[profile_rules]]
+id = "codex_window"
+profile = "codex"
+app_name = "Codex"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("contextual config with prompt appends should parse");
+
+        let resolved = config.resolve_effective_config(target_context(
+            Some("com.openai.codex"),
+            Some("Codex"),
+            Some("Spec"),
+        ));
+
+        let expected_prompt = r#"base prompt
+
+Vocabulary JSON:
+{"terms":["Muninn"]}
+
+Vocabulary JSON:
+{"terms":["Deepgram"]}
+
+Vocabulary JSON:
+{"terms":["Cargo.toml"]}"#;
+
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            expected_prompt
+        );
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt_append,
+            None
+        );
+        assert_eq!(
+            resolved.builtin_steps.transcript.system_prompt,
+            expected_prompt
+        );
+        assert_eq!(resolved.builtin_steps.transcript.system_prompt_append, None);
+    }
+
+    #[test]
+    fn rejects_empty_transcript_system_prompt_append() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[transcript]
+system_prompt_append = "   "
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect_err("blank transcript prompt append must fail");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::ConfigIdentifierMustNotBeEmpty {
+                field_name: "transcript.system_prompt_append".to_string(),
+            })
         );
     }
 

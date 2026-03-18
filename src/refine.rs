@@ -221,11 +221,7 @@ async fn refine_with_openai(
                 },
                 {
                     "role": "user",
-                    "content": format!(
-                        "Project/user hints:\n{}\n\nTranscript:\n{}",
-                        hint_prompt.trim(),
-                        raw_text,
-                    ),
+                    "content": build_refine_user_prompt(hint_prompt, raw_text),
                 }
             ]
         }))
@@ -359,6 +355,14 @@ fn apply_refinement(
             }));
         }
     }
+}
+
+fn build_refine_user_prompt(hint_prompt: &str, raw_text: &str) -> String {
+    format!(
+        "Project/user hints:\n{}\n\nTranscript:\n{}",
+        hint_prompt.trim(),
+        raw_text,
+    )
 }
 
 fn evaluate_candidate(
@@ -728,5 +732,23 @@ mod tests {
         let decoded = read_envelope_from_reader(output.as_slice()).expect("read envelope");
 
         assert_eq!(decoded, envelope);
+    }
+
+    #[test]
+    fn build_refine_user_prompt_preserves_vocabulary_json_blocks() {
+        let prompt = build_refine_user_prompt(
+            r#"Prefer minimal corrections.
+
+Vocabulary JSON:
+{"terms":["Muninn","whisper.cpp"],"commands":["cargo test -q"]}"#,
+            "run cargo test",
+        );
+
+        assert!(prompt.contains("Project/user hints:\nPrefer minimal corrections."));
+        assert!(prompt.contains(
+            r#"Vocabulary JSON:
+{"terms":["Muninn","whisper.cpp"],"commands":["cargo test -q"]}"#
+        ));
+        assert!(prompt.ends_with("Transcript:\nrun cargo test"));
     }
 }
