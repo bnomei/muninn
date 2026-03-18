@@ -26,10 +26,10 @@ pub mod transcription;
 pub use audio::MacosAudioRecorder;
 pub use config::{
     resolve_config_path, AppConfig, AppleSpeechProviderConfig, ConfigError, ConfigValidationError,
-    OnErrorPolicy, PayloadFormat, ProfileConfig, ProfileRuleConfig, ProvidersConfig,
-    RecordingConfig, RefineOverrides, ResolvedBuiltinStepConfig, ResolvedProfileSelection,
-    ResolvedUtteranceConfig, TranscriptOverrides, TranscriptionConfig, TriggerType, VoiceConfig,
-    WhisperCppDevicePreference, WhisperCppProviderConfig,
+    DeepgramProviderConfig, OnErrorPolicy, PayloadFormat, ProfileConfig, ProfileRuleConfig,
+    ProvidersConfig, RecordingConfig, RefineOverrides, ResolvedBuiltinStepConfig,
+    ResolvedProfileSelection, ResolvedUtteranceConfig, TranscriptOverrides, TranscriptionConfig,
+    TriggerType, VoiceConfig, WhisperCppDevicePreference, WhisperCppProviderConfig,
 };
 pub use envelope::MuninnEnvelopeV1;
 pub use error::{MacosAdapterError, MacosAdapterResult, PermissionKind};

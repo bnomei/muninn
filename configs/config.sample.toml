@@ -176,6 +176,16 @@ model = "gpt-4o-mini-transcribe"
 model_dir = "~/.local/share/muninn/models"
 device = "auto"
 
+[providers.deepgram]
+# api_key = "set via DEEPGRAM_API_KEY"
+# endpoint can also be overridden with DEEPGRAM_STT_ENDPOINT
+endpoint = "https://api.deepgram.com/v1/listen"
+# Muninn uses Deepgram prerecorded uploads with smart formatting enabled.
+# model can also be overridden with DEEPGRAM_STT_MODEL
+model = "nova-3"
+# language can also be overridden with DEEPGRAM_STT_LANGUAGE
+language = "en"
+
 [providers.google]
 # api_key = "set via GOOGLE_API_KEY"
 # token = "set via GOOGLE_STT_TOKEN"

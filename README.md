@@ -104,12 +104,12 @@ Muninn reads provider credentials from your environment or config and uses them 
 Setup:
 - Apple Speech: no API key is required; this local leg requires macOS 26+ and Apple-managed Speech assets for the selected locale
 - Whisper.cpp: no API key is required; place a model under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file
+- Deepgram: set `DEEPGRAM_API_KEY`; Muninn uses the prerecorded `/v1/listen` API with `model = "nova-3"`, `language = "en"`, and smart formatting enabled by default
 - OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg and for the default refine pass
 - Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the Google route leg
-- Deepgram: set `DEEPGRAM_API_KEY` if you keep the Deepgram leg enabled in your route
 - optional provider settings such as endpoints and models live in the config you control
 
-The shipped route order is local-first. `apple_speech` and `whisper_cpp` run locally on completed recordings for post-processing transcription; `deepgram` still participates in route resolution and diagnostics, then falls through until its live backend is available. `openai` and `google` remain cloud legs.
+The shipped route order is local-first. `apple_speech` and `whisper_cpp` run locally on completed recordings for post-processing transcription; `deepgram` is the preferred cloud leg for prerecorded uploads; `openai` and `google` remain fallback cloud legs.
 
 Whisper model lifecycle:
 - documented first-use default: `tiny.en`, resolved as `ggml-tiny.en.bin`
@@ -118,6 +118,14 @@ Whisper model lifecycle:
 - install behavior today: Muninn does not auto-download models; it records an actionable missing-model diagnostic and continues the ordered route
 - performance tradeoff: `tiny.en` is the fastest and smallest launchable default, while larger models such as `base.en` trade more disk and latency for better accuracy
 - acceleration: `device = "auto"` prefers Metal on Apple Silicon builds when available and uses CPU elsewhere; `device = "gpu"` is explicit and fails diagnostically on unsupported builds
+
+Deepgram provider defaults:
+- prerecorded endpoint: `https://api.deepgram.com/v1/listen`
+- documented first-use model: `nova-3`
+- default language hint: `en`
+- request behavior: Muninn uploads the completed recording binary with `smart_format=true`
+- override surface: `[providers.deepgram].endpoint`, `[providers.deepgram].model`, `[providers.deepgram].language`
+- env overrides: `DEEPGRAM_STT_ENDPOINT`, `DEEPGRAM_STT_MODEL`, and `DEEPGRAM_STT_LANGUAGE`
 
 That makes Muninn AI-native even in BYOK mode. You are not just piping audio into someone else's transcript API and injecting whatever comes back. The default flow uses your STT provider for the first pass, then uses Muninn's own built-in prompt contract for a second pass that aligns the text to developer dictation.
 
@@ -257,8 +265,8 @@ Muninn now tries to load `./.env` from the current working directory by default.
 | --- | --- | --- |
 | Apple Speech transcription | none | Configure `[providers.apple_speech]` (`locale` and `install_assets`) in config; this provider is completed-recording only, requires macOS 26+, and uses Apple-managed assets |
 | Whisper.cpp transcription | none | Put a model file under `providers.whisper_cpp.model_dir` or point `providers.whisper_cpp.model` at a local `.bin` file. The backend runs on completed recordings only. |
+| Deepgram transcription | `DEEPGRAM_API_KEY`, optional `DEEPGRAM_STT_ENDPOINT`, optional `DEEPGRAM_STT_MODEL`, optional `DEEPGRAM_STT_LANGUAGE`, optional `MUNINN_DEEPGRAM_STUB_TEXT` | Deepgram is the preferred cloud route leg for prerecorded uploads; Muninn sends the completed recording with `smart_format=true`, and stub text is only an optional bypass. |
 | OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
-| Deepgram transcription | `DEEPGRAM_API_KEY` | The route leg is normalized now; current builds record availability/failure diagnostics until a live backend lands. |
 | Google transcription | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google STT runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
 | Refine step | `OPENAI_API_KEY`, `MUNINN_REFINE_STUB_TEXT` | This is the second AI pass. `transcript.system_prompt` can give it voice/style hints. Stub text bypasses the network for refine. |
 
@@ -356,7 +364,7 @@ Use the fixtures in `tests/fixtures/` when you want example input.
 
 - `stt_apple_speech` is the native macOS 26+ on-device route leg; it reads completed recordings from `audio.wav_path`, uses Apple-managed speech assets, writes `transcript.raw_text` on success, and falls through when unsupported platform/locale or assets are unavailable
 - `stt_whisper_cpp` reads `audio.wav_path`, runs local whisper.cpp inference on completed recordings, writes `transcript.raw_text` on success, and records missing-model or unsupported-build diagnostics before falling through
-- `stt_deepgram` records missing `DEEPGRAM_API_KEY` or backend-unavailable states before falling through
+- `stt_deepgram` uploads the completed recording to Deepgram's prerecorded `/v1/listen` API, writes `transcript.raw_text` on success, and records structured missing-credential, request-failure, or empty-transcript diagnostics before falling through
 - `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it records structured failure details and lets later route legs run
 - `stt_google` fills `transcript.raw_text` when Google is configured, otherwise it records structured failure details and lets later route legs run
 - `refine` applies Muninn's built-in developer contract plus your `transcript.system_prompt` hints and writes accepted output to `output.final_text`
@@ -387,7 +395,7 @@ This profile now skips the local-first defaults while other profiles continue in
 
 - Muninn currently supports macOS only.
 - Whisper.cpp model files are not auto-downloaded yet; place them in the configured model directory yourself.
-- Deepgram route legs still stop at normalized diagnostics until their live backend lands.
+- Deepgram is currently a prerecorded-upload backend only; streaming and provider-specific vocabulary prompting remain out of scope here.
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.
 - Provider-backed transcription needs realistic timeout budgets.

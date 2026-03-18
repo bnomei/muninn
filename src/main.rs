@@ -14,6 +14,7 @@ mod runtime_shell;
 mod runtime_tray;
 mod runtime_worker;
 mod stt_apple_speech_tool;
+mod stt_deepgram_tool;
 mod stt_google_tool;
 mod stt_openai_tool;
 mod stt_whisper_cpp_tool;

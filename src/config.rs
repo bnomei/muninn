@@ -1085,6 +1085,7 @@ impl Default for LoggingConfig {
 pub struct ProvidersConfig {
     pub apple_speech: AppleSpeechProviderConfig,
     pub whisper_cpp: WhisperCppProviderConfig,
+    pub deepgram: DeepgramProviderConfig,
     pub openai: OpenAiProviderConfig,
     pub google: GoogleProviderConfig,
 }
@@ -1092,7 +1093,8 @@ pub struct ProvidersConfig {
 impl ProvidersConfig {
     fn validate(&self) -> Result<(), ConfigValidationError> {
         self.apple_speech.validate()?;
-        self.whisper_cpp.validate()
+        self.whisper_cpp.validate()?;
+        self.deepgram.validate()
     }
 }
 
@@ -1165,6 +1167,41 @@ impl Default for WhisperCppProviderConfig {
             model_dir: PathBuf::from("~/.local/share/muninn/models"),
             device: WhisperCppDevicePreference::Auto,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeepgramProviderConfig {
+    pub api_key: Option<String>,
+    pub endpoint: String,
+    pub model: String,
+    pub language: String,
+}
+
+impl Default for DeepgramProviderConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            endpoint: "https://api.deepgram.com/v1/listen".to_string(),
+            model: "nova-3".to_string(),
+            language: "en".to_string(),
+        }
+    }
+}
+
+impl DeepgramProviderConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        if self.endpoint.trim().is_empty() {
+            return Err(ConfigValidationError::DeepgramEndpointMustNotBeEmpty);
+        }
+        if self.model.trim().is_empty() {
+            return Err(ConfigValidationError::DeepgramModelMustNotBeEmpty);
+        }
+        if self.language.trim().is_empty() {
+            return Err(ConfigValidationError::DeepgramLanguageMustNotBeEmpty);
+        }
+        Ok(())
     }
 }
 
@@ -1267,6 +1304,12 @@ pub enum ConfigValidationError {
     WhisperCppModelMustNotBeEmpty,
     #[error("providers.whisper_cpp.model_dir must not be empty")]
     WhisperCppModelDirMustNotBeEmpty,
+    #[error("providers.deepgram.endpoint must not be empty")]
+    DeepgramEndpointMustNotBeEmpty,
+    #[error("providers.deepgram.model must not be empty")]
+    DeepgramModelMustNotBeEmpty,
+    #[error("providers.deepgram.language must not be empty")]
+    DeepgramLanguageMustNotBeEmpty,
     #[error("pipeline.deadline_ms must be greater than 0")]
     PipelineDeadlineMsMustBePositive,
     #[error("pipeline must include at least one step")]
@@ -1649,6 +1692,12 @@ mod tests {
             config.providers.whisper_cpp.device,
             WhisperCppDevicePreference::Auto
         );
+        assert_eq!(
+            config.providers.deepgram.endpoint,
+            "https://api.deepgram.com/v1/listen"
+        );
+        assert_eq!(config.providers.deepgram.model, "nova-3");
+        assert_eq!(config.providers.deepgram.language, "en");
         assert_eq!(config.refine.model, "gpt-4.1-mini");
         assert_eq!(config.indicator.colors.idle, "#636366");
         assert!(config.recording.mono);
@@ -1703,6 +1752,12 @@ mod tests {
             config.providers.whisper_cpp.device,
             WhisperCppDevicePreference::Auto
         );
+        assert_eq!(
+            config.providers.deepgram.endpoint,
+            "https://api.deepgram.com/v1/listen"
+        );
+        assert_eq!(config.providers.deepgram.model, "nova-3");
+        assert_eq!(config.providers.deepgram.language, "en");
         assert_eq!(config.refine.provider, RefineProvider::OpenAi);
         assert_eq!(
             config.transcript.system_prompt,
@@ -1790,6 +1845,40 @@ on_error = "abort"
                 model: Some("base.en".to_string()),
                 model_dir: PathBuf::from("/tmp/muninn-models"),
                 device: WhisperCppDevicePreference::Cpu,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_deepgram_provider_overrides() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[providers.deepgram]
+api_key = "config-deepgram-key"
+endpoint = "https://api.deepgram.test/v1/listen"
+model = "nova-3-medical"
+language = "en-IE"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("Deepgram provider overrides should parse");
+
+        assert_eq!(
+            config.providers.deepgram,
+            super::DeepgramProviderConfig {
+                api_key: Some("config-deepgram-key".to_string()),
+                endpoint: "https://api.deepgram.test/v1/listen".to_string(),
+                model: "nova-3-medical".to_string(),
+                language: "en-IE".to_string(),
             }
         );
     }
@@ -1899,6 +1988,34 @@ on_error = "abort"
         assert_eq!(
             error.to_validation_error(),
             Some(ConfigValidationError::WhisperCppModelDirMustNotBeEmpty)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_deepgram_provider_values() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[providers.deepgram]
+endpoint = ""
+model = "nova-3"
+language = "en"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect_err("empty Deepgram endpoint must fail");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::DeepgramEndpointMustNotBeEmpty)
         );
     }
 
