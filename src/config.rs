@@ -513,8 +513,6 @@ impl Default for TranscriptConfig {
 
 impl TranscriptConfig {
     fn validate(&self, field_prefix: &str) -> Result<(), ConfigValidationError> {
-        validate_prompt_fragment(&self.system_prompt, format!("{field_prefix}.system_prompt"))?;
-
         if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
             validate_prompt_fragment(
                 system_prompt_append,
@@ -523,6 +521,11 @@ impl TranscriptConfig {
         }
 
         Ok(())
+    }
+
+    fn replace_system_prompt(&mut self, prompt: &str) {
+        self.system_prompt = prompt.to_string();
+        self.system_prompt_append = None;
     }
 
     fn append_system_prompt(&mut self, fragment: &str) {
@@ -720,7 +723,7 @@ impl VoiceConfig {
 
     fn apply_to(&self, transcript: &mut TranscriptConfig, refine: &mut RefineConfig) {
         if let Some(system_prompt) = self.system_prompt.as_ref() {
-            transcript.system_prompt = system_prompt.clone();
+            transcript.replace_system_prompt(system_prompt);
         }
         if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
             transcript.append_system_prompt(system_prompt_append);
@@ -895,7 +898,7 @@ impl TranscriptOverrides {
 
     fn apply_to(&self, transcript: &mut TranscriptConfig) {
         if let Some(system_prompt) = self.system_prompt.as_ref() {
-            transcript.system_prompt = system_prompt.clone();
+            transcript.replace_system_prompt(system_prompt);
         }
         if let Some(system_prompt_append) = self.system_prompt_append.as_deref() {
             transcript.append_system_prompt(system_prompt_append);
@@ -3094,6 +3097,302 @@ on_error = "abort"
                 field_name: "transcript.system_prompt_append".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn allows_empty_root_transcript_system_prompt_for_append_only_configs() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[transcript]
+system_prompt = ""
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn"]}
+"""
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("empty root transcript prompt should remain valid");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            "Vocabulary JSON:\n{\"terms\":[\"Muninn\"]}"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_config_clears_base_append_when_voice_replaces_prompt() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[transcript]
+system_prompt = "base prompt"
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn"]}
+"""
+
+[voices.codex]
+system_prompt = "voice prompt"
+
+[profiles.default]
+
+[profiles.codex]
+voice = "codex"
+
+[[profile_rules]]
+id = "codex_window"
+profile = "codex"
+app_name = "Codex"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("voice replacement config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(
+            Some("com.openai.codex"),
+            Some("Codex"),
+            Some("Spec"),
+        ));
+
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            "voice prompt"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_config_clears_inherited_appends_when_profile_replaces_prompt() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[transcript]
+system_prompt = "base prompt"
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn"]}
+"""
+
+[voices.codex]
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Deepgram"]}
+"""
+
+[profiles.default]
+
+[profiles.codex]
+voice = "codex"
+[profiles.codex.transcript]
+system_prompt = "profile prompt"
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Cargo.toml"]}
+"""
+
+[[profile_rules]]
+id = "codex_window"
+profile = "codex"
+app_name = "Codex"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("profile replacement config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(
+            Some("com.openai.codex"),
+            Some("Codex"),
+            Some("Spec"),
+        ));
+
+        let expected_prompt = r#"profile prompt
+
+Vocabulary JSON:
+{"terms":["Cargo.toml"]}"#;
+
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            expected_prompt
+        );
+    }
+
+    #[test]
+    fn accepts_empty_root_transcript_system_prompt() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[transcript]
+system_prompt = ""
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("empty root transcript system prompt should remain valid");
+
+        assert_eq!(config.transcript.system_prompt, "");
+        assert_eq!(config.transcript.system_prompt_append, None);
+    }
+
+    #[test]
+    fn resolve_effective_config_voice_prompt_replacement_clears_base_append() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[transcript]
+system_prompt = "base prompt"
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn"]}
+"""
+
+[voices.codex]
+system_prompt = "voice prompt"
+
+[profiles.default]
+
+[profiles.codex]
+voice = "codex"
+
+[[profile_rules]]
+id = "codex_window"
+profile = "codex"
+app_name = "Codex"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("voice prompt replacement config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(
+            Some("com.openai.codex"),
+            Some("Codex"),
+            Some("Spec"),
+        ));
+
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            "voice prompt"
+        );
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt_append,
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_effective_config_profile_prompt_replacement_clears_inherited_appends() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[transcript]
+system_prompt = "base prompt"
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Muninn"]}
+"""
+
+[voices.codex]
+system_prompt_append = """
+Vocabulary JSON:
+{"terms":["Deepgram"]}
+"""
+
+[profiles.default]
+
+[profiles.codex]
+voice = "codex"
+[profiles.codex.transcript]
+system_prompt = "profile prompt"
+
+[[profile_rules]]
+id = "codex_window"
+profile = "codex"
+app_name = "Codex"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("profile prompt replacement config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(
+            Some("com.openai.codex"),
+            Some("Codex"),
+            Some("Spec"),
+        ));
+
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt,
+            "profile prompt"
+        );
+        assert_eq!(
+            resolved.effective_config.transcript.system_prompt_append,
+            None
+        );
+        assert_eq!(
+            resolved.builtin_steps.transcript.system_prompt,
+            "profile prompt"
+        );
+        assert_eq!(resolved.builtin_steps.transcript.system_prompt_append, None);
     }
 
     #[test]
