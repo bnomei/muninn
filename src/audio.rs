@@ -25,6 +25,7 @@ pub struct MacosAudioRecorder {
 struct CaptureEngine {
     stream: cpal::Stream,
     capture: Arc<Mutex<CaptureBuffer>>,
+    device_name: String,
     sample_rate: u32,
     channels: u16,
     requested_output_config: RecordingConfig,
@@ -98,41 +99,47 @@ impl AudioRecorder for MacosAudioRecorder {
                 return Err(MacosAdapterError::RecorderAlreadyActive);
             }
 
-            let engine = self.ensure_engine()?;
-            {
-                let mut capture = engine.capture.lock().map_err(|_| {
-                    MacosAdapterError::operation_failed(
-                        "start_recording",
-                        "capture buffer poisoned",
-                    )
-                })?;
-                if capture.active {
-                    return Err(MacosAdapterError::RecorderAlreadyActive);
-                }
-                capture.samples.clear();
-                capture.overflowed = false;
-                capture.active = true;
-            }
-
-            if let Err(error) = engine.stream.play() {
-                if let Ok(mut capture) = engine.capture.lock() {
-                    capture.active = false;
-                    capture.overflowed = false;
+            let (capture_device_name, capture_sample_rate_hz, capture_channels) = {
+                let engine = self.ensure_engine()?;
+                {
+                    let mut capture = engine.capture.lock().map_err(|_| {
+                        MacosAdapterError::operation_failed(
+                            "start_recording",
+                            "capture buffer poisoned",
+                        )
+                    })?;
+                    if capture.active {
+                        return Err(MacosAdapterError::RecorderAlreadyActive);
+                    }
                     capture.samples.clear();
+                    capture.overflowed = false;
+                    capture.active = true;
                 }
-                return Err(MacosAdapterError::operation_failed(
-                    "start_recording",
-                    format!("starting input stream: {error}"),
-                ));
-            }
 
-            let capture_sample_rate_hz = engine.sample_rate;
-            let capture_channels = engine.channels;
+                if let Err(error) = engine.stream.play() {
+                    if let Ok(mut capture) = engine.capture.lock() {
+                        capture.active = false;
+                        capture.overflowed = false;
+                        capture.samples.clear();
+                    }
+                    return Err(MacosAdapterError::operation_failed(
+                        "start_recording",
+                        format!("starting input stream: {error}"),
+                    ));
+                }
+
+                (
+                    engine.device_name.clone(),
+                    engine.sample_rate,
+                    engine.channels,
+                )
+            };
             let output_sample_rate_hz = self.output_config.sample_rate_hz();
             let output_mono = self.output_config.mono;
             self.started_at = Some(Instant::now());
             tracing::debug!(
                 target: TARGET_RECORDING,
+                capture_device_name = %capture_device_name,
                 capture_sample_rate_hz,
                 capture_channels,
                 output_sample_rate_hz,
@@ -198,6 +205,7 @@ impl AudioRecorder for MacosAudioRecorder {
             if samples.is_empty() {
                 tracing::warn!(
                     target: TARGET_RECORDING,
+                    capture_device_name = %engine.device_name,
                     capture_sample_rate_hz = engine.sample_rate,
                     capture_channels = engine.channels,
                     output_sample_rate_hz = self.output_config.sample_rate_hz(),
@@ -216,6 +224,7 @@ impl AudioRecorder for MacosAudioRecorder {
                 .unwrap_or_default();
             tracing::debug!(
                 target: TARGET_RECORDING,
+                capture_device_name = %engine.device_name,
                 wav_path = %wav_path.display(),
                 wav_bytes,
                 buffered_samples = samples.len(),
@@ -283,13 +292,40 @@ impl AudioRecorder for MacosAudioRecorder {
 impl MacosAudioRecorder {
     #[cfg(target_os = "macos")]
     fn ensure_engine(&mut self) -> MacosAdapterResult<&CaptureEngine> {
-        let rebuild_engine = self.started_at.is_none()
-            && match self.engine.as_ref() {
-                Some(engine) => engine.requested_output_config != self.output_config,
-                None => true,
-            };
+        let current_default_device_name = current_default_input_device_name();
+        let rebuild_reason = capture_engine_rebuild_reason(
+            self.engine
+                .as_ref()
+                .map(|engine| &engine.requested_output_config),
+            self.engine
+                .as_ref()
+                .map(|engine| engine.device_name.as_str()),
+            &self.output_config,
+            self.started_at.is_some(),
+            current_default_device_name.as_deref(),
+        );
 
-        if rebuild_engine {
+        if let Some(reason) = rebuild_reason {
+            if reason == "default_input_device_changed" {
+                tracing::debug!(
+                    target: TARGET_RECORDING,
+                    previous_capture_device_name = self
+                        .engine
+                        .as_ref()
+                        .map(|engine| engine.device_name.as_str())
+                        .unwrap_or("<none>"),
+                    current_default_input_device_name = current_default_device_name
+                        .as_deref()
+                        .unwrap_or("<unknown>"),
+                    "rebuilding audio capture engine after default input device change"
+                );
+            } else {
+                tracing::debug!(
+                    target: TARGET_RECORDING,
+                    rebuild_reason = reason,
+                    "rebuilding audio capture engine"
+                );
+            }
             self.engine = Some(build_capture_engine(&self.output_config)?);
         }
 
@@ -297,6 +333,55 @@ impl MacosAudioRecorder {
             MacosAdapterError::operation_failed("audio_engine", "capture engine missing after init")
         })
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn capture_engine_rebuild_reason(
+    current_engine_output_config: Option<&RecordingConfig>,
+    current_engine_device_name: Option<&str>,
+    output_config: &RecordingConfig,
+    recording_active: bool,
+    current_default_device_name: Option<&str>,
+) -> Option<&'static str> {
+    if recording_active {
+        return None;
+    }
+
+    let Some(current_engine_output_config) = current_engine_output_config else {
+        return Some("engine_missing");
+    };
+
+    if current_engine_output_config != output_config {
+        return Some("recording_config_changed");
+    }
+
+    match (current_engine_device_name, current_default_device_name) {
+        (Some(current_engine_device_name), Some(current_default_device_name))
+            if current_engine_device_name != current_default_device_name =>
+        {
+            Some("default_input_device_changed")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn current_default_input_device_name() -> Option<String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    cpal::default_host()
+        .default_input_device()
+        .and_then(|device| match device.name() {
+            Ok(name) => Some(name),
+            Err(error) => {
+                tracing::warn!(
+                    target: TARGET_RECORDING,
+                    %error,
+                    "failed to query default input device name"
+                );
+                None
+            }
+        })
 }
 
 #[cfg(target_os = "macos")]
@@ -307,6 +392,9 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
     let device = host.default_input_device().ok_or_else(|| {
         MacosAdapterError::operation_failed("audio_engine", "no default input device available")
     })?;
+    let device_name = device
+        .name()
+        .unwrap_or_else(|error| format!("<unknown input device: {error}>"));
     let default_supported_config = device.default_input_config().map_err(|error| {
         MacosAdapterError::operation_failed(
             "audio_engine",
@@ -353,6 +441,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
 
     tracing::debug!(
         target: TARGET_RECORDING,
+        capture_device_name = %device_name,
         capture_sample_format = ?selection.sample_format,
         capture_sample_rate_hz = config.sample_rate.0,
         capture_channels = config.channels,
@@ -365,6 +454,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
     Ok(CaptureEngine {
         stream,
         capture,
+        device_name,
         sample_rate: config.sample_rate.0,
         channels: config.channels,
         requested_output_config: output_config.clone(),
@@ -807,9 +897,10 @@ mod tests {
     use crate::config::RecordingConfig;
 
     use super::{
-        append_capped_samples, collect_output_samples, max_buffered_samples,
-        normalized_f32_to_pcm_i16, output_wav_spec, pcm_i16_to_normalized_f32,
-        preferred_capture_choice, CaptureBuffer, CaptureConfigChoice, CaptureSampleFormat,
+        append_capped_samples, capture_engine_rebuild_reason, collect_output_samples,
+        max_buffered_samples, normalized_f32_to_pcm_i16, output_wav_spec,
+        pcm_i16_to_normalized_f32, preferred_capture_choice, CaptureBuffer, CaptureConfigChoice,
+        CaptureSampleFormat,
     };
 
     fn assert_samples_close(actual: &[f32], expected: &[f32]) {
@@ -866,6 +957,68 @@ mod tests {
     fn max_buffered_samples_scales_with_sample_rate_and_channels() {
         assert_eq!(max_buffered_samples(16_000, 1), 2_880_000);
         assert_eq!(max_buffered_samples(48_000, 2), 17_280_000);
+    }
+
+    #[test]
+    fn capture_engine_rebuild_reason_requires_engine_when_idle() {
+        assert_eq!(
+            capture_engine_rebuild_reason(
+                None,
+                None,
+                &RecordingConfig::default(),
+                false,
+                Some("USB Microphone"),
+            ),
+            Some("engine_missing")
+        );
+    }
+
+    #[test]
+    fn capture_engine_rebuild_reason_detects_recording_config_change() {
+        assert_eq!(
+            capture_engine_rebuild_reason(
+                Some(&RecordingConfig {
+                    mono: true,
+                    sample_rate_khz: 16,
+                }),
+                Some("USB Microphone"),
+                &RecordingConfig {
+                    mono: false,
+                    sample_rate_khz: 48,
+                },
+                false,
+                Some("USB Microphone"),
+            ),
+            Some("recording_config_changed")
+        );
+    }
+
+    #[test]
+    fn capture_engine_rebuild_reason_detects_default_input_device_change() {
+        assert_eq!(
+            capture_engine_rebuild_reason(
+                Some(&RecordingConfig::default()),
+                Some("MacBook Air Microphone"),
+                &RecordingConfig::default(),
+                false,
+                Some("USB Microphone"),
+            ),
+            Some("default_input_device_changed")
+        );
+    }
+
+    #[test]
+    fn capture_engine_rebuild_reason_skips_device_check_while_recording() {
+        assert_eq!(
+            capture_engine_rebuild_reason(
+                Some(&RecordingConfig::default()),
+                Some("MacBook Air Microphone"),
+                &RecordingConfig::default(),
+                true,
+                Some("USB Microphone"),
+            ),
+            None
+        );
     }
 
     #[test]
