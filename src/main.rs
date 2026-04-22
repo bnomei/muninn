@@ -19,24 +19,19 @@ mod stt_google_tool;
 mod stt_openai_tool;
 mod stt_whisper_cpp_tool;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use muninn::config::resolve_config_path;
-use muninn::{
-    AppConfig, AudioRecorder, MacosAudioRecorder, MacosPermissionsAdapter, RecordingConfig,
-};
+use muninn::AppConfig;
 use tracing::{debug, info, warn};
 
 use crate::runtime_shell::AppRuntime;
 #[cfg(test)]
 pub(crate) use crate::runtime_tray::{map_tray_event, resolved_indicator_glyph, IndicatorGlyph};
-use crate::runtime_worker::{
-    ensure_recording_can_start, refresh_recording_permissions_for_user_action,
-    RecordingStartSource, RuntimeMessage,
-};
+use crate::runtime_worker::RuntimeMessage;
 #[cfg(test)]
 pub(crate) use crate::runtime_worker::{
-    refresh_injection_permissions_for_user_action, should_abort_injection,
-    should_abort_recording_start,
+    refresh_injection_permissions_for_user_action, refresh_recording_permissions_for_user_action,
+    should_abort_injection, should_abort_recording_start, RecordingStartSource,
 };
 
 const INDICATOR_ICON_SIZE_PX: u32 = 36;
@@ -51,9 +46,6 @@ fn main() -> ExitCode {
     maybe_load_dotenv();
 
     let args = std::env::args().collect::<Vec<_>>();
-    if let Some(exit_code) = maybe_handle_debug_record(&args) {
-        return exit_code;
-    }
     if let Some(exit_code) = internal_tools::maybe_handle_internal_step(&args) {
         return exit_code;
     }
@@ -65,23 +57,6 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
-}
-
-fn maybe_handle_debug_record(args: &[String]) -> Option<ExitCode> {
-    if args.get(1).map(String::as_str) != Some("__debug_record") {
-        return None;
-    }
-
-    Some(
-        match parse_debug_record_options(&args[2..]).and_then(|options| run_debug_record(&options))
-        {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("muninn debug record failed: {error:#}");
-                ExitCode::FAILURE
-            }
-        },
-    )
 }
 
 fn bootstrap() -> Result<()> {
@@ -105,139 +80,6 @@ fn bootstrap() -> Result<()> {
 
     let runtime = AppRuntime::new(config_path, config)?;
     runtime.run()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DebugRecordOptions {
-    seconds: u64,
-    mono: Option<bool>,
-    sample_rate_khz: Option<u32>,
-}
-
-impl Default for DebugRecordOptions {
-    fn default() -> Self {
-        Self {
-            seconds: 3,
-            mono: None,
-            sample_rate_khz: None,
-        }
-    }
-}
-
-fn parse_debug_record_options(args: &[String]) -> Result<DebugRecordOptions> {
-    let mut options = DebugRecordOptions::default();
-    let mut saw_duration = false;
-    let mut index = 0;
-
-    while index < args.len() {
-        match args[index].as_str() {
-            "--mono" => {
-                if matches!(options.mono, Some(false)) {
-                    bail!("__debug_record cannot use both --mono and --stereo");
-                }
-                options.mono = Some(true);
-            }
-            "--stereo" => {
-                if matches!(options.mono, Some(true)) {
-                    bail!("__debug_record cannot use both --mono and --stereo");
-                }
-                options.mono = Some(false);
-            }
-            "--sample-rate-khz" => {
-                let value = args
-                    .get(index + 1)
-                    .context("missing value after __debug_record --sample-rate-khz")?;
-                let sample_rate_khz = value
-                    .parse::<u32>()
-                    .context("parsing __debug_record --sample-rate-khz value")?;
-                if sample_rate_khz == 0 {
-                    bail!("__debug_record --sample-rate-khz must be greater than 0");
-                }
-                options.sample_rate_khz = Some(sample_rate_khz);
-                index += 1;
-            }
-            value if !value.starts_with("--") && !saw_duration => {
-                options.seconds = value
-                    .parse::<u64>()
-                    .context("parsing __debug_record duration seconds")?
-                    .max(1);
-                saw_duration = true;
-            }
-            value => bail!("unsupported __debug_record argument: {value}"),
-        }
-        index += 1;
-    }
-
-    Ok(options)
-}
-
-fn run_debug_record(options: &DebugRecordOptions) -> Result<()> {
-    let config = AppConfig::load().context("loading AppConfig for __debug_record")?;
-    let recording = resolved_debug_recording_config(&config.recording, options)?;
-    if let Err(error) = logging::init_logging(&config) {
-        eprintln!(
-            "muninn logging warning: failed to initialize logging for __debug_record: {error:#}"
-        );
-    }
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("building tokio runtime for __debug_record")?;
-
-    runtime.block_on(async move {
-        let permissions = MacosPermissionsAdapter::new();
-        let recording_permissions =
-            refresh_recording_permissions_for_user_action(&permissions, RecordingStartSource::Tray)
-                .await
-                .context("refreshing permissions for __debug_record")?;
-        ensure_recording_can_start(recording_permissions.preflight, RecordingStartSource::Tray)?;
-
-        let mut recorder = MacosAudioRecorder::new(recording.clone());
-        recorder.warm_up().await.context("warming recorder")?;
-        recorder
-            .start_recording()
-            .await
-            .context("starting debug recording")?;
-        tokio::time::sleep(Duration::from_secs(options.seconds)).await;
-        let recorded = recorder
-            .stop_recording()
-            .await
-            .context("stopping debug recording")?;
-        let wav_bytes = fs::metadata(&recorded.wav_path)
-            .with_context(|| {
-                format!(
-                    "reading debug recording metadata {}",
-                    recorded.wav_path.display()
-                )
-            })?
-            .len();
-
-        println!("wav_path={}", recorded.wav_path.display());
-        println!("duration_ms={}", recorded.duration_ms);
-        println!("bytes={wav_bytes}");
-        println!("mono={}", recording.mono);
-        println!("sample_rate_hz={}", recording.sample_rate_hz());
-
-        Ok(())
-    })
-}
-
-fn resolved_debug_recording_config(
-    base: &RecordingConfig,
-    options: &DebugRecordOptions,
-) -> Result<RecordingConfig> {
-    let mut recording = base.clone();
-    if let Some(mono) = options.mono {
-        recording.mono = mono;
-    }
-    if let Some(sample_rate_khz) = options.sample_rate_khz {
-        recording.sample_rate_khz = sample_rate_khz;
-    }
-    recording
-        .validate()
-        .context("validating effective __debug_record recording config")?;
-    Ok(recording)
 }
 
 fn sync_os_autostart(config_path: &Path, config: &AppConfig) {
@@ -414,12 +256,10 @@ fn cleanup_stale_temp_recordings() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dotenv_path_for_dir, map_tray_event, parse_debug_record_options,
-        refresh_injection_permissions_for_user_action,
-        refresh_recording_permissions_for_user_action, resolved_debug_recording_config,
-        resolved_indicator_glyph, should_abort_injection, should_abort_recording_start,
-        should_load_dotenv, DebugRecordOptions, IndicatorGlyph, RecordingStartSource,
-        DEFAULT_INDICATOR_GLYPH,
+        dotenv_path_for_dir, map_tray_event, refresh_injection_permissions_for_user_action,
+        refresh_recording_permissions_for_user_action, resolved_indicator_glyph,
+        should_abort_injection, should_abort_recording_start, should_load_dotenv, IndicatorGlyph,
+        RecordingStartSource, DEFAULT_INDICATOR_GLYPH,
     };
     use crate::config_watch::{preview_context_key, read_config_fingerprint, ConfigFingerprint};
     use crate::runtime_pipeline::{
@@ -430,8 +270,7 @@ mod tests {
     use muninn::{
         AppEvent, IndicatorState, MockPermissionsAdapter, MuninnEnvelopeV1,
         PermissionPreflightStatus, PermissionStatus, PipelineOutcome, PipelinePolicyApplied,
-        PipelineStopReason, PipelineTraceEntry, RecordingConfig, ResolvedBuiltinStepConfig,
-        StepFailureKind,
+        PipelineStopReason, PipelineTraceEntry, ResolvedBuiltinStepConfig, StepFailureKind,
     };
     use serde_json::json;
     use std::fs;
@@ -465,76 +304,6 @@ mod tests {
 
     fn baseline_envelope() -> MuninnEnvelopeV1 {
         MuninnEnvelopeV1::new("utt-123", "2026-03-06T10:00:00Z")
-    }
-
-    #[test]
-    fn parse_debug_record_options_defaults_to_three_second_recording() {
-        let options =
-            parse_debug_record_options(&[]).expect("default debug record args should parse");
-
-        assert_eq!(
-            options,
-            DebugRecordOptions {
-                seconds: 3,
-                mono: None,
-                sample_rate_khz: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_debug_record_options_accepts_duration_and_recording_overrides() {
-        let args = vec![
-            "2".to_string(),
-            "--sample-rate-khz".to_string(),
-            "48".to_string(),
-            "--stereo".to_string(),
-        ];
-
-        let options =
-            parse_debug_record_options(&args).expect("debug record overrides should parse");
-
-        assert_eq!(
-            options,
-            DebugRecordOptions {
-                seconds: 2,
-                mono: Some(false),
-                sample_rate_khz: Some(48),
-            }
-        );
-    }
-
-    #[test]
-    fn parse_debug_record_options_rejects_conflicting_channel_flags() {
-        let args = vec!["--mono".to_string(), "--stereo".to_string()];
-
-        let error =
-            parse_debug_record_options(&args).expect_err("conflicting channel flags should fail");
-
-        assert!(error
-            .to_string()
-            .contains("cannot use both --mono and --stereo"));
-    }
-
-    #[test]
-    fn resolved_debug_recording_config_applies_requested_overrides() {
-        let recording = resolved_debug_recording_config(
-            &RecordingConfig::default(),
-            &DebugRecordOptions {
-                seconds: 3,
-                mono: Some(false),
-                sample_rate_khz: Some(48),
-            },
-        )
-        .expect("debug recording overrides should be valid");
-
-        assert_eq!(
-            recording,
-            RecordingConfig {
-                mono: false,
-                sample_rate_khz: 48,
-            }
-        );
     }
 
     #[test]

@@ -38,7 +38,7 @@
 - `25-runtime-compatibility-edges` (depends: `05-app-integration`, `08-current-runtime-surface`, `13-runtime-resilience`)
   - Smooth over legacy internal-tool aliases and brittle autostart path assumptions.
 - `26-runtime-troubleshooting-feedback` (depends: `08-current-runtime-surface`, `09-security-trust-boundaries`)
-  - Preserve the direct debug-record path and operator-visible missing-credentials feedback used for recording/provider triage.
+  - Preserve recorder diagnostics and operator-visible missing-credentials feedback used for recording/provider triage.
 - `27-contextual-profiles-and-voices` (depends: `08-current-runtime-surface`, `26-runtime-troubleshooting-feedback`)
   - Resolve per-utterance profiles and refine voices from frontmost app/window context so Muninn can adapt its pipeline to Codex, Terminal, Mail, and similar targets while previewing the selected voice in the tray glyph.
 - `28-runtime-structural-cleanup` (depends: `08-current-runtime-surface`, `19-inprocess-internal-steps`, `27-contextual-profiles-and-voices`)

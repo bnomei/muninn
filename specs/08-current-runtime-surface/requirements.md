@@ -8,12 +8,12 @@ Specs `00` through `07` describe the incremental buildout history. They remain u
 
 ## EARS requirements
 1. The repository shall expose Cargo package `muninn-speach-to-text`, library target `muninn`, and binary target `muninn`.
-2. When the `muninn` binary starts without an internal-step or debug-record subcommand, the system shall attempt to load `./.env` from the current working directory unless disabled, resolve the config path, load or create the config file, validate it, and bootstrap the tray runtime.
+2. When the `muninn` binary starts without an internal-step subcommand, the system shall attempt to load `./.env` from the current working directory unless disabled, resolve the config path, load or create the config file, validate it, and bootstrap the tray runtime.
 3. When the app resolves the config path, the system shall use `MUNINN_CONFIG -> $XDG_CONFIG_HOME/muninn/config.toml -> ~/.config/muninn/config.toml`.
 4. When the resolved config file does not exist, the system shall write a launchable default config before continuing startup.
 5. If the app starts on a non-macOS platform, then the system shall fail startup with a platform error instead of running the tray runtime.
 6. When the binary receives `__internal_step stt_openai`, `__internal_step stt_google`, or `__internal_step refine`, the system shall run the matching internal tool contract and exit without starting the tray runtime.
-7. When the binary receives `__debug_record [seconds]`, the system shall load config, refresh recording permissions, capture one WAV using the configured recording settings, print recording metadata, and exit without starting the tray runtime.
+7. When recording debug logging is enabled, the system shall emit recorder diagnostics that identify the selected input device, capture/output settings, capture-engine rebuilds after default-input changes, and whether zero samples were captured.
 8. When the app is idle and receives push-to-talk press, the system shall enter push-to-talk recording; when it later receives push-to-talk release, the system shall stop recording and enter processing.
 9. When the app is idle and receives done-mode toggle press, the system shall enter done-mode recording; when it later receives done-mode toggle press again, the system shall stop recording and enter processing.
 10. When the app is recording and receives cancel, the system shall cancel the recording, show the cancelled indicator briefly, and return to idle.

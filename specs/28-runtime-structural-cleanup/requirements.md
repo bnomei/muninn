@@ -5,7 +5,7 @@ Modularize Muninn’s runtime so contextual profiles, provider routing, and late
 
 ## EARS requirements
 1. When the runtime-structural-cleanup refactor is implemented, the system shall preserve the current tray-runtime behavior and CLI entry points except for intentional changes introduced by dependent feature specs.
-2. When the binary starts, the system shall keep `muninn`, `__internal_step`, and `__debug_record` entry points working with the same user-visible semantics.
+2. When the binary starts, the system shall keep `muninn` and `__internal_step` entry points working with the same user-visible semantics.
 3. When runtime orchestration is refactored, the system shall extract bootstrap, config watching, worker-loop handling, processing/injection flow, and replay dispatch into dedicated modules outside `main.rs`.
 4. When runtime orchestration is refactored, the system shall expose a testable coordinator seam so runtime-flow tests can exercise the real coordinator logic with mock adapters.
 5. When per-utterance execution is prepared, the system shall derive explicit resolved-config domain structs instead of passing the full `AppConfig` into built-in step handlers by default.

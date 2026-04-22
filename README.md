@@ -416,7 +416,6 @@ This profile now skips the local-first defaults while other profiles continue in
 ## Replay And Debugging
 
 - tracing logs go to stderr and are controlled with `RUST_LOG`
-- `muninn __debug_record [seconds] [--sample-rate-khz N] [--mono|--stereo]` captures one WAV through the real recorder path, prints recording metadata, and exits without starting the tray runtime
 - `RUST_LOG=recording=debug` now logs `capture_device_name` and records when Muninn rebuilds its cached capture engine after the macOS default input device changes
 - replay logging is optional and writes per-utterance artifacts to `replay_dir`
 - `replay_retain_audio = true` keeps an `audio.*` artifact when possible by trying a hard link before copying

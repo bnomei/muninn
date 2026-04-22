@@ -69,4 +69,4 @@ Meta:
   - Validation:
     - manual audit against `src/main.rs`, `src/internal_tools.rs`, `src/runner.rs`, `src/replay.rs`, `src/stt_openai_tool.rs`, `src/stt_google_tool.rs`, `src/refine.rs`, and `src/audio.rs`
   - Notes:
-    - This sync pass folds in the new `__debug_record` path, missing-credentials feedback, metadata-aware config watching, link-first replay audio retention, in-process built-ins, and active scoring application.
+    - This sync pass folds in recording diagnostics, missing-credentials feedback, metadata-aware config watching, link-first replay audio retention, in-process built-ins, and active scoring application.

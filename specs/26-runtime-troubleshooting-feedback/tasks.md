@@ -26,11 +26,11 @@ Meta:
 
 ## Done
 
-- [x] T001: Spec the implemented debug-record and missing-credentials feedback paths (owner: mayor) (scope: specs/26-runtime-troubleshooting-feedback/,specs/index.md,specs/_handoff.md) (depends: spec:08-current-runtime-surface,spec:09-security-trust-boundaries)
+- [x] T001: Spec the implemented recording-diagnostics and missing-credentials feedback paths (owner: mayor) (scope: specs/26-runtime-troubleshooting-feedback/,specs/index.md,specs/_handoff.md) (depends: spec:08-current-runtime-surface,spec:09-security-trust-boundaries)
   - Started_at: 2026-03-06T10:02:00Z
   - Finished_at: 2026-03-06T10:15:08Z
   - DoD:
-    - requirements capture the implemented `__debug_record` and missing-credentials feedback behavior
+    - requirements capture the implemented recording-diagnostics and missing-credentials feedback behavior
     - design explains the runtime detection and indicator path
     - spec index and handoff mention the new troubleshooting-feedback spec
   - Validation:

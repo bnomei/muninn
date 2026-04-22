@@ -102,7 +102,7 @@ The exact implementation can vary, but logging should stop being ad hoc `eprintl
 ### 7. Preserve runtime behavior while changing internals
 This refactor must explicitly preserve:
 
-- current `__internal_step` and `__debug_record` behavior
+- current `__internal_step` behavior
 - replay sanitization and pruning behavior
 - hotkey backpressure/drop handling
 - config reload semantics, including hotkey-restart warnings

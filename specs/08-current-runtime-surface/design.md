@@ -26,9 +26,8 @@ The older specs still refer to a multi-crate workspace (`muninn-types`, `muninn-
 
 1. Attempt to load `./.env` from the current working directory unless `MUNINN_LOAD_DOTENV` disables it.
 2. Parse argv.
-3. If argv is `__debug_record [seconds]`, run the one-shot recording debug path and exit.
-4. If argv is `__internal_step <tool>`, run the matching CLI tool contract and exit.
-5. Otherwise resolve config, initialize logging, clean stale temp recordings, sync autostart, and bootstrap the Tao tray runtime.
+3. If argv is `__internal_step <tool>`, run the matching CLI tool contract and exit.
+4. Otherwise resolve config, initialize logging, clean stale temp recordings, sync autostart, and bootstrap the Tao tray runtime.
 
 Normal tray startup then:
 
@@ -275,15 +274,11 @@ Replay persistence is best-effort:
 
 ## Troubleshooting aids
 
-- `muninn __debug_record [seconds]` records one WAV without hotkeys or providers and prints:
-  - `wav_path`
-  - `duration_ms`
-  - `bytes`
-  - `mono`
-  - `sample_rate_hz`
 - debug logging now reports:
+  - selected CPAL input device name
   - selected capture/output config on recorder start
   - capture-engine selection details on warm-up/init
+  - capture-engine rebuilds after default input device changes
   - zero-sample finalization warnings
   - `.env` load or miss events for the current working directory
 

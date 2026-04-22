@@ -7,7 +7,6 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - Added `capture_device_name` recorder diagnostics so `RUST_LOG=recording=debug` shows which CPAL input device Muninn opens during engine initialization, recording start, and recording finalization.
-- Extended `muninn __debug_record` with temporary `--sample-rate-khz`, `--mono`, and `--stereo` overrides for isolated recorder probes without editing the main config.
 
 ### Changed
 

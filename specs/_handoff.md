@@ -30,7 +30,7 @@ Last updated: 2026-03-17T00:00:00Z
 - Specs `18` through `25` capture the second hotspot follow-up pass that addressed the remaining runtime/product rough edges from that audit.
 - Specs `18` through `25` are now implemented and validated with `cargo test -q`.
 - `08-current-runtime-surface` and `09-security-trust-boundaries` were re-synced on 2026-03-06 after runtime changes to dotenv loading, in-process built-ins, scoring, replay audio retention, and missing-credentials feedback.
-- `26-runtime-troubleshooting-feedback` captures the implemented `__debug_record` path plus missing-credentials tray feedback and has no open tasks.
+- `26-runtime-troubleshooting-feedback` captures the implemented recording-diagnostics path plus missing-credentials tray feedback and has no open tasks.
 - `27-contextual-profiles-and-voices` is newly authored and is the next user-facing feature program.
 - `28-runtime-structural-cleanup` is newly authored as the follow-on cleanup program and should start after the contextual-profile seams are in place.
 - `29` through `33` are newly authored from the merged ideas roadmap in `docs/ideas.md`.
