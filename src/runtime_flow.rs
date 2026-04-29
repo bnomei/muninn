@@ -213,6 +213,7 @@ where
         let recorded = match self.recorder.stop_recording().await {
             Ok(recorded) => recorded,
             Err(error) => {
+                self.state = AppState::Idle;
                 if let Err(reset_error) = self.indicator.set_state(IndicatorState::Idle).await {
                     warn!(
                         target: TARGET_RUNTIME,
@@ -346,5 +347,55 @@ mod tests {
             ]
         );
         assert!(error.to_string().contains("boom"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_returns_to_idle_when_recording_stop_fails() {
+        let indicator = MockIndicatorAdapter::new();
+        let recorder = MockAudioRecorder::new();
+        recorder.enqueue_stop_result(Err(MacosAdapterError::operation_failed(
+            "stop_recording",
+            "recording exceeded max buffered duration (180s)",
+        )));
+        let injector = MockTextInjector::new();
+        let mut coordinator =
+            RuntimeFlowCoordinator::new(indicator.clone(), recorder.clone(), injector);
+
+        coordinator
+            .initialize()
+            .await
+            .expect("initialize should work");
+        coordinator
+            .start_push_to_talk(Some('T'))
+            .await
+            .expect("start should work");
+        let error = coordinator
+            .finish_push_to_talk_for_processing(IndicatorState::Transcribing, Some('T'))
+            .await
+            .expect_err("stop failure should surface");
+
+        assert_eq!(coordinator.state(), AppState::Idle);
+        assert!(!recorder.is_active());
+        assert!(error.to_string().contains("recording exceeded"));
+        assert_eq!(
+            indicator.state_history(),
+            vec![
+                IndicatorState::Recording {
+                    mode: RecordingMode::PushToTalk
+                },
+                IndicatorState::Transcribing,
+                IndicatorState::Idle,
+            ]
+        );
+
+        coordinator
+            .start_push_to_talk(Some('T'))
+            .await
+            .expect("next start should work after failed stop");
+        assert_eq!(
+            coordinator.state(),
+            AppState::RecordingPushToTalk,
+            "failed stop must not leave runtime stuck in recording state"
+        );
     }
 }

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-04-29
+
+### Fixed
+
+- Long recordings that exceed the 180-second buffer cap now continue with the capped audio instead of failing before transcription and leaving the runtime worker stopped.
+
 ## [0.3.0] - 2026-04-22
 
 ### Added

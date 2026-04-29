@@ -386,7 +386,12 @@ where
                                     "failed to reset indicator after recording stop failure"
                                 );
                             }
-                            return Err(error).context("stopping recording");
+                            warn!(
+                                target: logging::TARGET_RECORDING,
+                                error = %error,
+                                "discarded recording after stop failure"
+                            );
+                            continue;
                         }
                     };
                     debug!(

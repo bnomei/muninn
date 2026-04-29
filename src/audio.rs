@@ -191,16 +191,6 @@ impl AudioRecorder for MacosAudioRecorder {
                 )
             })?;
 
-            if overflowed {
-                return Err(MacosAdapterError::operation_failed(
-                    "stop_recording",
-                    format!(
-                        "recording exceeded max buffered duration ({}s)",
-                        MAX_BUFFERED_RECORDING_SECS
-                    ),
-                ));
-            }
-
             let elapsed_ms = started_at.elapsed().as_millis() as u64;
             if samples.is_empty() {
                 tracing::warn!(
@@ -222,6 +212,28 @@ impl AudioRecorder for MacosAudioRecorder {
             let wav_bytes = std::fs::metadata(&wav_path)
                 .map(|metadata| metadata.len())
                 .unwrap_or_default();
+            let duration_ms = if overflowed {
+                buffered_duration_ms(samples.len(), engine.sample_rate, engine.channels)
+            } else {
+                elapsed_ms
+            };
+            if overflowed {
+                tracing::warn!(
+                    target: TARGET_RECORDING,
+                    capture_device_name = %engine.device_name,
+                    wav_path = %wav_path.display(),
+                    wav_bytes,
+                    buffered_samples = samples.len(),
+                    capture_sample_rate_hz = engine.sample_rate,
+                    capture_channels = engine.channels,
+                    output_sample_rate_hz = self.output_config.sample_rate_hz(),
+                    output_mono = self.output_config.mono,
+                    elapsed_ms,
+                    duration_ms,
+                    max_buffered_recording_secs = MAX_BUFFERED_RECORDING_SECS,
+                    "recording exceeded max buffered duration; using capped audio"
+                );
+            }
             tracing::debug!(
                 target: TARGET_RECORDING,
                 capture_device_name = %engine.device_name,
@@ -233,10 +245,12 @@ impl AudioRecorder for MacosAudioRecorder {
                 output_sample_rate_hz = self.output_config.sample_rate_hz(),
                 output_mono = self.output_config.mono,
                 elapsed_ms,
+                duration_ms,
+                clipped = overflowed,
                 "audio recording finalized"
             );
 
-            Ok(RecordedAudio::new(wav_path, elapsed_ms))
+            Ok(RecordedAudio::new(wav_path, duration_ms))
         }
 
         #[cfg(not(target_os = "macos"))]
@@ -625,6 +639,16 @@ fn max_buffered_samples(sample_rate: u32, channels: u16) -> usize {
 }
 
 #[cfg(any(target_os = "macos", test))]
+fn buffered_duration_ms(sample_count: usize, sample_rate: u32, channels: u16) -> u64 {
+    let samples_per_second = sample_rate as u64 * channels as u64;
+    if samples_per_second == 0 {
+        return 0;
+    }
+
+    sample_count as u64 * 1_000 / samples_per_second
+}
+
+#[cfg(any(target_os = "macos", test))]
 fn preferred_capture_choice(
     default_choice: CaptureConfigChoice,
     available_choices: &[CaptureConfigChoice],
@@ -897,8 +921,8 @@ mod tests {
     use crate::config::RecordingConfig;
 
     use super::{
-        append_capped_samples, capture_engine_rebuild_reason, collect_output_samples,
-        max_buffered_samples, normalized_f32_to_pcm_i16, output_wav_spec,
+        append_capped_samples, buffered_duration_ms, capture_engine_rebuild_reason,
+        collect_output_samples, max_buffered_samples, normalized_f32_to_pcm_i16, output_wav_spec,
         pcm_i16_to_normalized_f32, preferred_capture_choice, CaptureBuffer, CaptureConfigChoice,
         CaptureSampleFormat,
     };
@@ -957,6 +981,13 @@ mod tests {
     fn max_buffered_samples_scales_with_sample_rate_and_channels() {
         assert_eq!(max_buffered_samples(16_000, 1), 2_880_000);
         assert_eq!(max_buffered_samples(48_000, 2), 17_280_000);
+    }
+
+    #[test]
+    fn buffered_duration_ms_uses_captured_sample_count() {
+        assert_eq!(buffered_duration_ms(2_880_000, 16_000, 1), 180_000);
+        assert_eq!(buffered_duration_ms(17_280_000, 48_000, 2), 180_000);
+        assert_eq!(buffered_duration_ms(8_000, 16_000, 1), 500);
     }
 
     #[test]
