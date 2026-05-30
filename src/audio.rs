@@ -385,8 +385,8 @@ fn current_default_input_device_name() -> Option<String> {
 
     cpal::default_host()
         .default_input_device()
-        .and_then(|device| match device.name() {
-            Ok(name) => Some(name),
+        .and_then(|device| match device.description() {
+            Ok(description) => Some(description.name().to_string()),
             Err(error) => {
                 tracing::warn!(
                     target: TARGET_RECORDING,
@@ -407,7 +407,8 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
         MacosAdapterError::operation_failed("audio_engine", "no default input device available")
     })?;
     let device_name = device
-        .name()
+        .description()
+        .map(|description| description.name().to_string())
         .unwrap_or_else(|error| format!("<unknown input device: {error}>"));
     let default_supported_config = device.default_input_config().map_err(|error| {
         MacosAdapterError::operation_failed(
@@ -420,7 +421,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
     let selection = capture_choice_from_supported(&supported_config)?;
     let config = supported_config.config();
     let capture = Arc::new(Mutex::new(CaptureBuffer::default()));
-    let sample_budget = max_buffered_samples(config.sample_rate.0, config.channels);
+    let sample_budget = max_buffered_samples(config.sample_rate, config.channels);
     let error_callback = |error| {
         tracing::error!(
             target: TARGET_RECORDING,
@@ -457,7 +458,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
         target: TARGET_RECORDING,
         capture_device_name = %device_name,
         capture_sample_format = ?selection.sample_format,
-        capture_sample_rate_hz = config.sample_rate.0,
+        capture_sample_rate_hz = config.sample_rate,
         capture_channels = config.channels,
         requested_output_sample_rate_hz = output_config.sample_rate_hz(),
         requested_output_mono = output_config.mono,
@@ -469,7 +470,7 @@ fn build_capture_engine(output_config: &RecordingConfig) -> MacosAdapterResult<C
         stream,
         capture,
         device_name,
-        sample_rate: config.sample_rate.0,
+        sample_rate: config.sample_rate,
         channels: config.channels,
         requested_output_config: output_config.clone(),
     })
@@ -496,14 +497,14 @@ fn select_supported_capture_config(
             continue;
         };
         let Some(config) =
-            range.try_with_sample_rate(cpal::SampleRate(output_config.sample_rate_hz()))
+            range.try_with_sample_rate(output_config.sample_rate_hz())
         else {
             continue;
         };
         supported.push((
             CaptureConfigChoice {
                 sample_format,
-                sample_rate: config.sample_rate().0,
+                sample_rate: config.sample_rate(),
                 channels: config.channels(),
             },
             config,
@@ -526,7 +527,7 @@ fn capture_choice_from_supported(
 ) -> MacosAdapterResult<CaptureConfigChoice> {
     Ok(CaptureConfigChoice {
         sample_format: capture_sample_format_from_cpal(config.sample_format())?,
-        sample_rate: config.sample_rate().0,
+        sample_rate: config.sample_rate(),
         channels: config.channels(),
     })
 }
