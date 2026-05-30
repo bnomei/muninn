@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-05-30
+
+### Added
+
+- Added an `[external_control]` surface that lets other agents start, stop, toggle, or cancel recording without a human hotkey. Two transports converge on the same action vocabulary:
+  - A macOS `muninn://` custom URL scheme (`record`/`start`, `stop`/`done`, `toggle`, `cancel`/`abort`), handled by the packaged `.app` that registers the scheme. Controlled by `url_scheme_enabled` (default `true`).
+  - A localhost streamable-HTTP MCP server exposing `start_recording`, `stop_recording`, and `cancel_recording` tools. Controlled by `mcp_enabled` (default `false`) and `mcp_bind_address` (default `127.0.0.1:2769`).
+- Externally triggered recordings are attributed to `source = "external"` in runtime logs, and `cancel` discards the active recording without running the pipeline.
+
+### Changed
+
+- Clicking the menu bar tray icon now toggles recording (start when idle, stop the active recording otherwise) instead of acting as a momentary push-to-talk button. The toggle is resolved against the current runtime state, so a click reliably stops a recording regardless of how it was started.
+
+### Security
+
+- The MCP server has no authentication and relies on a loopback-only bind. Muninn now logs a startup warning when `mcp_bind_address` resolves to a non-loopback address (for example `0.0.0.0` or a LAN IP).
+
 ## [0.3.1] - 2026-04-29
 
 ### Fixed

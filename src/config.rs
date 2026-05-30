@@ -28,6 +28,7 @@ pub struct AppConfig {
     pub transcript: TranscriptConfig,
     pub refine: RefineConfig,
     pub logging: LoggingConfig,
+    pub external_control: ExternalControlConfig,
     pub providers: ProvidersConfig,
     #[serde(default)]
     pub voices: BTreeMap<String, VoiceConfig>,
@@ -241,6 +242,7 @@ impl AppConfig {
             transcript,
             refine,
             logging,
+            external_control: self.external_control.clone(),
             providers,
             voices: if replay_snapshot_enabled {
                 self.voices.clone()
@@ -287,6 +289,29 @@ impl Default for AppSettings {
             profile: "default".to_string(),
             strict_step_contract: true,
             autostart: false,
+        }
+    }
+}
+
+/// Controls external automation surfaces that let other agents start/stop
+/// recording without a human pressing a hotkey.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ExternalControlConfig {
+    /// Register and handle the `muninn://` custom URL scheme (macOS bundled app only).
+    pub url_scheme_enabled: bool,
+    /// Run a localhost streamable-HTTP MCP server exposing recording-control tools.
+    pub mcp_enabled: bool,
+    /// Socket address the MCP server binds to when enabled.
+    pub mcp_bind_address: String,
+}
+
+impl Default for ExternalControlConfig {
+    fn default() -> Self {
+        Self {
+            url_scheme_enabled: true,
+            mcp_enabled: false,
+            mcp_bind_address: "127.0.0.1:2769".to_string(),
         }
     }
 }

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 mod autostart;
 mod config_watch;
+mod external_control;
 mod internal_tools;
 mod logging;
 mod refine;
@@ -262,15 +263,16 @@ mod tests {
         RecordingStartSource, DEFAULT_INDICATOR_GLYPH,
     };
     use crate::config_watch::{preview_context_key, read_config_fingerprint, ConfigFingerprint};
+    use crate::external_control::ExternalControlAction;
     use crate::runtime_pipeline::{
         apply_live_config_reload, build_pipeline_runner, resolve_pipeline_config,
         should_show_missing_credentials_feedback,
     };
     use muninn::config::{OnErrorPolicy, PipelineStepConfig, StepIoMode};
     use muninn::{
-        AppEvent, IndicatorState, MockPermissionsAdapter, MuninnEnvelopeV1,
-        PermissionPreflightStatus, PermissionStatus, PipelineOutcome, PipelinePolicyApplied,
-        PipelineStopReason, PipelineTraceEntry, ResolvedBuiltinStepConfig, StepFailureKind,
+        IndicatorState, MockPermissionsAdapter, MuninnEnvelopeV1, PermissionPreflightStatus,
+        PermissionStatus, PipelineOutcome, PipelinePolicyApplied, PipelineStopReason,
+        PipelineTraceEntry, ResolvedBuiltinStepConfig, StepFailureKind,
     };
     use serde_json::json;
     use std::fs;
@@ -350,18 +352,18 @@ mod tests {
     }
 
     #[test]
-    fn tray_left_mouse_down_maps_to_ptt_pressed() {
+    fn tray_left_mouse_down_is_ignored() {
         assert_eq!(
             map_tray_event(&left_tray_click(MouseButtonState::Down)),
-            Some(AppEvent::PttPressed)
+            None
         );
     }
 
     #[test]
-    fn tray_left_mouse_up_maps_to_ptt_released() {
+    fn tray_left_mouse_up_toggles_recording() {
         assert_eq!(
             map_tray_event(&left_tray_click(MouseButtonState::Up)),
-            Some(AppEvent::PttReleased)
+            Some(ExternalControlAction::Toggle)
         );
     }
 

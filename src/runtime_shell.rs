@@ -64,6 +64,15 @@ impl AppRuntime {
         let proxy = event_loop.create_proxy();
         install_tray_event_bridge(proxy.clone());
 
+        // Register the muninn:// URL scheme handler before the event loop runs.
+        // macOS delivers the launch GetURL Apple Event during
+        // applicationWillFinishLaunching, earlier than StartCause::Init, so the
+        // observer set up here must already be in place to catch cold-launch URLs.
+        #[cfg(target_os = "macos")]
+        if self.config.external_control.url_scheme_enabled {
+            crate::external_control::install_url_scheme_handler(proxy.clone());
+        }
+
         let profile = self.config.app.profile.clone();
         let platform = self.platform;
         let strict_step_contract = self.config.app.strict_step_contract;
@@ -120,34 +129,41 @@ impl AppRuntime {
                     );
                     config_watch::spawn_config_watcher(config_path.clone(), proxy.clone());
                     config_watch::spawn_preview_context_watcher(proxy.clone());
+
+                    if current_config.external_control.mcp_enabled {
+                        crate::external_control::spawn_mcp_server(
+                            proxy.clone(),
+                            current_config.external_control.mcp_bind_address.clone(),
+                        );
+                    }
                 }
                 Event::UserEvent(UserEvent::TrayEvent(event)) => {
-                    if let Some(app_event) = map_tray_event(&event) {
-                        match runtime_event_tx.try_send(RuntimeMessage::AppEvent(app_event)) {
+                    if let Some(action) = map_tray_event(&event) {
+                        match runtime_event_tx.try_send(RuntimeMessage::TrayControl(action)) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(
-                                RuntimeMessage::AppEvent(app_event),
+                                RuntimeMessage::TrayControl(action),
                             )) => {
                                 warn!(
                                     target: logging::TARGET_HOTKEY,
-                                    ?app_event,
+                                    ?action,
                                     "dropped tray interaction while runtime queue was full"
                                 );
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Closed(
-                                RuntimeMessage::AppEvent(app_event),
+                                RuntimeMessage::TrayControl(action),
                             )) => {
                                 warn!(
                                     target: logging::TARGET_RUNTIME,
-                                    ?app_event,
+                                    ?action,
                                     "dropped tray interaction because runtime worker channel closed"
                                 );
                             }
                             Err(tokio::sync::mpsc::error::TrySendError::Full(
-                                RuntimeMessage::ReloadConfig(_),
+                                RuntimeMessage::ReloadConfig(_) | RuntimeMessage::ExternalControl(_),
                             ))
                             | Err(tokio::sync::mpsc::error::TrySendError::Closed(
-                                RuntimeMessage::ReloadConfig(_),
+                                RuntimeMessage::ReloadConfig(_) | RuntimeMessage::ExternalControl(_),
                             )) => {
                                 warn!(
                                     target: logging::TARGET_RUNTIME,
@@ -234,7 +250,7 @@ impl AppRuntime {
                             );
                         }
                         Err(tokio::sync::mpsc::error::TrySendError::Full(
-                            RuntimeMessage::AppEvent(_),
+                            RuntimeMessage::TrayControl(_) | RuntimeMessage::ExternalControl(_),
                         )) => {
                             warn!(
                                 target: logging::TARGET_CONFIG,
@@ -269,6 +285,25 @@ impl AppRuntime {
                             preview_selection.voice_glyph,
                             &indicator_config,
                         );
+                    }
+                }
+                Event::UserEvent(UserEvent::ExternalControl(action)) => {
+                    match runtime_event_tx.try_send(RuntimeMessage::ExternalControl(action)) {
+                        Ok(()) => {}
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            warn!(
+                                target: logging::TARGET_RUNTIME,
+                                ?action,
+                                "dropped external control request while runtime queue was full"
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(
+                                target: logging::TARGET_RUNTIME,
+                                ?action,
+                                "dropped external control request because runtime worker channel closed"
+                            );
+                        }
                     }
                 }
                 _ => {}

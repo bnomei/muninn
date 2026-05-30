@@ -13,13 +13,15 @@ use muninn::{
 use tao::event_loop::EventLoopProxy;
 use tracing::{debug, error, info, warn};
 
+use crate::external_control::ExternalControlAction;
 use crate::runtime_tray::{send_user_event, EventLoopIndicator, UserEvent};
 use crate::{logging, runtime_pipeline, HOTKEY_RECOVERY_DELAY, OUTPUT_INDICATOR_MIN_DURATION};
 
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeMessage {
-    AppEvent(AppEvent),
+    TrayControl(ExternalControlAction),
     ReloadConfig(Box<AppConfig>),
+    ExternalControl(ExternalControlAction),
 }
 
 pub(crate) fn spawn_runtime_worker(
@@ -171,7 +173,10 @@ where
                 }
                 maybe_event = runtime_events.recv() => {
                     match maybe_event {
-                        Some(RuntimeMessage::AppEvent(app_event)) => {
+                        Some(RuntimeMessage::TrayControl(action)) => {
+                            let Some(app_event) = action.to_app_event(coordinator.state()) else {
+                                continue;
+                            };
                             (app_event, RecordingStartSource::Tray)
                         }
                         Some(RuntimeMessage::ReloadConfig(new_config)) => {
@@ -196,6 +201,12 @@ where
                                     .set_recording_config(self.config.recording.clone());
                             }
                             continue;
+                        }
+                        Some(RuntimeMessage::ExternalControl(action)) => {
+                            let Some(app_event) = action.to_app_event(coordinator.state()) else {
+                                continue;
+                            };
+                            (app_event, RecordingStartSource::External)
                         }
                         None => return Err(anyhow!("runtime event channel closed")),
                     }
@@ -521,12 +532,14 @@ pub(crate) struct RecordingPermissionRefresh {
 pub(crate) enum RecordingStartSource {
     Hotkey,
     Tray,
+    External,
 }
 
 fn recording_source_name(source: RecordingStartSource) -> &'static str {
     match source {
         RecordingStartSource::Hotkey => "hotkey",
         RecordingStartSource::Tray => "tray",
+        RecordingStartSource::External => "external",
     }
 }
 
@@ -651,7 +664,9 @@ fn log_recording_start_block(
 ) {
     let missing = match source {
         RecordingStartSource::Hotkey => preflight.missing_for_recording(),
-        RecordingStartSource::Tray => preflight.missing_for_tray_recording(),
+        RecordingStartSource::Tray | RecordingStartSource::External => {
+            preflight.missing_for_tray_recording()
+        }
     };
 
     if matches!(source, RecordingStartSource::Hotkey)
@@ -757,7 +772,9 @@ fn drain_busy_input_backlog(
     let mut latest_config = None;
     loop {
         match runtime_events.try_recv() {
-            Ok(RuntimeMessage::AppEvent(_)) => dropped_runtime_events += 1,
+            Ok(RuntimeMessage::TrayControl(_) | RuntimeMessage::ExternalControl(_)) => {
+                dropped_runtime_events += 1
+            }
             Ok(RuntimeMessage::ReloadConfig(config)) => latest_config = Some(config),
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -806,7 +823,7 @@ pub(crate) fn ensure_recording_can_start(
                 .ensure_recording_allowed()
                 .map_err(|error| anyhow!(error))
         }
-        RecordingStartSource::Tray => preflight
+        RecordingStartSource::Tray | RecordingStartSource::External => preflight
             .ensure_tray_recording_allowed()
             .map_err(|error| anyhow!(error)),
     }

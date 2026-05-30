@@ -36,6 +36,7 @@ The current app supports:
 - microphone recording to a temp WAV with configurable mono output and sample rate
 - ordered transcription-provider routing plus built-in refine and external pipeline steps
 - keyboard-event text injection into the current app
+- external control for other agents via a `muninn://` URL scheme and an optional localhost MCP server
 - stderr tracing logs plus optional replay artifacts per utterance
 
 ## Pipeline-First By Design
@@ -225,6 +226,64 @@ Tray behavior follows the resolved voice:
 - idle preview shows the glyph for the currently matched voice; when no app rule matches, the tray falls back to `M` even though `app.profile` still applies
 - recording and processing freeze the resolved glyph for that utterance even if the frontmost app changes
 - `?` remains reserved for missing-credentials feedback and overrides any voice glyph
+- a left click on the tray icon toggles recording: it starts when idle and stops the active recording otherwise
+
+## External Control (Agents & Automation)
+
+Muninn can be driven by other agents and scripts, not just by a human pressing a hotkey or clicking the tray. Two transports converge on the same recording-control vocabulary and feed the same state machine the tray and hotkeys use, so an external `start` behaves exactly like a manual one. Externally triggered recordings are attributed to `source = "external"` in the runtime logs.
+
+Configure it under `[external_control]`:
+
+```toml
+[external_control]
+# Handle muninn:// links; only effective for the packaged macOS .app.
+url_scheme_enabled = true
+# Run a localhost MCP server exposing recording-control tools.
+mcp_enabled = false
+mcp_bind_address = "127.0.0.1:2769"
+```
+
+Action semantics, shared by both transports:
+- `start` begins recording and is a no-op unless Muninn is idle.
+- `stop` finishes the active recording and runs the transcription pipeline; no-op when idle.
+- `toggle` starts when idle, otherwise stops the active recording.
+- `cancel` discards the active recording without running the pipeline or injecting text.
+
+Recording does not stop on its own. An agent typically calls `start`, and a human ends it with the hotkey, a tray click, or an explicit `stop`/`cancel`.
+
+### `muninn://` URL scheme
+
+When `url_scheme_enabled = true`, the packaged `.app` registers the `muninn://` scheme and handles these verbs (case-insensitive; authority and path forms both work):
+
+| URL | Action |
+| --- | --- |
+| `muninn://record`, `muninn://start` | start |
+| `muninn://stop`, `muninn://done` | stop |
+| `muninn://toggle` | toggle |
+| `muninn://cancel`, `muninn://abort` | cancel |
+
+```bash
+open "muninn://record"
+```
+
+The scheme only works for the installed `.app` bundle that registers it through `CFBundleURLTypes`; a binary launched with `cargo run` will not receive these links.
+
+### MCP server
+
+When `mcp_enabled = true`, Muninn runs a streamable-HTTP [MCP](https://modelcontextprotocol.io) server at `http://<mcp_bind_address>/mcp` (default `http://127.0.0.1:2769/mcp`) exposing three tools: `start_recording`, `stop_recording`, and `cancel_recording`. (The `muninn://toggle` URL verb has no MCP equivalent — agents should use the explicit start/stop tools.)
+
+Register it with an MCP-aware client, for example the Augment CLI:
+
+```bash
+auggie mcp add muninn --transport http --url http://127.0.0.1:2769/mcp
+```
+
+- The server starts only at app launch. Toggling `mcp_enabled` later requires restarting Muninn; it is not started or stopped by live config reload.
+- The endpoint only resolves while Muninn is running.
+
+### Security
+
+The MCP server has no authentication and relies entirely on a loopback-only bind. Keep `mcp_bind_address` on `127.0.0.1` so only this machine can control recording. Binding to `0.0.0.0` or a LAN IP exposes recording control to any host that can reach the address; Muninn logs a startup warning when the bind address is non-loopback.
 
 ## Quick Start
 
@@ -429,6 +488,7 @@ This profile now skips the local-first defaults while other profiles continue in
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.
 - Provider-backed transcription needs realistic timeout budgets.
+- The external-control MCP server is disabled by default, has no authentication, binds loopback-only, and only starts or stops when the app launches (not on live config reload).
 
 ## Benchmarking
 

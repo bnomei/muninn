@@ -5,12 +5,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use muninn::config::IndicatorConfig;
 use muninn::{
-    AppConfig, AppEvent, IndicatorAdapter, IndicatorState, RecordingMode, TargetContextSnapshot,
+    AppConfig, IndicatorAdapter, IndicatorState, RecordingMode, TargetContextSnapshot,
 };
 use tao::event_loop::EventLoopProxy;
 use tracing::warn;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
+use crate::external_control::ExternalControlAction;
 use crate::logging;
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,7 @@ pub(crate) enum UserEvent {
     ConfigReloadFailed(String),
     RetryPendingConfigReload,
     RuntimeFailure(String),
+    ExternalControl(ExternalControlAction),
 }
 
 pub(crate) fn install_tray_event_bridge(proxy: EventLoopProxy<UserEvent>) {
@@ -79,18 +81,19 @@ pub(crate) fn update_tray_appearance(
     tray_icon.set_title(None::<&str>);
 }
 
-pub(crate) fn map_tray_event(event: &TrayIconEvent) -> Option<AppEvent> {
+/// Map a completed left click on the tray icon to a recording toggle.
+///
+/// Acting on the button release (a full click) makes the tray a toggle: it
+/// starts recording when idle and stops the active recording otherwise. The
+/// toggle is resolved against the authoritative runtime state by the runtime
+/// worker, so a click reliably stops a recording no matter how it was started.
+pub(crate) fn map_tray_event(event: &TrayIconEvent) -> Option<ExternalControlAction> {
     match event {
-        TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Down,
-            ..
-        } => Some(AppEvent::PttPressed),
         TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
             ..
-        } => Some(AppEvent::PttReleased),
+        } => Some(ExternalControlAction::Toggle),
         _ => None,
     }
 }

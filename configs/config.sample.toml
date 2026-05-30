@@ -173,6 +173,19 @@ max_new_word_count = 2
 # If no rule matches, Muninn falls back to app.profile for behavior, but the idle
 # tray glyph still falls back to the default M until a rule matches.
 
+[external_control]
+# Let other agents start/stop recording without a human pressing a hotkey.
+# url_scheme_enabled handles muninn:// links (record/start/stop/toggle/cancel) and
+# only takes effect for the packaged macOS .app that registers the scheme.
+url_scheme_enabled = true
+# mcp_enabled runs a localhost streamable-HTTP MCP server exposing recording-control
+# tools (start_recording, stop_recording, cancel_recording).
+mcp_enabled = false
+# The server has no authentication; keep mcp_bind_address on 127.0.0.1 so only this
+# machine can control recording. Binding to 0.0.0.0 or a LAN IP exposes recording
+# control to any host that can reach the address (Muninn logs a warning in that case).
+mcp_bind_address = "127.0.0.1:2769"
+
 [logging]
 replay_enabled = false
 replay_retain_audio = true
