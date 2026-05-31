@@ -496,9 +496,7 @@ fn select_supported_capture_config(
         let Ok(sample_format) = capture_sample_format_from_cpal(range.sample_format()) else {
             continue;
         };
-        let Some(config) =
-            range.try_with_sample_rate(output_config.sample_rate_hz())
-        else {
+        let Some(config) = range.try_with_sample_rate(output_config.sample_rate_hz()) else {
             continue;
         };
         supported.push((

@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use muninn::config::IndicatorConfig;
-use muninn::{
-    AppConfig, IndicatorAdapter, IndicatorState, RecordingMode, TargetContextSnapshot,
-};
+use muninn::{AppConfig, IndicatorAdapter, IndicatorState, RecordingMode, TargetContextSnapshot};
 use tao::event_loop::EventLoopProxy;
 use tracing::warn;
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};

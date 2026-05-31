@@ -107,11 +107,26 @@ mod tests {
 
     #[test]
     fn parses_known_verbs_in_authority_and_path_forms() {
-        assert_eq!(parse_url_action("muninn://record"), Some(ExternalControlAction::Start));
-        assert_eq!(parse_url_action("muninn:///start"), Some(ExternalControlAction::Start));
-        assert_eq!(parse_url_action("MUNINN://Stop"), Some(ExternalControlAction::Stop));
-        assert_eq!(parse_url_action("muninn://toggle/"), Some(ExternalControlAction::Toggle));
-        assert_eq!(parse_url_action("muninn://cancel?x=1"), Some(ExternalControlAction::Cancel));
+        assert_eq!(
+            parse_url_action("muninn://record"),
+            Some(ExternalControlAction::Start)
+        );
+        assert_eq!(
+            parse_url_action("muninn:///start"),
+            Some(ExternalControlAction::Start)
+        );
+        assert_eq!(
+            parse_url_action("MUNINN://Stop"),
+            Some(ExternalControlAction::Stop)
+        );
+        assert_eq!(
+            parse_url_action("muninn://toggle/"),
+            Some(ExternalControlAction::Toggle)
+        );
+        assert_eq!(
+            parse_url_action("muninn://cancel?x=1"),
+            Some(ExternalControlAction::Cancel)
+        );
     }
 
     #[test]
@@ -127,7 +142,10 @@ mod tests {
             ExternalControlAction::Start.to_app_event(AppState::Idle),
             Some(AppEvent::DoneTogglePressed)
         );
-        assert_eq!(ExternalControlAction::Start.to_app_event(AppState::RecordingDone), None);
+        assert_eq!(
+            ExternalControlAction::Start.to_app_event(AppState::RecordingDone),
+            None
+        );
     }
 
     #[test]
@@ -140,12 +158,18 @@ mod tests {
             ExternalControlAction::Stop.to_app_event(AppState::RecordingDone),
             Some(AppEvent::DoneTogglePressed)
         );
-        assert_eq!(ExternalControlAction::Stop.to_app_event(AppState::Idle), None);
+        assert_eq!(
+            ExternalControlAction::Stop.to_app_event(AppState::Idle),
+            None
+        );
         assert_eq!(
             ExternalControlAction::Cancel.to_app_event(AppState::RecordingDone),
             Some(AppEvent::CancelPressed)
         );
-        assert_eq!(ExternalControlAction::Cancel.to_app_event(AppState::Idle), None);
+        assert_eq!(
+            ExternalControlAction::Cancel.to_app_event(AppState::Idle),
+            None
+        );
     }
 
     #[test]

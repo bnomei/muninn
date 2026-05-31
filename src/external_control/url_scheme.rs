@@ -73,8 +73,7 @@ fn handle_get_url_event(event: *mut AnyObject) {
 }
 
 unsafe fn extract_url(event: *mut AnyObject) -> Option<String> {
-    let descriptor: *mut AnyObject =
-        msg_send![event, paramDescriptorForKeyword: KEY_DIRECT_OBJECT];
+    let descriptor: *mut AnyObject = msg_send![event, paramDescriptorForKeyword: KEY_DIRECT_OBJECT];
     if descriptor.is_null() {
         return None;
     }
