@@ -21,6 +21,7 @@ pub mod runtime_flow;
 pub mod scoring;
 pub mod secrets;
 pub mod state;
+pub mod streaming_transcription;
 pub mod target_context;
 pub mod transcription;
 
@@ -109,6 +110,11 @@ pub use scoring::{
 };
 pub use secrets::{resolve_secret, resolve_secret_from_env};
 pub use state::{AppEvent, AppState};
+pub use streaming_transcription::{
+    ActiveStreamingTranscription, StreamingTranscriptOutcome, StreamingTranscriptionError,
+    StreamingTranscriptionProvider, StreamingTranscriptionProviderEntry,
+    StreamingTranscriptionSession,
+};
 pub use target_context::{capture_frontmost_target_context, TargetContextSnapshot};
 pub use transcription::{
     append_transcription_attempt, attach_transcription_route, resolved_transcription_route,
@@ -323,6 +329,13 @@ impl RecordedAudio {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioFrame {
+    pub samples: Vec<i16>,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+}
+
 #[async_trait]
 pub trait IndicatorAdapter: Send + Sync {
     async fn initialize(&mut self) -> MacosAdapterResult<()>;
@@ -380,6 +393,13 @@ pub trait HotkeyEventSource: Send {
 #[async_trait(?Send)]
 pub trait AudioRecorder {
     async fn start_recording(&mut self) -> MacosAdapterResult<()>;
+    async fn start_recording_with_audio_sink(
+        &mut self,
+        sink: Option<tokio::sync::mpsc::Sender<AudioFrame>>,
+    ) -> MacosAdapterResult<()> {
+        let _ = sink;
+        self.start_recording().await
+    }
     async fn stop_recording(&mut self) -> MacosAdapterResult<RecordedAudio>;
     async fn cancel_recording(&mut self) -> MacosAdapterResult<()>;
 }

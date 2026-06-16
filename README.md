@@ -8,7 +8,7 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-AI-native macOS menu bar dictation with a post-recording text pipeline.
+AI-native macOS menu bar dictation with a transcription and text pipeline.
 
 Muninn records speech, transcribes it, then runs the transcript through a configurable pipeline before injecting the final text back into the active app. The core idea is not just voice capture. It is the AI-native pass after recording that can correct, reshape, or enhance the transcribed text so technical dictation survives intact.
 
@@ -24,9 +24,11 @@ Muninn is:
 
 ## What Muninn Does
 
-High-level flow:
+Default recorded-mode flow:
 
 `hotkey -> record temp WAV (default 16 kHz mono) -> resolve transcription route -> transcribe with the first available provider -> run Muninn refine pass -> optional filters -> inject text`
+
+Streaming transcription is opt-in with `[transcription].mode = "streaming"`. In streaming mode Muninn opens the first streaming-capable cloud provider in the resolved route while it still records the completed WAV. A final streaming transcript seeds the same pipeline envelope used by recorded mode; if streaming fails and fallback is enabled, Muninn continues through the completed-WAV route.
 
 The default setup is already a two-pass AI pipeline. First, your chosen STT provider turns audio into raw text. Then Muninn runs a second pass that aligns that text to developer needs: technical terms, commands, flags, paths, env vars, acronyms, and obvious dictation errors. That second pass is conservative by default, but it is still part of the core product behavior, not an afterthought.
 
@@ -56,6 +58,8 @@ Ordered transcription providers:
 - `deepgram`
 - `openai`
 - `google`
+
+`deepgram`, `openai`, and `google` can be used for opt-in streaming transcription. `apple_speech` and `whisper_cpp` remain completed-recording providers and are only used by recorded mode or the completed-WAV fallback path.
 
 Built-in pipeline steps:
 - `stt_apple_speech`
@@ -105,12 +109,12 @@ Muninn reads provider credentials from your environment or config and uses them 
 Setup:
 - Apple Speech: no API key is required; this local leg requires macOS 26+ and Apple-managed Speech assets for the selected locale
 - Whisper.cpp: no API key is required; Muninn auto-downloads the selected or default model on first use when it knows the canonical upstream file name, or you can still point `providers.whisper_cpp.model` at a local `.bin` file
-- Deepgram: set `DEEPGRAM_API_KEY`; Muninn uses the prerecorded `/v1/listen` API with `model = "nova-3"`, `language = "en"`, and smart formatting enabled by default
-- OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg and for the default refine pass
-- Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for the Google route leg
+- Deepgram: set `DEEPGRAM_API_KEY`; recorded mode uses the prerecorded `/v1/listen` API, while streaming mode uses Deepgram's live WebSocket API
+- OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg, OpenAI Realtime streaming, and the default refine pass
+- Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for recorded REST transcription; Google streaming uses Speech-to-Text v2 through the official `google-cloud-speech-v2` crate and requires credentials accepted by that client
 - optional provider settings such as endpoints and models live in the config you control
 
-The shipped route order is local-first. `apple_speech` and `whisper_cpp` run locally on completed recordings for post-processing transcription; `deepgram` is the preferred cloud leg for prerecorded uploads; `openai` and `google` remain fallback cloud legs.
+The shipped route order is local-first. `apple_speech` and `whisper_cpp` run locally on completed recordings for post-processing transcription; `deepgram`, `openai`, and `google` are cloud legs for recorded fallback and opt-in streaming.
 
 Whisper model lifecycle:
 - documented first-use default: `tiny.en`, resolved as `ggml-tiny.en.bin`
@@ -124,11 +128,43 @@ Whisper model lifecycle:
 
 Deepgram provider defaults:
 - prerecorded endpoint: `https://api.deepgram.com/v1/listen`
+- streaming endpoint: `wss://api.deepgram.com/v1/listen`
 - documented first-use model: `nova-3`
 - default language hint: `en`
 - request behavior: Muninn uploads the completed recording binary with `smart_format=true`
-- override surface: `[providers.deepgram].endpoint`, `[providers.deepgram].model`, `[providers.deepgram].language`
+- streaming behavior: Muninn sends linear PCM audio over WebSocket, treats interim results as transient, and only uses final results as transcript text
+- override surface: `[providers.deepgram].endpoint`, `[providers.deepgram].streaming_endpoint`, `[providers.deepgram].model`, `[providers.deepgram].language`
 - env overrides: `DEEPGRAM_STT_ENDPOINT`, `DEEPGRAM_STT_MODEL`, and `DEEPGRAM_STT_LANGUAGE`
+
+### Streaming Transcription
+
+Recorded mode is the default. Leave `[transcription].mode` unset or set it to `"recorded"` to preserve the completed-WAV behavior, route expansion, replay input, refine semantics, and launchable default config.
+
+To opt in:
+
+```toml
+[transcription]
+mode = "streaming"
+providers = ["deepgram", "openai", "google"]
+
+[transcription.streaming]
+frame_ms = 100
+finish_timeout_ms = 2500
+fallback_to_recorded_on_error = true
+```
+
+Streaming provider support:
+- Deepgram uses the live WebSocket API with `DEEPGRAM_API_KEY`.
+- OpenAI uses Realtime transcription with `gpt-realtime-whisper` and `OPENAI_API_KEY`.
+- Google uses Speech-to-Text v2 through the official `google-cloud-speech-v2` crate. The crate may require Rust 1.88+; Muninn's crate metadata now declares that MSRV. API-key-only Google REST credentials remain valid for recorded fallback but are not enough for the streaming client.
+
+Fallback and replay behavior:
+- Muninn still writes the completed WAV during streaming, so fallback can use the recorded route when the streaming provider fails, is unavailable, times out, or returns no final transcript.
+- `fallback_to_recorded_on_error = false` keeps the structured streaming attempt/error in the envelope without inventing transcript text.
+- Streaming success only seeds `transcript.raw_text`; `refine`, scoring, replay, and injection keep the same downstream semantics as recorded mode.
+- Partial/interim streaming results are transient. There is no partial transcript UI, and replay artifacts do not persist partial transcript history.
+
+Live smoke checks with real Deepgram, OpenAI, or Google credentials are optional local checks. They are not required for CI.
 
 That makes Muninn AI-native even in BYOK mode. You are not just piping audio into someone else's transcript API and injecting whatever comes back. The default flow uses your STT provider for the first pass, then uses Muninn's own built-in prompt contract for a second pass that aligns the text to developer dictation.
 
@@ -354,9 +390,9 @@ Muninn now tries to load `./.env` from the current working directory by default.
 | --- | --- | --- |
 | Apple Speech transcription | none | Configure `[providers.apple_speech]` (`locale` and `install_assets`) in config; this provider is completed-recording only, requires macOS 26+, and uses Apple-managed assets |
 | Whisper.cpp transcription | none | Muninn auto-downloads the selected/default canonical model into `providers.whisper_cpp.model_dir` on first use. If you point `providers.whisper_cpp.model` at a custom local path and that file is missing, Muninn logs `missing_whisper_cpp_model` and a local-only Whisper route produces no injected text. |
-| Deepgram transcription | `DEEPGRAM_API_KEY`, optional `DEEPGRAM_STT_ENDPOINT`, optional `DEEPGRAM_STT_MODEL`, optional `DEEPGRAM_STT_LANGUAGE`, optional `MUNINN_DEEPGRAM_STUB_TEXT` | Deepgram is the preferred cloud route leg for prerecorded uploads; Muninn sends the completed recording with `smart_format=true`, and stub text is only an optional bypass. |
-| OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
-| Google transcription | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google STT runs live when `transcript.raw_text` is missing; stub text is only an optional bypass. |
+| Deepgram transcription | `DEEPGRAM_API_KEY`, optional `DEEPGRAM_STT_ENDPOINT`, optional `DEEPGRAM_STT_MODEL`, optional `DEEPGRAM_STT_LANGUAGE`, optional `MUNINN_DEEPGRAM_STUB_TEXT` | Deepgram supports recorded uploads and opt-in streaming. Stub text is only an optional recorded-step bypass. |
+| OpenAI transcription | `OPENAI_API_KEY`, `MUNINN_OPENAI_STUB_TEXT` | OpenAI supports recorded transcription and opt-in Realtime streaming. Stub text is only an optional recorded-step bypass. |
+| Google transcription | `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN`, optional `GOOGLE_STT_ENDPOINT`, optional `GOOGLE_STT_MODEL`, optional `MUNINN_GOOGLE_STUB_TEXT` | Google recorded REST transcription can use API key or token credentials. Google streaming uses Speech-to-Text v2 through the official client and may need non-API-key client credentials. |
 | Refine step | `OPENAI_API_KEY`, `MUNINN_REFINE_STUB_TEXT` | This is the second AI pass. `transcript.system_prompt` can give it voice/style hints. Stub text bypasses the network for refine. |
 
 ### 5) Run the tray app
@@ -454,14 +490,14 @@ Use the fixtures in `tests/fixtures/` when you want example input.
 - `stt_apple_speech` is the native macOS 26+ on-device route leg; it reads completed recordings from `audio.wav_path`, uses Apple-managed speech assets, writes `transcript.raw_text` on success, and falls through when unsupported platform/locale or assets are unavailable
 - `stt_whisper_cpp` reads `audio.wav_path`, runs local whisper.cpp inference on completed recordings, writes `transcript.raw_text` on success, and records missing-model or unsupported-build diagnostics before falling through
 - `stt_deepgram` uploads the completed recording to Deepgram's prerecorded `/v1/listen` API, writes `transcript.raw_text` on success, and records structured missing-credential, request-failure, or empty-transcript diagnostics before falling through
-- `stt_openai` fills `transcript.raw_text` when OpenAI is configured, otherwise it records structured failure details and lets later route legs run
-- `stt_google` fills `transcript.raw_text` when Google is configured, otherwise it records structured failure details and lets later route legs run
+- `stt_openai` sends the completed recording to OpenAI when configured, fills `transcript.raw_text`, otherwise records structured failure details and lets later route legs run
+- `stt_google` sends the completed recording to Google REST STT when configured, fills `transcript.raw_text`, otherwise records structured failure details and lets later route legs run
 - `refine` applies Muninn's built-in developer contract plus your `transcript.system_prompt` hints and writes accepted output to `output.final_text`
 - recommended default: `[transcription].providers -> refine -> optional external filters`
 
 ### Ordered transcription provider routing
 
-v0.2.0 introduces `[transcription].providers` as the ordered STT route that the runtime resolves before it hands a concrete pipeline to the runner. The shipped default list is local-first: `apple_speech`, `whisper_cpp`, `deepgram`, `openai`, then `google`. During execution Muninn records which provider was attempted, why it succeeded or failed, and whether the normalized route metadata allows the next provider to run.
+v0.2.0 introduces `[transcription].providers` as the ordered STT route that the runtime resolves before it hands a concrete pipeline to the runner. The shipped default list is local-first: `apple_speech`, `whisper_cpp`, `deepgram`, `openai`, then `google`. During execution Muninn records which provider was attempted, why it succeeded or failed, and whether the normalized route metadata allows the next provider to run. When `[transcription].mode = "streaming"`, only streaming-capable cloud providers from this route are used for the live session; local providers stay available to the completed-WAV fallback.
 
 Profiles can override only the provider order for their context, without re-encoding raw pipeline steps. For example, a mail profile that prefers the cloud leg can narrow the chain:
 
@@ -479,12 +515,14 @@ This profile now skips the local-first defaults while other profiles continue in
 - replay logging is optional and writes per-utterance artifacts to `replay_dir`
 - `replay_retain_audio = true` keeps an `audio.*` artifact when possible by trying a hard link before copying
 - `replay_retain_audio = false` keeps `record.json` and metadata only
+- streaming partial/interim results are not replay history; replay records the final input envelope and pipeline outcome only
 - replay snapshots redact provider secrets
 
 ## Current Limits
 
 - Muninn currently supports macOS only.
-- Deepgram is currently a prerecorded-upload backend only; streaming and provider-specific vocabulary prompting remain out of scope here.
+- Streaming transcription is provider-final-text only; there is no partial transcript UI.
+- Apple Speech and whisper.cpp are completed-recording providers, not streaming providers.
 - Replay artifacts are for inspection, not re-run.
 - There is no replay UI yet.
 - Provider-backed transcription needs realistic timeout budgets.

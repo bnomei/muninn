@@ -4,8 +4,8 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use muninn::config::PipelineConfig;
 use muninn::{
-    capture_frontmost_target_context, map_hotkey_event, AppConfig, AppEvent, AppState,
-    HotkeyEventSource, IndicatorAdapter, IndicatorState, MacosAudioRecorder,
+    capture_frontmost_target_context, map_hotkey_event, ActiveStreamingTranscription, AppConfig,
+    AppEvent, AppState, HotkeyEventSource, IndicatorAdapter, IndicatorState, MacosAudioRecorder,
     MacosHotkeyEventSource, MacosPermissionsAdapter, MacosTextInjector, PermissionKind,
     PermissionPreflightStatus, PermissionStatus, PermissionsAdapter, PipelineRunner,
     ResolvedBuiltinStepConfig, ResolvedUtteranceConfig, RuntimeFlowCoordinator,
@@ -71,11 +71,11 @@ where
     indicator: I,
 }
 
-#[derive(Clone)]
 struct ActiveUtterance {
     resolved: ResolvedUtteranceConfig,
     pipeline: PipelineConfig,
     runner: Arc<PipelineRunner>,
+    streaming: ActiveStreamingTranscription,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -239,7 +239,7 @@ where
                     ) {
                         continue;
                     }
-                    let prepared = prepare_active_utterance(
+                    let mut prepared = prepare_active_utterance(
                         &self.config,
                         capture_frontmost_target_context(),
                         &mut prepared_utterance_cache,
@@ -255,11 +255,29 @@ where
                     coordinator
                         .recorder_mut()
                         .set_recording_config(prepared.resolved.effective_config.recording.clone());
-                    let started = std::time::Instant::now();
                     coordinator
-                        .start_push_to_talk(prepared.resolved.voice_glyph)
+                        .recorder_mut()
+                        .set_streaming_transcription_config(
+                            prepared
+                                .resolved
+                                .effective_config
+                                .transcription
+                                .streaming
+                                .clone(),
+                        );
+                    let streaming = ActiveStreamingTranscription::start(&prepared.resolved).await;
+                    let audio_sink = streaming.sink();
+                    let started = std::time::Instant::now();
+                    if let Err(error) = coordinator
+                        .start_push_to_talk_with_audio_sink(
+                            prepared.resolved.voice_glyph,
+                            audio_sink,
+                        )
                         .await
-                        .context("starting push-to-talk recording flow")?;
+                    {
+                        streaming.cancel().await;
+                        return Err(error).context("starting push-to-talk recording flow");
+                    }
                     logging::log_recording_started(
                         &prepared.resolved.profile_id,
                         prepared.resolved.voice_id.as_deref(),
@@ -273,6 +291,7 @@ where
                         prepared.resolved.effective_config.recording.mono,
                         recording_source_name(recording_source),
                     );
+                    prepared.streaming = streaming;
                     active_utterance = Some(prepared);
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
@@ -295,7 +314,7 @@ where
                     ) {
                         continue;
                     }
-                    let prepared = prepare_active_utterance(
+                    let mut prepared = prepare_active_utterance(
                         &self.config,
                         capture_frontmost_target_context(),
                         &mut prepared_utterance_cache,
@@ -311,11 +330,26 @@ where
                     coordinator
                         .recorder_mut()
                         .set_recording_config(prepared.resolved.effective_config.recording.clone());
-                    let started = std::time::Instant::now();
                     coordinator
-                        .start_done_mode(prepared.resolved.voice_glyph)
+                        .recorder_mut()
+                        .set_streaming_transcription_config(
+                            prepared
+                                .resolved
+                                .effective_config
+                                .transcription
+                                .streaming
+                                .clone(),
+                        );
+                    let streaming = ActiveStreamingTranscription::start(&prepared.resolved).await;
+                    let audio_sink = streaming.sink();
+                    let started = std::time::Instant::now();
+                    if let Err(error) = coordinator
+                        .start_done_mode_with_audio_sink(prepared.resolved.voice_glyph, audio_sink)
                         .await
-                        .context("starting done-mode recording flow")?;
+                    {
+                        streaming.cancel().await;
+                        return Err(error).context("starting done-mode recording flow");
+                    }
                     logging::log_recording_started(
                         &prepared.resolved.profile_id,
                         prepared.resolved.voice_id.as_deref(),
@@ -329,6 +363,7 @@ where
                         prepared.resolved.effective_config.recording.mono,
                         recording_source_name(recording_source),
                     );
+                    prepared.streaming = streaming;
                     active_utterance = Some(prepared);
                     debug!(
                         elapsed_ms = started.elapsed().as_millis(),
@@ -340,14 +375,17 @@ where
                     AppEvent::CancelPressed,
                     AppState::Idle,
                 ) => {
-                    let glyph = active_utterance
+                    let active = active_utterance.take();
+                    let glyph = active
                         .as_ref()
                         .and_then(|utterance| utterance.resolved.voice_glyph);
-                    coordinator
+                    let cancel_result = coordinator
                         .cancel_current_capture(glyph, OUTPUT_INDICATOR_MIN_DURATION)
-                        .await
-                        .context("canceling recording flow")?;
-                    active_utterance = None;
+                        .await;
+                    if let Some(utterance) = active {
+                        utterance.streaming.cancel().await;
+                    }
+                    cancel_result.context("canceling recording flow")?;
                 }
                 (
                     AppState::RecordingPushToTalk | AppState::RecordingDone,
@@ -358,6 +396,7 @@ where
                         resolved,
                         pipeline: effective_pipeline,
                         runner: effective_runner,
+                        streaming,
                     } = match active_utterance.take() {
                         Some(utterance) => utterance,
                         None => prepare_active_utterance(
@@ -409,6 +448,7 @@ where
                         elapsed_ms = stopped.elapsed().as_millis(),
                         "recording stopped and wav finalized"
                     );
+                    let streaming_outcome = streaming.finish().await;
 
                     let (state, indicator, injector) = coordinator.processing_parts();
                     if let Err(error) = runtime_pipeline::process_and_inject(
@@ -418,6 +458,7 @@ where
                             runner: effective_runner.as_ref(),
                             injector,
                             replay_persist: &replay_persist,
+                            streaming_outcome,
                         },
                         indicator,
                         state,
@@ -483,6 +524,7 @@ fn prepare_active_utterance(
             },
             pipeline: entry.pipeline.clone(),
             runner: Arc::clone(&entry.runner),
+            streaming: ActiveStreamingTranscription::disabled(),
         });
     }
 
@@ -508,6 +550,7 @@ fn prepare_active_utterance(
         resolved,
         pipeline,
         runner,
+        streaming: ActiveStreamingTranscription::disabled(),
     })
 }
 

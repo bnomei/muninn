@@ -13,7 +13,7 @@ use muninn::{
     AppEvent, AppState, IndicatorAdapter, IndicatorState, MacosPermissionsAdapter,
     MacosTextInjector, MuninnEnvelopeV1, Orchestrator, PipelineOutcome, PipelineRunner,
     PipelineStopReason, PipelineTraceEntry, ResolvedBuiltinStepConfig, ResolvedUtteranceConfig,
-    TextInjector, TranscriptionAttemptOutcome,
+    StreamingTranscriptOutcome, TextInjector, TranscriptionAttemptOutcome,
 };
 use serde_json::Value;
 use tracing::{info, warn};
@@ -29,6 +29,7 @@ pub(crate) struct ProcessingContext<'a> {
     pub(crate) runner: &'a PipelineRunner,
     pub(crate) injector: &'a MacosTextInjector,
     pub(crate) replay_persist: &'a ReplayPersistenceService,
+    pub(crate) streaming_outcome: Option<StreamingTranscriptOutcome>,
 }
 
 pub(crate) async fn process_and_inject<I>(
@@ -40,28 +41,35 @@ pub(crate) async fn process_and_inject<I>(
 where
     I: IndicatorAdapter,
 {
+    let ProcessingContext {
+        resolved,
+        pipeline,
+        runner,
+        injector,
+        replay_persist,
+        streaming_outcome,
+    } = context;
     let result = async {
-        let envelope = build_envelope(context.resolved, recorded);
+        let envelope = build_envelope(resolved, recorded, streaming_outcome);
         let mut outcome = run_pipeline_with_indicator_stages(
-            context.pipeline,
-            context.runner,
+            pipeline,
+            runner,
             indicator,
-            context.resolved.voice_glyph,
+            resolved.voice_glyph,
             envelope.clone(),
         )
         .await?;
         let _ = muninn::scoring::apply_scored_replacements_to_outcome(
             &mut outcome,
-            &context.resolved.effective_config.scoring,
+            &resolved.effective_config.scoring,
         );
         let route = Orchestrator::route_injection(&outcome);
         log_pipeline_outcome_diagnostics(&outcome);
-        let replay_config = context
-            .resolved
+        let replay_config = resolved
             .effective_config
             .logging
             .replay_enabled
-            .then(|| context.resolved.clone());
+            .then(|| resolved.clone());
         let replay_recorded = recorded.clone();
         let injection_text = route.target.text().map(ToOwned::to_owned);
         let route_reason = route.reason;
@@ -69,9 +77,7 @@ where
         let missing_credentials_feedback = should_show_missing_credentials_feedback(&outcome);
         let permissions = MacosPermissionsAdapter::new();
 
-        context
-            .replay_persist
-            .enqueue(replay_config, envelope, outcome, route, replay_recorded);
+        replay_persist.enqueue(replay_config, envelope, outcome, route, replay_recorded);
 
         *state = state.on_event(AppEvent::ProcessingFinished);
 
@@ -89,22 +95,21 @@ where
             indicator
                 .set_temporary_state_with_glyph(
                     IndicatorState::Output,
-                    context.resolved.voice_glyph,
+                    resolved.voice_glyph,
                     crate::OUTPUT_INDICATOR_MIN_DURATION,
                     IndicatorState::Idle,
                     None,
                 )
                 .await
                 .context("setting output indicator")?;
-            context
-                .injector
+            injector
                 .inject_checked(text)
                 .await
                 .context("injecting final text")?;
             info!(
                 target: logging::TARGET_PIPELINE,
-                profile = %context.resolved.profile_id,
-                voice = ?context.resolved.voice_id,
+                profile = %resolved.profile_id,
+                voice = ?resolved.voice_id,
                 route_reason = ?route_reason,
                 pipeline_stop_reason = ?route_pipeline_stop_reason,
                 injected_len = text.len(),
@@ -115,7 +120,7 @@ where
                 indicator
                     .set_temporary_state_with_glyph(
                         IndicatorState::MissingCredentials,
-                        context.resolved.voice_glyph,
+                        resolved.voice_glyph,
                         crate::MISSING_CREDENTIALS_INDICATOR_DURATION,
                         IndicatorState::Idle,
                         None,
@@ -125,8 +130,8 @@ where
             }
             warn!(
                 target: logging::TARGET_PIPELINE,
-                profile = %context.resolved.profile_id,
-                voice = ?context.resolved.voice_id,
+                profile = %resolved.profile_id,
+                voice = ?resolved.voice_id,
                 route_reason = ?route_reason,
                 pipeline_stop_reason = ?route_pipeline_stop_reason,
                 "pipeline completed without injectable text"
@@ -405,6 +410,7 @@ fn log_pipeline_outcome_diagnostics(outcome: &PipelineOutcome) {
 fn build_envelope(
     resolved: &ResolvedUtteranceConfig,
     recorded: &muninn::RecordedAudio,
+    streaming_outcome: Option<StreamingTranscriptOutcome>,
 ) -> MuninnEnvelopeV1 {
     let mut envelope = MuninnEnvelopeV1::new(Uuid::now_v7().to_string(), Utc::now().to_rfc3339())
         .with_audio(
@@ -412,6 +418,9 @@ fn build_envelope(
             recorded.duration_ms,
         );
     attach_transcription_route(&mut envelope, &resolved.transcription_route);
+    if let Some(streaming_outcome) = streaming_outcome {
+        streaming_outcome.apply_to_envelope(&mut envelope);
+    }
     envelope
 }
 

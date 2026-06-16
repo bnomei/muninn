@@ -7,7 +7,7 @@ use std::{
 use async_trait::async_trait;
 
 use crate::{
-    AudioRecorder, HotkeyEvent, HotkeyEventSource, IndicatorAdapter, IndicatorState,
+    AudioFrame, AudioRecorder, HotkeyEvent, HotkeyEventSource, IndicatorAdapter, IndicatorState,
     MacosAdapterError, MacosAdapterResult, PermissionPreflightStatus, PermissionsAdapter,
     RecordedAudio, TextInjector,
 };
@@ -420,6 +420,8 @@ pub struct MockAudioRecorder {
 struct AudioRecorderInner {
     active: bool,
     start_calls: usize,
+    start_with_audio_sink_calls: usize,
+    audio_sink_start_history: Vec<bool>,
     stop_calls: usize,
     cancel_calls: usize,
     start_error_queue: VecDeque<MacosAdapterError>,
@@ -433,6 +435,8 @@ impl Default for AudioRecorderInner {
         Self {
             active: false,
             start_calls: 0,
+            start_with_audio_sink_calls: 0,
+            audio_sink_start_history: Vec::new(),
             stop_calls: 0,
             cancel_calls: 0,
             start_error_queue: VecDeque::new(),
@@ -505,6 +509,23 @@ impl MockAudioRecorder {
     }
 
     #[must_use]
+    pub fn start_with_audio_sink_calls(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("audio recorder mutex poisoned")
+            .start_with_audio_sink_calls
+    }
+
+    #[must_use]
+    pub fn audio_sink_start_history(&self) -> Vec<bool> {
+        self.inner
+            .lock()
+            .expect("audio recorder mutex poisoned")
+            .audio_sink_start_history
+            .clone()
+    }
+
+    #[must_use]
     pub fn stop_calls(&self) -> usize {
         self.inner
             .lock()
@@ -524,19 +545,14 @@ impl MockAudioRecorder {
 #[async_trait(?Send)]
 impl AudioRecorder for MockAudioRecorder {
     async fn start_recording(&mut self) -> MacosAdapterResult<()> {
-        let mut inner = self.inner.lock().expect("audio recorder mutex poisoned");
-        inner.start_calls += 1;
+        self.start_recording_inner(None, false)
+    }
 
-        if inner.active {
-            return Err(MacosAdapterError::RecorderAlreadyActive);
-        }
-
-        if let Some(error) = inner.start_error_queue.pop_front() {
-            return Err(error);
-        }
-
-        inner.active = true;
-        Ok(())
+    async fn start_recording_with_audio_sink(
+        &mut self,
+        sink: Option<tokio::sync::mpsc::Sender<AudioFrame>>,
+    ) -> MacosAdapterResult<()> {
+        self.start_recording_inner(sink, true)
     }
 
     async fn stop_recording(&mut self) -> MacosAdapterResult<RecordedAudio> {
@@ -568,6 +584,32 @@ impl AudioRecorder for MockAudioRecorder {
         }
 
         inner.active = false;
+        Ok(())
+    }
+}
+
+impl MockAudioRecorder {
+    fn start_recording_inner(
+        &mut self,
+        sink: Option<tokio::sync::mpsc::Sender<AudioFrame>>,
+        record_sink_call: bool,
+    ) -> MacosAdapterResult<()> {
+        let mut inner = self.inner.lock().expect("audio recorder mutex poisoned");
+        inner.start_calls += 1;
+        if record_sink_call {
+            inner.start_with_audio_sink_calls += 1;
+            inner.audio_sink_start_history.push(sink.is_some());
+        }
+
+        if inner.active {
+            return Err(MacosAdapterError::RecorderAlreadyActive);
+        }
+
+        if let Some(error) = inner.start_error_queue.pop_front() {
+            return Err(error);
+        }
+
+        inner.active = true;
         Ok(())
     }
 }
@@ -649,7 +691,7 @@ mod tests {
     };
 
     use crate::{
-        AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind, HotkeyEventSource,
+        AudioFrame, AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind, HotkeyEventSource,
         IndicatorAdapter, IndicatorState, MacosAdapterError, PermissionPreflightStatus,
         PermissionStatus, PermissionsAdapter, RecordedAudio, TextInjector,
     };
@@ -816,6 +858,22 @@ mod tests {
         assert_eq!(recorder.start_calls(), 3);
         assert_eq!(recorder.stop_calls(), 4);
         assert!(!recorder.is_active());
+    }
+
+    #[test]
+    fn audio_recorder_tracks_optional_audio_sink_starts_without_changing_start_calls() {
+        let mut recorder = MockAudioRecorder::new();
+        let (sink, _frames) = tokio::sync::mpsc::channel::<AudioFrame>(1);
+
+        block_on(recorder.start_recording_with_audio_sink(Some(sink)))
+            .expect("sink start should succeed");
+        block_on(recorder.stop_recording()).expect("stop should succeed");
+        block_on(recorder.start_recording()).expect("plain start should succeed");
+
+        assert_eq!(recorder.start_calls(), 2);
+        assert_eq!(recorder.start_with_audio_sink_calls(), 1);
+        assert_eq!(recorder.audio_sink_start_history(), vec![true]);
+        assert!(recorder.is_active());
     }
 
     #[test]

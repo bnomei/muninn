@@ -111,7 +111,7 @@ impl AppConfig {
 
         self.refine.validate()?;
         self.transcript.validate("transcript")?;
-        self.transcription.validate("transcription.providers")?;
+        self.transcription.validate("transcription")?;
         self.providers.validate()?;
 
         for (name, binding) in [
@@ -607,48 +607,133 @@ impl TranscriptConfig {
     }
 }
 
+const MIN_STREAMING_FRAME_MS: u16 = 20;
+const MAX_STREAMING_FRAME_MS: u16 = 200;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionMode {
+    #[default]
+    Recorded,
+    Streaming,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamingTranscriptionConfig {
+    pub frame_ms: u16,
+    pub finish_timeout_ms: u64,
+    pub fallback_to_recorded_on_error: bool,
+}
+
+impl StreamingTranscriptionConfig {
+    fn validate(&self, field_prefix: &str) -> Result<(), ConfigValidationError> {
+        validate_streaming_frame_ms(format!("{field_prefix}.frame_ms"), self.frame_ms)?;
+        validate_streaming_finish_timeout_ms(
+            format!("{field_prefix}.finish_timeout_ms"),
+            self.finish_timeout_ms,
+        )
+    }
+}
+
+impl Default for StreamingTranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            frame_ms: 100,
+            finish_timeout_ms: 2_500,
+            fallback_to_recorded_on_error: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptionConfig {
+    pub mode: TranscriptionMode,
+    pub streaming: StreamingTranscriptionConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub providers: Option<Vec<TranscriptionProvider>>,
 }
 
 impl TranscriptionConfig {
-    fn validate(&self, field_name: &str) -> Result<(), ConfigValidationError> {
-        if self.providers.as_ref().is_some_and(Vec::is_empty) {
-            return Err(
-                ConfigValidationError::TranscriptionProvidersMustNotBeEmpty {
-                    field_name: field_name.to_string(),
-                },
-            );
-        }
+    fn validate(&self, field_prefix: &str) -> Result<(), ConfigValidationError> {
+        validate_transcription_provider_list(
+            self.providers.as_ref(),
+            format!("{field_prefix}.providers"),
+        )?;
+        self.streaming
+            .validate(&format!("{field_prefix}.streaming"))
+    }
+}
 
-        if let Some(providers) = self.providers.as_ref() {
-            let mut seen = HashSet::new();
-            let mut duplicates = HashSet::new();
-            for provider in providers {
-                if !seen.insert(*provider) {
-                    duplicates.insert(*provider);
-                }
-            }
-            if !duplicates.is_empty() {
-                let mut provider_ids = duplicates
-                    .into_iter()
-                    .map(|provider| provider.config_id().to_string())
-                    .collect::<Vec<_>>();
-                provider_ids.sort();
-                return Err(ConfigValidationError::DuplicateTranscriptionProviders {
-                    field_name: field_name.to_string(),
-                    provider_ids,
-                });
-            }
-        }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct StreamingTranscriptionOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_ms: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_to_recorded_on_error: Option<bool>,
+}
 
+impl StreamingTranscriptionOverrides {
+    fn validate(&self, field_prefix: &str) -> Result<(), ConfigValidationError> {
+        if let Some(frame_ms) = self.frame_ms {
+            validate_streaming_frame_ms(format!("{field_prefix}.frame_ms"), frame_ms)?;
+        }
+        if let Some(finish_timeout_ms) = self.finish_timeout_ms {
+            validate_streaming_finish_timeout_ms(
+                format!("{field_prefix}.finish_timeout_ms"),
+                finish_timeout_ms,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn apply_to(&self, target: &mut StreamingTranscriptionConfig) {
+        if let Some(frame_ms) = self.frame_ms {
+            target.frame_ms = frame_ms;
+        }
+        if let Some(finish_timeout_ms) = self.finish_timeout_ms {
+            target.finish_timeout_ms = finish_timeout_ms;
+        }
+        if let Some(fallback_to_recorded_on_error) = self.fallback_to_recorded_on_error {
+            target.fallback_to_recorded_on_error = fallback_to_recorded_on_error;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct TranscriptionOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TranscriptionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<StreamingTranscriptionOverrides>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<TranscriptionProvider>>,
+}
+
+impl TranscriptionOverrides {
+    fn validate(&self, field_prefix: &str) -> Result<(), ConfigValidationError> {
+        validate_transcription_provider_list(
+            self.providers.as_ref(),
+            format!("{field_prefix}.providers"),
+        )?;
+        if let Some(streaming) = self.streaming.as_ref() {
+            streaming.validate(&format!("{field_prefix}.streaming"))?;
+        }
         Ok(())
     }
 
     fn apply_to(&self, target: &mut TranscriptionConfig) {
+        if let Some(mode) = self.mode {
+            target.mode = mode;
+        }
+        if let Some(streaming) = self.streaming.as_ref() {
+            streaming.apply_to(&mut target.streaming);
+        }
         if let Some(providers) = self.providers.as_ref() {
             target.providers = Some(providers.clone());
         }
@@ -824,7 +909,7 @@ pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline: Option<PipelineOverrides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transcription: Option<TranscriptionConfig>,
+    pub transcription: Option<TranscriptionOverrides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<TranscriptOverrides>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -843,7 +928,7 @@ impl ProfileConfig {
             pipeline.validate(profile_id)?;
         }
         if let Some(transcription) = self.transcription.as_ref() {
-            transcription.validate(&format!("profiles.{profile_id}.transcription.providers"))?;
+            transcription.validate(&format!("profiles.{profile_id}.transcription"))?;
         }
         if let Some(transcript) = self.transcript.as_ref() {
             transcript.validate(profile_id)?;
@@ -1149,6 +1234,22 @@ pub struct ResolvedUtteranceConfig {
     pub builtin_steps: ResolvedBuiltinStepConfig,
 }
 
+impl ResolvedUtteranceConfig {
+    #[must_use]
+    pub fn streaming_transcription_route(&self) -> Vec<TranscriptionProvider> {
+        if self.effective_config.transcription.mode != TranscriptionMode::Streaming {
+            return Vec::new();
+        }
+
+        self.transcription_route
+            .providers
+            .iter()
+            .copied()
+            .filter(|provider| is_streaming_capable_transcription_provider(*provider))
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedBuiltinStepConfig {
     pub transcript: TranscriptConfig,
@@ -1206,7 +1307,9 @@ impl ProvidersConfig {
     fn validate(&self) -> Result<(), ConfigValidationError> {
         self.apple_speech.validate()?;
         self.whisper_cpp.validate()?;
-        self.deepgram.validate()
+        self.deepgram.validate()?;
+        self.openai.validate()?;
+        self.google.validate()
     }
 }
 
@@ -1289,6 +1392,8 @@ pub struct DeepgramProviderConfig {
     pub endpoint: String,
     pub model: String,
     pub language: String,
+    pub streaming_endpoint: String,
+    pub streaming_interim_results: bool,
 }
 
 impl Default for DeepgramProviderConfig {
@@ -1298,6 +1403,8 @@ impl Default for DeepgramProviderConfig {
             endpoint: "https://api.deepgram.com/v1/listen".to_string(),
             model: "nova-3".to_string(),
             language: "en".to_string(),
+            streaming_endpoint: "wss://api.deepgram.com/v1/listen".to_string(),
+            streaming_interim_results: true,
         }
     }
 }
@@ -1313,6 +1420,10 @@ impl DeepgramProviderConfig {
         if self.language.trim().is_empty() {
             return Err(ConfigValidationError::DeepgramLanguageMustNotBeEmpty);
         }
+        validate_non_empty_provider_field(
+            "providers.deepgram.streaming_endpoint",
+            &self.streaming_endpoint,
+        )?;
         Ok(())
     }
 }
@@ -1323,6 +1434,10 @@ pub struct OpenAiProviderConfig {
     pub api_key: Option<String>,
     pub endpoint: String,
     pub model: String,
+    pub realtime_endpoint: String,
+    pub realtime_model: String,
+    pub realtime_language: Option<String>,
+    pub realtime_delay: String,
 }
 
 impl Default for OpenAiProviderConfig {
@@ -1331,7 +1446,28 @@ impl Default for OpenAiProviderConfig {
             api_key: None,
             endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             model: "gpt-4o-mini-transcribe".to_string(),
+            realtime_endpoint: "wss://api.openai.com/v1/realtime".to_string(),
+            realtime_model: "gpt-realtime-whisper".to_string(),
+            realtime_language: Some("en".to_string()),
+            realtime_delay: "low".to_string(),
         }
+    }
+}
+
+impl OpenAiProviderConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        validate_non_empty_provider_field("providers.openai.endpoint", &self.endpoint)?;
+        validate_non_empty_provider_field("providers.openai.model", &self.model)?;
+        validate_non_empty_provider_field(
+            "providers.openai.realtime_endpoint",
+            &self.realtime_endpoint,
+        )?;
+        validate_non_empty_provider_field("providers.openai.realtime_model", &self.realtime_model)?;
+        validate_optional_provider_field(
+            "providers.openai.realtime_language",
+            self.realtime_language.as_deref(),
+        )?;
+        validate_non_empty_provider_field("providers.openai.realtime_delay", &self.realtime_delay)
     }
 }
 
@@ -1342,6 +1478,12 @@ pub struct GoogleProviderConfig {
     pub token: Option<String>,
     pub endpoint: String,
     pub model: Option<String>,
+    pub streaming_project_id: Option<String>,
+    pub streaming_location: String,
+    pub streaming_recognizer: String,
+    pub streaming_model: Option<String>,
+    pub streaming_language_codes: Vec<String>,
+    pub streaming_interim_results: bool,
 }
 
 impl Default for GoogleProviderConfig {
@@ -1351,7 +1493,40 @@ impl Default for GoogleProviderConfig {
             token: None,
             endpoint: "https://speech.googleapis.com/v1/speech:recognize".to_string(),
             model: None,
+            streaming_project_id: None,
+            streaming_location: "global".to_string(),
+            streaming_recognizer: "_".to_string(),
+            streaming_model: None,
+            streaming_language_codes: vec!["en-US".to_string()],
+            streaming_interim_results: true,
         }
+    }
+}
+
+impl GoogleProviderConfig {
+    fn validate(&self) -> Result<(), ConfigValidationError> {
+        validate_non_empty_provider_field("providers.google.endpoint", &self.endpoint)?;
+        validate_optional_provider_field("providers.google.model", self.model.as_deref())?;
+        validate_optional_provider_field(
+            "providers.google.streaming_project_id",
+            self.streaming_project_id.as_deref(),
+        )?;
+        validate_non_empty_provider_field(
+            "providers.google.streaming_location",
+            &self.streaming_location,
+        )?;
+        validate_non_empty_provider_field(
+            "providers.google.streaming_recognizer",
+            &self.streaming_recognizer,
+        )?;
+        validate_optional_provider_field(
+            "providers.google.streaming_model",
+            self.streaming_model.as_deref(),
+        )?;
+        validate_non_empty_string_list(
+            "providers.google.streaming_language_codes",
+            &self.streaming_language_codes,
+        )
     }
 }
 
@@ -1422,6 +1597,19 @@ pub enum ConfigValidationError {
     DeepgramModelMustNotBeEmpty,
     #[error("providers.deepgram.language must not be empty")]
     DeepgramLanguageMustNotBeEmpty,
+    #[error("{field_name} must be between {min} and {max} milliseconds inclusive (got {value})")]
+    StreamingFrameMsOutOfRange {
+        field_name: String,
+        value: u16,
+        min: u16,
+        max: u16,
+    },
+    #[error("{field_name} must be greater than 0")]
+    StreamingFinishTimeoutMsMustBePositive { field_name: String },
+    #[error("{field_name} must not be empty")]
+    ProviderConfigFieldMustNotBeEmpty { field_name: String },
+    #[error("{field_name} must include at least one value")]
+    ProviderConfigListMustNotBeEmpty { field_name: String },
     #[error("pipeline.deadline_ms must be greater than 0")]
     PipelineDeadlineMsMustBePositive,
     #[error("pipeline must include at least one step")]
@@ -1532,6 +1720,110 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<(), ConfigValida
             field_name: field_name.to_string(),
         });
     }
+    Ok(())
+}
+
+fn validate_transcription_provider_list(
+    providers: Option<&Vec<TranscriptionProvider>>,
+    field_name: String,
+) -> Result<(), ConfigValidationError> {
+    if providers.is_some_and(Vec::is_empty) {
+        return Err(ConfigValidationError::TranscriptionProvidersMustNotBeEmpty { field_name });
+    }
+
+    if let Some(providers) = providers {
+        let mut seen = HashSet::new();
+        let mut duplicates = HashSet::new();
+        for provider in providers {
+            if !seen.insert(*provider) {
+                duplicates.insert(*provider);
+            }
+        }
+        if !duplicates.is_empty() {
+            let mut provider_ids = duplicates
+                .into_iter()
+                .map(|provider| provider.config_id().to_string())
+                .collect::<Vec<_>>();
+            provider_ids.sort();
+            return Err(ConfigValidationError::DuplicateTranscriptionProviders {
+                field_name,
+                provider_ids,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_streaming_frame_ms(
+    field_name: String,
+    value: u16,
+) -> Result<(), ConfigValidationError> {
+    if !(MIN_STREAMING_FRAME_MS..=MAX_STREAMING_FRAME_MS).contains(&value) {
+        return Err(ConfigValidationError::StreamingFrameMsOutOfRange {
+            field_name,
+            value,
+            min: MIN_STREAMING_FRAME_MS,
+            max: MAX_STREAMING_FRAME_MS,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_streaming_finish_timeout_ms(
+    field_name: String,
+    value: u64,
+) -> Result<(), ConfigValidationError> {
+    if value == 0 {
+        return Err(ConfigValidationError::StreamingFinishTimeoutMsMustBePositive { field_name });
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty_provider_field(
+    field_name: &str,
+    value: &str,
+) -> Result<(), ConfigValidationError> {
+    if value.trim().is_empty() {
+        return Err(ConfigValidationError::ProviderConfigFieldMustNotBeEmpty {
+            field_name: field_name.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_optional_provider_field(
+    field_name: &str,
+    value: Option<&str>,
+) -> Result<(), ConfigValidationError> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(ConfigValidationError::ProviderConfigFieldMustNotBeEmpty {
+            field_name: field_name.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_non_empty_string_list(
+    field_name: &str,
+    values: &[String],
+) -> Result<(), ConfigValidationError> {
+    if values.is_empty() {
+        return Err(ConfigValidationError::ProviderConfigListMustNotBeEmpty {
+            field_name: field_name.to_string(),
+        });
+    }
+
+    if values.iter().any(|value| value.trim().is_empty()) {
+        return Err(ConfigValidationError::ProviderConfigFieldMustNotBeEmpty {
+            field_name: field_name.to_string(),
+        });
+    }
+
     Ok(())
 }
 
@@ -1705,6 +1997,15 @@ fn infer_transcription_route_from_pipeline(
         .collect()
 }
 
+fn is_streaming_capable_transcription_provider(provider: TranscriptionProvider) -> bool {
+    matches!(
+        provider,
+        TranscriptionProvider::Deepgram
+            | TranscriptionProvider::OpenAi
+            | TranscriptionProvider::Google
+    )
+}
+
 fn expand_pipeline_with_transcription_route(
     pipeline: &PipelineConfig,
     route: &ResolvedTranscriptionRoute,
@@ -1825,7 +2126,8 @@ mod tests {
 
     use super::{
         resolve_config_path_with, AppConfig, ConfigError, ConfigValidationError, PayloadFormat,
-        RefineProvider, TargetContextSnapshot, TriggerType, WhisperCppDevicePreference,
+        RefineProvider, TargetContextSnapshot, TranscriptionMode, TriggerType,
+        WhisperCppDevicePreference,
     };
 
     #[test]
@@ -1837,6 +2139,10 @@ mod tests {
         assert_eq!(config.pipeline.steps.len(), 2);
         assert!(!config.logging.replay_enabled);
         assert!(config.logging.replay_retain_audio);
+        assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
+        assert_eq!(config.transcription.streaming.frame_ms, 100);
+        assert_eq!(config.transcription.streaming.finish_timeout_ms, 2_500);
+        assert!(config.transcription.streaming.fallback_to_recorded_on_error);
         assert_eq!(config.providers.openai.model, "gpt-4o-mini-transcribe");
         assert_eq!(config.providers.apple_speech.locale, None);
         assert!(config.providers.apple_speech.install_assets);
@@ -1855,6 +2161,33 @@ mod tests {
         );
         assert_eq!(config.providers.deepgram.model, "nova-3");
         assert_eq!(config.providers.deepgram.language, "en");
+        assert_eq!(
+            config.providers.deepgram.streaming_endpoint,
+            "wss://api.deepgram.com/v1/listen"
+        );
+        assert!(config.providers.deepgram.streaming_interim_results);
+        assert_eq!(
+            config.providers.openai.realtime_endpoint,
+            "wss://api.openai.com/v1/realtime"
+        );
+        assert_eq!(
+            config.providers.openai.realtime_model,
+            "gpt-realtime-whisper"
+        );
+        assert_eq!(
+            config.providers.openai.realtime_language.as_deref(),
+            Some("en")
+        );
+        assert_eq!(config.providers.openai.realtime_delay, "low");
+        assert_eq!(config.providers.google.streaming_project_id, None);
+        assert_eq!(config.providers.google.streaming_location, "global");
+        assert_eq!(config.providers.google.streaming_recognizer, "_");
+        assert_eq!(config.providers.google.streaming_model, None);
+        assert_eq!(
+            config.providers.google.streaming_language_codes,
+            vec!["en-US"]
+        );
+        assert!(config.providers.google.streaming_interim_results);
         assert_eq!(config.refine.model, "gpt-4.1-mini");
         assert_eq!(config.indicator.colors.idle, "#636366");
         assert!(config.recording.mono);
@@ -1886,6 +2219,10 @@ mod tests {
         );
         assert!(!config.logging.replay_enabled);
         assert!(config.logging.replay_retain_audio);
+        assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
+        assert_eq!(config.transcription.streaming.frame_ms, 100);
+        assert_eq!(config.transcription.streaming.finish_timeout_ms, 2_500);
+        assert!(config.transcription.streaming.fallback_to_recorded_on_error);
         assert_eq!(config.scoring.min_top_score, 0.84);
         assert_eq!(config.scoring.min_margin, 0.10);
         assert_eq!(config.scoring.acronym_min_top_score, 0.90);
@@ -1916,6 +2253,33 @@ mod tests {
         );
         assert_eq!(config.providers.deepgram.model, "nova-3");
         assert_eq!(config.providers.deepgram.language, "en");
+        assert_eq!(
+            config.providers.deepgram.streaming_endpoint,
+            "wss://api.deepgram.com/v1/listen"
+        );
+        assert!(config.providers.deepgram.streaming_interim_results);
+        assert_eq!(
+            config.providers.openai.realtime_endpoint,
+            "wss://api.openai.com/v1/realtime"
+        );
+        assert_eq!(
+            config.providers.openai.realtime_model,
+            "gpt-realtime-whisper"
+        );
+        assert_eq!(
+            config.providers.openai.realtime_language.as_deref(),
+            Some("en")
+        );
+        assert_eq!(config.providers.openai.realtime_delay, "low");
+        assert_eq!(config.providers.google.streaming_project_id, None);
+        assert_eq!(config.providers.google.streaming_location, "global");
+        assert_eq!(config.providers.google.streaming_recognizer, "_");
+        assert_eq!(config.providers.google.streaming_model, None);
+        assert_eq!(
+            config.providers.google.streaming_language_codes,
+            vec!["en-US"]
+        );
+        assert!(config.providers.google.streaming_interim_results);
         assert_eq!(config.refine.provider, RefineProvider::OpenAi);
         assert_eq!(
             config.transcript.system_prompt,
@@ -1934,10 +2298,139 @@ mod tests {
             config.transcription.providers,
             Some(TranscriptionProvider::default_ordered_route().to_vec())
         );
+        assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
         assert_eq!(config.pipeline.steps.len(), 1);
         assert_eq!(config.pipeline.steps[0].id, "refine");
         assert_eq!(config.pipeline.steps[0].cmd, "refine");
         assert_eq!(config.pipeline.steps[0].timeout_ms, 2_500);
+    }
+
+    #[test]
+    fn parses_explicit_streaming_transcription_config() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[transcription]
+mode = "streaming"
+providers = ["deepgram", "openai"]
+
+[transcription.streaming]
+frame_ms = 80
+finish_timeout_ms = 1500
+fallback_to_recorded_on_error = false
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("streaming transcription config should parse");
+
+        assert_eq!(config.transcription.mode, TranscriptionMode::Streaming);
+        assert_eq!(config.transcription.streaming.frame_ms, 80);
+        assert_eq!(config.transcription.streaming.finish_timeout_ms, 1_500);
+        assert!(!config.transcription.streaming.fallback_to_recorded_on_error);
+        assert_eq!(
+            config.transcription.providers,
+            Some(vec![
+                TranscriptionProvider::Deepgram,
+                TranscriptionProvider::OpenAi,
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_streaming_frame_ms_outside_initial_bounds() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[transcription.streaming]
+frame_ms = 10
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect_err("streaming frame below lower bound must fail");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::StreamingFrameMsOutOfRange {
+                field_name: "transcription.streaming.frame_ms".to_string(),
+                value: 10,
+                min: 20,
+                max: 200,
+            })
+        );
+
+        let error = AppConfig::from_toml_str(
+            r#"
+[transcription.streaming]
+frame_ms = 201
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect_err("streaming frame above upper bound must fail");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(ConfigValidationError::StreamingFrameMsOutOfRange {
+                field_name: "transcription.streaming.frame_ms".to_string(),
+                value: 201,
+                min: 20,
+                max: 200,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_positive_streaming_finish_timeout() {
+        let error = AppConfig::from_toml_str(
+            r#"
+[transcription.streaming]
+finish_timeout_ms = 0
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect_err("streaming finish timeout must be positive");
+
+        assert_eq!(
+            error.to_validation_error(),
+            Some(
+                ConfigValidationError::StreamingFinishTimeoutMsMustBePositive {
+                    field_name: "transcription.streaming.finish_timeout_ms".to_string(),
+                }
+            )
+        );
     }
 
     #[test]
@@ -1956,6 +2449,67 @@ mod tests {
                 providers: TranscriptionProvider::default_ordered_route().to_vec(),
                 source: TranscriptionRouteSource::ExplicitConfig,
             }
+        );
+        assert!(resolved.streaming_transcription_route().is_empty());
+        assert_eq!(
+            resolved
+                .effective_config
+                .pipeline
+                .steps
+                .iter()
+                .map(|step| step.cmd.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "stt_apple_speech",
+                "stt_whisper_cpp",
+                "stt_deepgram",
+                "stt_openai",
+                "stt_google",
+                "refine",
+            ]
+        );
+    }
+
+    #[test]
+    fn streaming_route_filters_local_providers_without_changing_recorded_route() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[transcription]
+mode = "streaming"
+providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("streaming route with local providers should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.transcription_route.providers,
+            vec![
+                TranscriptionProvider::AppleSpeech,
+                TranscriptionProvider::WhisperCpp,
+                TranscriptionProvider::Deepgram,
+                TranscriptionProvider::OpenAi,
+                TranscriptionProvider::Google,
+            ]
+        );
+        assert_eq!(
+            resolved.streaming_transcription_route(),
+            vec![
+                TranscriptionProvider::Deepgram,
+                TranscriptionProvider::OpenAi,
+                TranscriptionProvider::Google,
+            ]
         );
         assert_eq!(
             resolved
@@ -2038,8 +2592,79 @@ on_error = "abort"
                 endpoint: "https://api.deepgram.test/v1/listen".to_string(),
                 model: "nova-3-medical".to_string(),
                 language: "en-IE".to_string(),
+                ..super::DeepgramProviderConfig::default()
             }
         );
+    }
+
+    #[test]
+    fn parses_provider_streaming_overrides() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[providers.deepgram]
+streaming_endpoint = "wss://deepgram.example.test/v1/listen"
+streaming_interim_results = false
+
+[providers.openai]
+realtime_endpoint = "wss://openai.example.test/v1/realtime"
+realtime_model = "custom-realtime-whisper"
+realtime_language = "en-IE"
+realtime_delay = "balanced"
+
+[providers.google]
+streaming_project_id = "speech-project"
+streaming_location = "eu"
+streaming_recognizer = "muninn"
+streaming_model = "chirp_3"
+streaming_language_codes = ["en-IE", "en-US"]
+streaming_interim_results = false
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("provider streaming overrides should parse");
+
+        assert_eq!(
+            config.providers.deepgram.streaming_endpoint,
+            "wss://deepgram.example.test/v1/listen"
+        );
+        assert!(!config.providers.deepgram.streaming_interim_results);
+        assert_eq!(
+            config.providers.openai.realtime_endpoint,
+            "wss://openai.example.test/v1/realtime"
+        );
+        assert_eq!(
+            config.providers.openai.realtime_model,
+            "custom-realtime-whisper"
+        );
+        assert_eq!(
+            config.providers.openai.realtime_language.as_deref(),
+            Some("en-IE")
+        );
+        assert_eq!(config.providers.openai.realtime_delay, "balanced");
+        assert_eq!(
+            config.providers.google.streaming_project_id.as_deref(),
+            Some("speech-project")
+        );
+        assert_eq!(config.providers.google.streaming_location, "eu");
+        assert_eq!(config.providers.google.streaming_recognizer, "muninn");
+        assert_eq!(
+            config.providers.google.streaming_model.as_deref(),
+            Some("chirp_3")
+        );
+        assert_eq!(
+            config.providers.google.streaming_language_codes,
+            vec!["en-IE", "en-US"]
+        );
+        assert!(!config.providers.google.streaming_interim_results);
     }
 
     #[test]
@@ -2407,7 +3032,11 @@ on_error = "continue"
 profile = "mail"
 
 [transcription]
+mode = "streaming"
 providers = ["openai", "google"]
+
+[transcription.streaming]
+frame_ms = 80
 
 [pipeline]
 deadline_ms = 500
@@ -2431,6 +3060,14 @@ on_error = "continue"
             vec![TranscriptionProvider::OpenAi, TranscriptionProvider::Google]
         );
         assert_eq!(
+            resolved.effective_config.transcription.mode,
+            TranscriptionMode::Streaming
+        );
+        assert_eq!(
+            resolved.effective_config.transcription.streaming.frame_ms,
+            80
+        );
+        assert_eq!(
             resolved
                 .effective_config
                 .pipeline
@@ -2439,6 +3076,70 @@ on_error = "continue"
                 .map(|step| step.cmd.as_str())
                 .collect::<Vec<_>>(),
             vec!["stt_openai", "stt_google", "refine"]
+        );
+    }
+
+    #[test]
+    fn profile_transcription_override_can_change_mode_without_route_override() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "mail"
+
+[transcription]
+providers = ["deepgram", "google"]
+
+[profiles.mail.transcription]
+mode = "streaming"
+
+[profiles.mail.transcription.streaming]
+frame_ms = 60
+finish_timeout_ms = 1200
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("profile transcription mode override should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.transcription_route.providers,
+            vec![
+                TranscriptionProvider::Deepgram,
+                TranscriptionProvider::Google
+            ]
+        );
+        assert_eq!(
+            resolved.effective_config.transcription.mode,
+            TranscriptionMode::Streaming
+        );
+        assert_eq!(
+            resolved.effective_config.transcription.streaming.frame_ms,
+            60
+        );
+        assert_eq!(
+            resolved
+                .effective_config
+                .transcription
+                .streaming
+                .finish_timeout_ms,
+            1_200
+        );
+        assert!(
+            resolved
+                .effective_config
+                .transcription
+                .streaming
+                .fallback_to_recorded_on_error
         );
     }
 

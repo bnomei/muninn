@@ -40,6 +40,16 @@ sample_rate_khz = 16
 [transcription]
 # Local-first ordered provider route from spec 29.
 providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
+# Streaming transcription is opt-in. Recorded mode remains the default and still
+# writes a completed WAV for fallback/replay before downstream refine/injection.
+# Streaming-capable providers are deepgram, openai, and google; apple_speech and
+# whisper_cpp remain completed-recording providers for recorded mode/fallback.
+# mode = "streaming"
+#
+# [transcription.streaming]
+# frame_ms = 100
+# finish_timeout_ms = 2500
+# fallback_to_recorded_on_error = true
 
 [providers.apple_speech]
 # Apple-managed local backend for macOS 26+ completed recordings.
@@ -197,6 +207,11 @@ replay_max_bytes = 52_428_800
 # api_key = "set via OPENAI_API_KEY"
 endpoint = "https://api.openai.com/v1/audio/transcriptions"
 model = "gpt-4o-mini-transcribe"
+# Realtime transcription settings used only when [transcription].mode = "streaming".
+# realtime_endpoint = "wss://api.openai.com/v1/realtime"
+# realtime_model = "gpt-realtime-whisper"
+# realtime_language = "en"
+# realtime_delay = "low"
 
 [providers.whisper_cpp]
 # model defaults to "tiny.en", which resolves to ggml-tiny.en.bin under model_dir
@@ -214,6 +229,9 @@ endpoint = "https://api.deepgram.com/v1/listen"
 model = "nova-3"
 # language can also be overridden with DEEPGRAM_STT_LANGUAGE
 language = "en"
+# Streaming uses Deepgram's WebSocket API. Interim results stay transient.
+# streaming_endpoint = "wss://api.deepgram.com/v1/listen"
+# streaming_interim_results = true
 
 [providers.google]
 # api_key = "set via GOOGLE_API_KEY"
@@ -222,3 +240,12 @@ language = "en"
 endpoint = "https://speech.googleapis.com/v1/speech:recognize"
 # model = "latest_short"
 # model can also be overridden with GOOGLE_STT_MODEL
+# Streaming uses Google Speech-to-Text v2 and cannot rely on API-key-only auth;
+# the API key above remains valid for the existing REST fallback. The official
+# google-cloud-speech-v2 crate may require Rust 1.88+.
+# streaming_project_id = "your-gcp-project"
+# streaming_location = "global"
+# streaming_recognizer = "_"
+# streaming_model = "latest_short"
+# streaming_language_codes = ["en-US"]
+# streaming_interim_results = true

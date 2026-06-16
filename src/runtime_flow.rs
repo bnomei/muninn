@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::{
-    AppEvent, AppState, AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind,
+    AppEvent, AppState, AudioFrame, AudioRecorder, HotkeyAction, HotkeyEvent, HotkeyEventKind,
     IndicatorAdapter, IndicatorState, InjectionRoute, MacosAdapterResult, RecordedAudio,
     RecordingMode, TextInjector, TARGET_RUNTIME,
 };
@@ -64,13 +64,34 @@ where
     }
 
     pub async fn start_push_to_talk(&mut self, glyph: Option<char>) -> MacosAdapterResult<bool> {
-        self.start_recording(AppEvent::PttPressed, RecordingMode::PushToTalk, glyph)
+        self.start_push_to_talk_with_audio_sink(glyph, None).await
+    }
+
+    pub async fn start_push_to_talk_with_audio_sink(
+        &mut self,
+        glyph: Option<char>,
+        sink: Option<tokio::sync::mpsc::Sender<AudioFrame>>,
+    ) -> MacosAdapterResult<bool> {
+        self.start_recording(AppEvent::PttPressed, RecordingMode::PushToTalk, glyph, sink)
             .await
     }
 
     pub async fn start_done_mode(&mut self, glyph: Option<char>) -> MacosAdapterResult<bool> {
-        self.start_recording(AppEvent::DoneTogglePressed, RecordingMode::DoneMode, glyph)
-            .await
+        self.start_done_mode_with_audio_sink(glyph, None).await
+    }
+
+    pub async fn start_done_mode_with_audio_sink(
+        &mut self,
+        glyph: Option<char>,
+        sink: Option<tokio::sync::mpsc::Sender<AudioFrame>>,
+    ) -> MacosAdapterResult<bool> {
+        self.start_recording(
+            AppEvent::DoneTogglePressed,
+            RecordingMode::DoneMode,
+            glyph,
+            sink,
+        )
+        .await
     }
 
     pub async fn finish_push_to_talk_for_processing(
@@ -171,6 +192,7 @@ where
         event: AppEvent,
         mode: RecordingMode,
         glyph: Option<char>,
+        sink: Option<tokio::sync::mpsc::Sender<AudioFrame>>,
     ) -> MacosAdapterResult<bool> {
         let previous = self.state;
         let next = previous.on_event(event);
@@ -181,7 +203,15 @@ where
         self.indicator
             .set_state_with_glyph(IndicatorState::Recording { mode }, glyph)
             .await?;
-        if let Err(error) = self.recorder.start_recording().await {
+        let start_result = match sink {
+            Some(sink) => {
+                self.recorder
+                    .start_recording_with_audio_sink(Some(sink))
+                    .await
+            }
+            None => self.recorder.start_recording().await,
+        };
+        if let Err(error) = start_result {
             if let Err(reset_error) = self.indicator.set_state(IndicatorState::Idle).await {
                 warn!(
                     target: TARGET_RUNTIME,
