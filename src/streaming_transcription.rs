@@ -405,9 +405,7 @@ impl StreamingTranscriptionController {
 
     async fn finish(mut self) -> Option<StreamingTranscriptOutcome> {
         self.sink.take();
-        let Some(mut worker) = self.worker.take() else {
-            return None;
-        };
+        let mut worker = self.worker.take()?;
 
         let result = tokio::select! {
             result = &mut worker => StreamingWorkerResult::Finished(result),

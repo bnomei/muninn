@@ -686,8 +686,7 @@ mod tests {
     use std::{
         future::Future,
         pin::Pin,
-        sync::Arc,
-        task::{Context, Poll, Wake, Waker},
+        task::{Context, Poll, Waker},
     };
 
     use crate::{
@@ -701,15 +700,9 @@ mod tests {
         MockTextInjector,
     };
 
-    struct NoopWaker;
-
-    impl Wake for NoopWaker {
-        fn wake(self: Arc<Self>) {}
-    }
-
     fn block_on<F: Future>(future: F) -> F::Output {
-        let waker: Waker = Waker::from(Arc::new(NoopWaker));
-        let mut context = Context::from_waker(&waker);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
         let mut future = Pin::from(Box::new(future));
 
         loop {

@@ -8,7 +8,7 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-AI-native macOS menu bar dictation with a transcription and text pipeline.
+AI-native macOS menu bar dictation with recorded and streaming transcription, plus a configurable text pipeline.
 
 Muninn records speech, transcribes it, then runs the transcript through a configurable pipeline before injecting the final text back into the active app. The core idea is not just voice capture. It is the AI-native pass after recording that can correct, reshape, or enhance the transcribed text so technical dictation survives intact.
 

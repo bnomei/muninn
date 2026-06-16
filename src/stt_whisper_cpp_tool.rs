@@ -965,7 +965,7 @@ fn convert_to_mono(samples: Vec<f32>, channels: u16) -> Result<Vec<f32>, CliErro
         }),
         channel_count => {
             let channels = channel_count as usize;
-            if samples.len() % channels != 0 {
+            if !samples.len().is_multiple_of(channels) {
                 return Err(CliError::new(
                     "wav_channel_conversion_failed",
                     format!(

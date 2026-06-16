@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-06-16
+
+### Added
+
+- Added opt-in streaming transcription with Deepgram, OpenAI Realtime, and Google Speech-to-Text v2 providers.
+- Streaming mode now records the completed WAV while sending live audio, then seeds the same transcript envelope, refine pass, scoring, replay, and injection flow used by recorded mode.
+- Added streaming fallback behavior so failed, unavailable, timed-out, or empty streaming attempts can continue through the completed-WAV transcription route when configured.
+
 ## [0.4.0] - 2026-05-30
 
 ### Added

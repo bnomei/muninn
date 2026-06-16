@@ -133,7 +133,7 @@ pub(crate) fn install_url_scheme_handler(proxy: EventLoopProxy<UserEvent>) {
         } else {
             let name: *mut AnyObject = msg_send![
                 class!(NSString),
-                stringWithUTF8String: b"NSApplicationWillFinishLaunchingNotification\0".as_ptr() as *const c_char
+                stringWithUTF8String: c"NSApplicationWillFinishLaunchingNotification".as_ptr()
             ];
             let _: () = msg_send![
                 center,

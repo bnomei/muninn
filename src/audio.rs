@@ -775,7 +775,7 @@ fn audio_frame_sample_count(sample_rate_hz: u32, channels: u16, frame_ms: u16) -
     let sample_rate_hz = sample_rate_hz.max(1) as u64;
     let channels = channels.max(1) as u64;
     let frame_ms = frame_ms.max(1) as u64;
-    let frames = ((sample_rate_hz * frame_ms) + 999) / 1_000;
+    let frames = (sample_rate_hz * frame_ms).div_ceil(1_000);
     frames.saturating_mul(channels).max(1) as usize
 }
 
@@ -1129,7 +1129,7 @@ mod tests {
         };
         configure_audio_sink(&mut capture, Some(sink), 1_000, 2, 2);
 
-        append_capped_samples(&mut capture, 16, (1..=9).into_iter());
+        append_capped_samples(&mut capture, 16, 1..=9);
 
         assert_eq!(capture.samples, (1..=9).collect::<Vec<_>>());
         assert_eq!(
@@ -1170,7 +1170,7 @@ mod tests {
         };
         configure_audio_sink(&mut capture, Some(sink), 1_000, 1, 2);
 
-        append_capped_samples(&mut capture, 16, (1..=6).into_iter());
+        append_capped_samples(&mut capture, 16, 1..=6);
 
         assert_eq!(capture.samples, (1..=6).collect::<Vec<_>>());
         assert_eq!(
