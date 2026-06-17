@@ -84,7 +84,7 @@ pub use audio::MacosAudioRecorder;
 pub use config::{
     resolve_config_path, AppConfig, AppleSpeechProviderConfig, ConfigError, ConfigValidationError,
     DeepgramProviderConfig, ExternalControlConfig, OnErrorPolicy, PayloadFormat, ProfileConfig,
-    ProfileRuleConfig, ProvidersConfig, RecordingConfig, RefineOverrides,
+    ProfileRuleConfig, ProvidersConfig, RecordingConfig, RefineOverrides, ReplayDetailMode,
     ResolvedBuiltinStepConfig, ResolvedProfileSelection, ResolvedUtteranceConfig,
     TranscriptOverrides, TranscriptionConfig, TriggerType, VoiceConfig, WhisperCppDevicePreference,
     WhisperCppProviderConfig,

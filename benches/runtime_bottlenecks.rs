@@ -9,7 +9,8 @@ use criterion::{
 use muninn::audio::benchmark_render_output_checksum;
 use muninn::config::{
     AppConfig, OnErrorPolicy, PayloadFormat, PipelineConfig, PipelineStepConfig, ProfileConfig,
-    ProfileRuleConfig, RecordingConfig, StepIoMode, TranscriptOverrides, VoiceConfig,
+    ProfileRuleConfig, RecordingConfig, ReplayDetailMode, StepIoMode, TranscriptOverrides,
+    VoiceConfig,
 };
 use muninn::scoring::{apply_scored_replacements_to_envelope, Thresholds};
 use muninn::{
@@ -482,6 +483,7 @@ fn replay_bench_input(replay_retain_audio: bool) -> ReplayBenchInput {
 
     let mut config = AppConfig::launchable_default();
     config.logging.replay_enabled = true;
+    config.logging.replay_detail = ReplayDetailMode::FullDebug;
     config.logging.replay_retain_audio = replay_retain_audio;
     config.logging.replay_dir = replay_root;
     config.logging.replay_retention_days = 7;

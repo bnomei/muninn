@@ -198,7 +198,11 @@ mcp_bind_address = "127.0.0.1:2769"
 
 [logging]
 replay_enabled = false
-replay_retain_audio = true
+# "minimal" stores metadata only. Use "full_debug" only when you need
+# detailed envelopes, pipeline outcomes, target context, and replay config.
+replay_detail = "minimal"
+# Audio is retained only when replay_detail = "full_debug" and this is true.
+replay_retain_audio = false
 replay_dir = "~/.local/state/muninn/replay"
 replay_retention_days = 7
 replay_max_bytes = 52_428_800

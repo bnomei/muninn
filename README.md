@@ -192,8 +192,8 @@ Vocabulary JSON:
 - prompt-based vocabulary biasing is best-effort only
 - provider-native vocabulary and adaptation features remain out of scope
 
-Replay artifacts redact provider secrets before they are written.
-When replay logging retains audio, Muninn prefers a filesystem hard link and falls back to a copy.
+Replay artifacts are privacy-preserving by default. With `replay_detail = "minimal"`, Muninn writes only sparse utterance metadata and omits transcripts, prompts, target context, pipeline output, injection text, and audio. Use `replay_detail = "full_debug"` only when you need detailed debugging artifacts.
+When full-debug replay logging retains audio, Muninn prefers a filesystem hard link and falls back to a copy.
 
 ## Contextual Profiles And Voices
 
@@ -375,7 +375,7 @@ echo "Using config: $CONFIG_PATH"
 The sample enables the local-first ordered transcription route and keeps `refine` as the first explicit pipeline step.
 In other words: resolve providers, transcribe with the first usable leg, run Muninn's developer-focused refine pass, then inject.
 It also defaults recording output to `mono = true` and `sample_rate_khz = 16`.
-Replay audio retention defaults to `replay_retain_audio = true`; set it to `false` if you only want replay metadata.
+Replay logging defaults to `replay_detail = "minimal"` and `replay_retain_audio = false`; set `replay_detail = "full_debug"` plus `replay_retain_audio = true` only when detailed replay artifacts and audio are needed.
 
 ### 3) Optional: preinstall a local Whisper model
 
@@ -531,10 +531,12 @@ This profile now skips the local-first defaults while other profiles continue in
 - tracing logs go to stderr and are controlled with `RUST_LOG`
 - `RUST_LOG=recording=debug` now logs `capture_device_name` and records when Muninn rebuilds its cached capture engine after the macOS default input device changes
 - replay logging is optional and writes per-utterance artifacts to `replay_dir`
-- `replay_retain_audio = true` keeps an `audio.*` artifact when possible by trying a hard link before copying
-- `replay_retain_audio = false` keeps `record.json` and metadata only
-- streaming partial/interim results are not replay history; replay records the final input envelope and pipeline outcome only
-- replay snapshots redact provider secrets
+- `replay_detail = "minimal"` keeps sparse `record.json` metadata only
+- `replay_detail = "full_debug"` adds redacted config, resolved target context, final envelopes, pipeline outcome, refine context, and injection route for debugging
+- `replay_retain_audio = true` keeps an `audio.*` artifact only when `replay_detail = "full_debug"` by trying a hard link before copying
+- `replay_retain_audio = false` never retains audio
+- streaming partial/interim results are not replay history; full-debug replay records the final input envelope and pipeline outcome only
+- full-debug replay snapshots redact provider secrets and prompt fields
 
 ## Current Limits
 

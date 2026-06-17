@@ -1274,10 +1274,19 @@ impl ResolvedBuiltinStepConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayDetailMode {
+    #[default]
+    Minimal,
+    FullDebug,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     pub replay_enabled: bool,
+    pub replay_detail: ReplayDetailMode,
     pub replay_retain_audio: bool,
     pub replay_dir: PathBuf,
     pub replay_retention_days: u32,
@@ -1288,7 +1297,8 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             replay_enabled: false,
-            replay_retain_audio: true,
+            replay_detail: ReplayDetailMode::Minimal,
+            replay_retain_audio: false,
             replay_dir: PathBuf::from("~/.local/state/muninn/replay"),
             replay_retention_days: 7,
             replay_max_bytes: 52_428_800,
@@ -2129,7 +2139,7 @@ mod tests {
 
     use super::{
         resolve_config_path_with, AppConfig, ConfigError, ConfigValidationError, PayloadFormat,
-        RefineProvider, TargetContextSnapshot, TranscriptionMode, TriggerType,
+        RefineProvider, ReplayDetailMode, TargetContextSnapshot, TranscriptionMode, TriggerType,
         WhisperCppDevicePreference,
     };
 
@@ -2141,7 +2151,8 @@ mod tests {
         assert_eq!(config.pipeline.payload_format, PayloadFormat::JsonObject);
         assert_eq!(config.pipeline.steps.len(), 2);
         assert!(!config.logging.replay_enabled);
-        assert!(config.logging.replay_retain_audio);
+        assert_eq!(config.logging.replay_detail, ReplayDetailMode::Minimal);
+        assert!(!config.logging.replay_retain_audio);
         assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
         assert_eq!(config.transcription.streaming.frame_ms, 100);
         assert_eq!(config.transcription.streaming.finish_timeout_ms, 2_500);
@@ -2221,7 +2232,8 @@ mod tests {
             None
         );
         assert!(!config.logging.replay_enabled);
-        assert!(config.logging.replay_retain_audio);
+        assert_eq!(config.logging.replay_detail, ReplayDetailMode::Minimal);
+        assert!(!config.logging.replay_retain_audio);
         assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
         assert_eq!(config.transcription.streaming.frame_ms, 100);
         assert_eq!(config.transcription.streaming.finish_timeout_ms, 2_500);
@@ -3257,7 +3269,7 @@ on_error = "abort"
         let config = AppConfig::from_toml_str(
             r#"
 [logging]
-replay_retain_audio = false
+replay_retain_audio = true
 
 [pipeline]
 deadline_ms = 500
@@ -3272,7 +3284,30 @@ on_error = "abort"
         )
         .expect("replay audio retention override should parse");
 
-        assert!(!config.logging.replay_retain_audio);
+        assert!(config.logging.replay_retain_audio);
+    }
+
+    #[test]
+    fn parses_replay_detail_override() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[logging]
+replay_detail = "full_debug"
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "step-a"
+timeout_ms = 100
+on_error = "abort"
+"#,
+        )
+        .expect("replay detail override should parse");
+
+        assert_eq!(config.logging.replay_detail, ReplayDetailMode::FullDebug);
     }
 
     #[test]
