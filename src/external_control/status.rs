@@ -72,7 +72,7 @@ impl RuntimeStatusHandle {
     }
 
     pub(crate) fn snapshot(&self) -> RuntimeStatusSnapshot {
-        self.with_inner(|inner| snapshot_from_inner(inner))
+        self.with_inner(snapshot_from_inner)
     }
 
     pub(crate) fn set_indicator_state(&self, state: IndicatorState) {

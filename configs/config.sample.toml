@@ -191,9 +191,9 @@ url_scheme_enabled = true
 # mcp_enabled runs a localhost streamable-HTTP MCP server exposing recording-control
 # tools (start_recording, stop_recording, cancel_recording).
 mcp_enabled = false
-# The server has no authentication; keep mcp_bind_address on 127.0.0.1 so only this
-# machine can control recording. Binding to 0.0.0.0 or a LAN IP exposes recording
-# control to any host that can reach the address (Muninn logs a warning in that case).
+# The server has no authentication; mcp_bind_address must be an explicit loopback
+# socket address such as 127.0.0.1:2769. Wildcard, LAN, hostname, and other
+# non-loopback binds are rejected.
 mcp_bind_address = "127.0.0.1:2769"
 
 [logging]

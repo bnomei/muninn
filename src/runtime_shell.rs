@@ -137,6 +137,7 @@ impl AppRuntime {
                             proxy.clone(),
                             current_config.external_control.mcp_bind_address.clone(),
                             runtime_status.clone(),
+                            current_config.external_control.start_recording_enabled,
                         );
                     }
                 }

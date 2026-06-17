@@ -12,7 +12,7 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
 };
 use tao::event_loop::EventLoopProxy;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::{ExternalControlAction, RuntimeStatusHandle};
 use crate::logging::TARGET_RUNTIME;
@@ -26,12 +26,21 @@ use crate::runtime_tray::{send_user_event, UserEvent};
 pub(crate) struct RecordingControlServer {
     proxy: EventLoopProxy<UserEvent>,
     status: RuntimeStatusHandle,
+    start_recording_enabled: bool,
 }
 
 #[tool_router]
 impl RecordingControlServer {
-    fn new(proxy: EventLoopProxy<UserEvent>, status: RuntimeStatusHandle) -> Self {
-        Self { proxy, status }
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        status: RuntimeStatusHandle,
+        start_recording_enabled: bool,
+    ) -> Self {
+        Self {
+            proxy,
+            status,
+            start_recording_enabled,
+        }
     }
 
     fn dispatch(
@@ -82,7 +91,28 @@ impl RecordingControlServer {
         )
     )]
     fn start_recording(&self) -> Result<CallToolResult, McpError> {
-        self.dispatch(ExternalControlAction::Start, "recording start requested")
+        if !self.start_recording_enabled {
+            return Ok(CallToolResult::success(vec![Content::json(
+                serde_json::json!({
+                    "status": "disabled",
+                    "action": "start_recording",
+                    "reason": "external_control.start_recording_enabled is false"
+                }),
+            )?]));
+        }
+
+        send_user_event(
+            &self.proxy,
+            UserEvent::ExternalControl(ExternalControlAction::Start),
+            "mcp_external_control",
+        );
+        Ok(CallToolResult::success(vec![Content::json(
+            serde_json::json!({
+                "status": "enabled",
+                "action": "start_recording",
+                "message": "recording start requested"
+            }),
+        )?]))
     }
 
     #[tool(
@@ -144,6 +174,7 @@ pub(crate) fn spawn_mcp_server(
     proxy: EventLoopProxy<UserEvent>,
     bind_address: String,
     status: RuntimeStatusHandle,
+    start_recording_enabled: bool,
 ) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -156,43 +187,61 @@ pub(crate) fn spawn_mcp_server(
                 return;
             }
         };
-        runtime.block_on(serve(proxy, bind_address, status));
+        runtime.block_on(serve(proxy, bind_address, status, start_recording_enabled));
     });
 }
 
-/// Warn when the MCP server is bound to a non-loopback address.
+/// Validate that the MCP server bind address is an explicit loopback socket address.
 ///
-/// The server exposes recording-control tools with no authentication, relying
-/// entirely on the bind address staying loopback-only. A non-loopback bind
-/// (for example `0.0.0.0` or a LAN IP) lets any host that can reach the address
-/// start or stop recording. Hostname binds that do not parse as a socket
-/// address are left for `TcpListener::bind` to resolve.
-fn warn_if_exposed_bind_address(bind_address: &str) {
-    if let Ok(addr) = bind_address.parse::<SocketAddr>() {
-        if !addr.ip().is_loopback() {
-            warn!(
-                target: TARGET_RUNTIME,
-                %bind_address,
-                "external-control MCP server is bound to a non-loopback address and has no authentication; any host that can reach this address can start or stop recording. Bind to 127.0.0.1 unless you intend to expose it."
-            );
-        }
+/// The server exposes recording-control tools with no authentication, so it must
+/// not bind to wildcard, LAN, or other non-loopback addresses. Hostnames are
+/// rejected instead of resolved so the policy is visible from configuration.
+fn validate_bind_address(bind_address: &str) -> Result<SocketAddr, String> {
+    let addr = bind_address.parse::<SocketAddr>().map_err(|error| {
+        format!("mcp_bind_address must be an explicit loopback socket address: {error}")
+    })?;
+
+    if !addr.ip().is_loopback() {
+        return Err(format!(
+            "mcp_bind_address must be loopback-only; {bind_address} is not allowed"
+        ));
     }
+
+    Ok(addr)
 }
 
 async fn serve(
     proxy: EventLoopProxy<UserEvent>,
     bind_address: String,
     status: RuntimeStatusHandle,
+    start_recording_enabled: bool,
 ) {
-    warn_if_exposed_bind_address(&bind_address);
+    let bind_addr = match validate_bind_address(&bind_address) {
+        Ok(addr) => addr,
+        Err(error) => {
+            error!(
+                target: TARGET_RUNTIME,
+                %bind_address,
+                %error,
+                "refusing to start external-control MCP server"
+            );
+            return;
+        }
+    };
     let service = StreamableHttpService::new(
-        move || Ok(RecordingControlServer::new(proxy.clone(), status.clone())),
+        move || {
+            Ok(RecordingControlServer::new(
+                proxy.clone(),
+                status.clone(),
+                start_recording_enabled,
+            ))
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );
     let app = axum::Router::new().nest_service("/mcp", service);
 
-    let listener = match tokio::net::TcpListener::bind(&bind_address).await {
+    let listener = match tokio::net::TcpListener::bind(bind_addr).await {
         Ok(listener) => listener,
         Err(error) => {
             error!(
@@ -211,5 +260,23 @@ async fn serve(
     );
     if let Err(error) = axum::serve(listener, app).await {
         error!(target: TARGET_RUNTIME, %error, "external-control MCP server stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_bind_address;
+
+    #[test]
+    fn accepts_loopback_bind_addresses() {
+        assert!(validate_bind_address("127.0.0.1:2769").is_ok());
+        assert!(validate_bind_address("[::1]:2769").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_loopback_bind_addresses() {
+        assert!(validate_bind_address("0.0.0.0:2769").is_err());
+        assert!(validate_bind_address("192.168.1.10:2769").is_err());
+        assert!(validate_bind_address("[::]:2769").is_err());
     }
 }
