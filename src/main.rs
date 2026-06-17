@@ -10,6 +10,8 @@ mod internal_tools;
 mod logging;
 mod refine;
 mod replay;
+mod replay_dispatch;
+mod runtime_permissions;
 mod runtime_pipeline;
 mod runtime_shell;
 mod runtime_tray;
@@ -25,15 +27,15 @@ use muninn::config::resolve_config_path;
 use muninn::AppConfig;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+pub(crate) use crate::runtime_permissions::{
+    refresh_injection_permissions_for_user_action, refresh_recording_permissions_for_user_action,
+    should_abort_injection, should_abort_recording_start, RecordingStartSource,
+};
 use crate::runtime_shell::AppRuntime;
 #[cfg(test)]
 pub(crate) use crate::runtime_tray::{map_tray_event, resolved_indicator_glyph, IndicatorGlyph};
 use crate::runtime_worker::RuntimeMessage;
-#[cfg(test)]
-pub(crate) use crate::runtime_worker::{
-    refresh_injection_permissions_for_user_action, refresh_recording_permissions_for_user_action,
-    should_abort_injection, should_abort_recording_start, RecordingStartSource,
-};
 
 const INDICATOR_ICON_SIZE_PX: u32 = 36;
 const DEFAULT_INDICATOR_GLYPH: char = 'M';
