@@ -14,7 +14,7 @@ use rmcp::{
 use tao::event_loop::EventLoopProxy;
 use tracing::{error, info};
 
-use super::ExternalControlAction;
+use super::{ExternalControlAction, RuntimeStatusHandle};
 use crate::logging::TARGET_RUNTIME;
 use crate::runtime_tray::{send_user_event, UserEvent};
 
@@ -25,14 +25,20 @@ use crate::runtime_tray::{send_user_event, UserEvent};
 #[derive(Clone)]
 pub(crate) struct RecordingControlServer {
     proxy: EventLoopProxy<UserEvent>,
+    status: RuntimeStatusHandle,
     start_recording_enabled: bool,
 }
 
 #[tool_router]
 impl RecordingControlServer {
-    fn new(proxy: EventLoopProxy<UserEvent>, start_recording_enabled: bool) -> Self {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        status: RuntimeStatusHandle,
+        start_recording_enabled: bool,
+    ) -> Self {
         Self {
             proxy,
+            status,
             start_recording_enabled,
         }
     }
@@ -48,6 +54,26 @@ impl RecordingControlServer {
             "mcp_external_control",
         );
         Ok(CallToolResult::success(vec![Content::text(message)]))
+    }
+
+    #[tool(
+        description = "Return Muninn runtime status without starting or stopping recording. \
+            The response is JSON with state, recording_active, busy, permissions, \
+            and optional failure fields. State is one of idle, recording_active, \
+            permission_blocked, already_running, or failed.",
+        annotations(
+            title = "Get runtime status",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    fn get_status(&self) -> Result<CallToolResult, McpError> {
+        let json = serde_json::to_string(&self.status.snapshot()).map_err(|error| {
+            McpError::internal_error(format!("failed to serialize runtime status: {error}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(
@@ -130,11 +156,13 @@ impl ServerHandler for RecordingControlServer {
         let mut info = ServerInfo::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
-            "Control Muninn dictation (speech-to-text) recording. Typical flow: \
-             call start_recording, let the user speak, then call stop_recording \
-             to transcribe and type the text into their focused app (the user \
-             can also stop via the menu-bar tray icon or their hotkey). Use \
-             cancel_recording to discard a recording without transcribing."
+            "Control Muninn dictation (speech-to-text) recording. Call get_status \
+             to inspect idle, recording, permission-blocked, busy, or failed \
+             state without starting work. Typical flow: call start_recording, \
+             let the user speak, then call stop_recording to transcribe and \
+             type the text into their focused app (the user can also stop via \
+             the menu-bar tray icon or their hotkey). Use cancel_recording to \
+             discard a recording without transcribing."
                 .to_string(),
         );
         info
@@ -145,6 +173,7 @@ impl ServerHandler for RecordingControlServer {
 pub(crate) fn spawn_mcp_server(
     proxy: EventLoopProxy<UserEvent>,
     bind_address: String,
+    status: RuntimeStatusHandle,
     start_recording_enabled: bool,
 ) {
     std::thread::spawn(move || {
@@ -158,7 +187,7 @@ pub(crate) fn spawn_mcp_server(
                 return;
             }
         };
-        runtime.block_on(serve(proxy, bind_address, start_recording_enabled));
+        runtime.block_on(serve(proxy, bind_address, status, start_recording_enabled));
     });
 }
 
@@ -184,6 +213,7 @@ fn validate_bind_address(bind_address: &str) -> Result<SocketAddr, String> {
 async fn serve(
     proxy: EventLoopProxy<UserEvent>,
     bind_address: String,
+    status: RuntimeStatusHandle,
     start_recording_enabled: bool,
 ) {
     let bind_addr = match validate_bind_address(&bind_address) {
@@ -202,6 +232,7 @@ async fn serve(
         move || {
             Ok(RecordingControlServer::new(
                 proxy.clone(),
+                status.clone(),
                 start_recording_enabled,
             ))
         },

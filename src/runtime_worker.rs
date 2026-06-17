@@ -13,7 +13,7 @@ use muninn::{
 use tao::event_loop::EventLoopProxy;
 use tracing::{debug, error, info, warn};
 
-use crate::external_control::{ExternalControlAction, ExternalControlOutcome};
+use crate::external_control::{ExternalControlAction, ExternalControlOutcome, RuntimeStatusHandle};
 use crate::runtime_tray::{send_user_event, EventLoopIndicator, UserEvent};
 use crate::{logging, runtime_pipeline, HOTKEY_RECOVERY_DELAY, OUTPUT_INDICATOR_MIN_DURATION};
 
@@ -29,6 +29,7 @@ pub(crate) fn spawn_runtime_worker(
     preflight: PermissionPreflightStatus,
     proxy: EventLoopProxy<UserEvent>,
     runtime_events: tokio::sync::mpsc::Receiver<RuntimeMessage>,
+    runtime_status: RuntimeStatusHandle,
 ) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -49,7 +50,7 @@ pub(crate) fn spawn_runtime_worker(
         };
 
         let indicator = EventLoopIndicator::new(proxy.clone());
-        let worker = RuntimeWorker::new(config, preflight, indicator);
+        let worker = RuntimeWorker::new(config, preflight, indicator, runtime_status);
         if let Err(error) = runtime.block_on(worker.run(runtime_events)) {
             let message = format!("{error:#}");
             logging::log_runtime_worker_failed("runtime_run", message.clone());
@@ -69,6 +70,7 @@ where
     config: AppConfig,
     preflight: PermissionPreflightStatus,
     indicator: I,
+    runtime_status: RuntimeStatusHandle,
 }
 
 struct ActiveUtterance {
@@ -96,11 +98,17 @@ impl<I> RuntimeWorker<I>
 where
     I: IndicatorAdapter,
 {
-    fn new(config: AppConfig, preflight: PermissionPreflightStatus, indicator: I) -> Self {
+    fn new(
+        config: AppConfig,
+        preflight: PermissionPreflightStatus,
+        indicator: I,
+        runtime_status: RuntimeStatusHandle,
+    ) -> Self {
         Self {
             config,
             preflight,
             indicator,
+            runtime_status,
         }
     }
 
@@ -244,6 +252,7 @@ where
                     .await
                     .context("refreshing permissions before push-to-talk recording")?;
                     self.preflight = recording_permissions.preflight;
+                    self.runtime_status.set_permissions(self.preflight);
                     if should_abort_recording_start(
                         self.preflight,
                         recording_permissions.requested_microphone,
@@ -319,6 +328,7 @@ where
                     .await
                     .context("refreshing permissions before done-mode recording")?;
                     self.preflight = recording_permissions.preflight;
+                    self.runtime_status.set_permissions(self.preflight);
                     if should_abort_recording_start(
                         self.preflight,
                         recording_permissions.requested_microphone,

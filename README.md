@@ -308,7 +308,7 @@ The scheme only works for the installed `.app` bundle that registers it through 
 
 ### MCP server
 
-When `mcp_enabled = true`, Muninn runs a streamable-HTTP [MCP](https://modelcontextprotocol.io) server at `http://<mcp_bind_address>/mcp` (default `http://127.0.0.1:2769/mcp`) exposing three tools: `start_recording`, `stop_recording`, and `cancel_recording`. (The `muninn://toggle` URL verb has no MCP equivalent — agents should use the explicit start/stop tools.) The `start_recording` tool returns a structured `enabled` or `disabled` result before dispatching the request.
+When `mcp_enabled = true`, Muninn runs a streamable-HTTP [MCP](https://modelcontextprotocol.io) server at `http://<mcp_bind_address>/mcp` (default `http://127.0.0.1:2769/mcp`) exposing four tools: `get_status`, `start_recording`, `stop_recording`, and `cancel_recording`. (The `muninn://toggle` URL verb has no MCP equivalent — agents should use the explicit start/stop tools.) The `start_recording` tool returns a structured `enabled` or `disabled` result before dispatching the request.
 
 Register it with an MCP-aware client, for example the Augment CLI:
 
@@ -316,6 +316,22 @@ Register it with an MCP-aware client, for example the Augment CLI:
 auggie mcp add muninn --transport http --url http://127.0.0.1:2769/mcp
 ```
 
+- `get_status` is read-only and never starts, stops, or cancels work. It returns a JSON object as MCP text content with this shape:
+
+```json
+{
+  "state": "idle",
+  "recording_active": false,
+  "busy": false,
+  "permissions": {
+    "microphone": "granted",
+    "accessibility": "granted",
+    "input_monitoring": "granted"
+  }
+}
+```
+
+- `state` is one of `idle`, `recording_active`, `permission_blocked`, `already_running`, or `failed`. `already_running` covers non-recording busy work such as transcription or pipeline processing, and `failed` includes a `failure.message` field. Permission values are `granted`, `denied`, `not_determined`, `restricted`, or `unsupported`.
 - The server starts only at app launch. Toggling `mcp_enabled` later requires restarting Muninn; it is not started or stopped by live config reload.
 - The endpoint only resolves while Muninn is running.
 
