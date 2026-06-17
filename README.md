@@ -319,7 +319,7 @@ auggie mcp add muninn --transport http --url http://127.0.0.1:2769/mcp
 
 ### Security
 
-The MCP server has no authentication and relies entirely on a loopback-only bind. Keep `mcp_bind_address` on `127.0.0.1` so only this machine can control recording. Binding to `0.0.0.0` or a LAN IP exposes recording control to any host that can reach the address; Muninn logs a startup warning when the bind address is non-loopback.
+The MCP server has no authentication and relies entirely on a loopback-only bind. Keep `mcp_bind_address` on an explicit loopback socket address such as `127.0.0.1:2769`; Muninn refuses to start the MCP server for wildcard, LAN, hostname, or other non-loopback bind addresses.
 
 ## Quick Start
 

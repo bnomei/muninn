@@ -25,7 +25,7 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
-- The MCP server has no authentication and relies on a loopback-only bind. Muninn now logs a startup warning when `mcp_bind_address` resolves to a non-loopback address (for example `0.0.0.0` or a LAN IP).
+- The MCP server has no authentication and relies on a loopback-only bind. Muninn now refuses to start the MCP server when `mcp_bind_address` is a wildcard, LAN, hostname, or other non-loopback address.
 
 ## [0.3.1] - 2026-04-29
 
