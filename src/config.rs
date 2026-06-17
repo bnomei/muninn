@@ -302,6 +302,8 @@ pub struct ExternalControlConfig {
     pub url_scheme_enabled: bool,
     /// Run a localhost streamable-HTTP MCP server exposing recording-control tools.
     pub mcp_enabled: bool,
+    /// Allow external controls to start recording. Stop/cancel remain available for active captures.
+    pub start_recording_enabled: bool,
     /// Socket address the MCP server binds to when enabled.
     pub mcp_bind_address: String,
 }
@@ -311,6 +313,7 @@ impl Default for ExternalControlConfig {
         Self {
             url_scheme_enabled: true,
             mcp_enabled: false,
+            start_recording_enabled: false,
             mcp_bind_address: "127.0.0.1:2769".to_string(),
         }
     }
@@ -4209,6 +4212,21 @@ on_error = "abort"
             fallback.fallback_reason.as_deref(),
             Some("no profile rule matched; using default profile `default`")
         );
+    }
+
+    #[test]
+    fn external_start_recording_requires_explicit_opt_in() {
+        let default_config = AppConfig::launchable_default();
+        assert!(!default_config.external_control.start_recording_enabled);
+
+        let config = AppConfig::from_toml_str(
+            r#"
+[external_control]
+start_recording_enabled = true
+"#,
+        )
+        .expect("external start opt-in should parse");
+        assert!(config.external_control.start_recording_enabled);
     }
 
     #[test]

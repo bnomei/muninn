@@ -29,28 +29,58 @@ pub(crate) enum ExternalControlAction {
     Cancel,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalControlOutcome {
+    Enabled(AppEvent),
+    Disabled,
+    Noop,
+}
+
 impl ExternalControlAction {
     /// Map an action onto the [`AppEvent`] appropriate for the current state.
     ///
-    /// Returns `None` when the action would be a no-op so callers can skip the
-    /// runtime round-trip entirely.
-    pub(crate) fn to_app_event(self, state: AppState) -> Option<AppEvent> {
+    /// Start requests are explicitly gated by config. `Noop` means the action
+    /// is allowed but has no state transition to perform.
+    pub(crate) fn resolve(
+        self,
+        state: AppState,
+        start_recording_enabled: bool,
+    ) -> ExternalControlOutcome {
         match self {
             ExternalControlAction::Start => match state {
-                AppState::Idle => Some(AppEvent::DoneTogglePressed),
-                _ => None,
+                AppState::Idle if start_recording_enabled => {
+                    ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
+                }
+                AppState::Idle => ExternalControlOutcome::Disabled,
+                _ => ExternalControlOutcome::Noop,
             },
-            ExternalControlAction::Stop => Self::stop_event(state),
+            ExternalControlAction::Stop => Self::stop_event(state).map_or(
+                ExternalControlOutcome::Noop,
+                ExternalControlOutcome::Enabled,
+            ),
             ExternalControlAction::Toggle => match state {
-                AppState::Idle => Some(AppEvent::DoneTogglePressed),
-                _ => Self::stop_event(state),
+                AppState::Idle if start_recording_enabled => {
+                    ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
+                }
+                AppState::Idle => ExternalControlOutcome::Disabled,
+                _ => Self::stop_event(state).map_or(
+                    ExternalControlOutcome::Noop,
+                    ExternalControlOutcome::Enabled,
+                ),
             },
             ExternalControlAction::Cancel => match state {
                 AppState::RecordingPushToTalk | AppState::RecordingDone => {
-                    Some(AppEvent::CancelPressed)
+                    ExternalControlOutcome::Enabled(AppEvent::CancelPressed)
                 }
-                _ => None,
+                _ => ExternalControlOutcome::Noop,
             },
+        }
+    }
+
+    pub(crate) fn to_app_event(self, state: AppState) -> Option<AppEvent> {
+        match self.resolve(state, true) {
+            ExternalControlOutcome::Enabled(app_event) => Some(app_event),
+            ExternalControlOutcome::Disabled | ExternalControlOutcome::Noop => None,
         }
     }
 
@@ -139,36 +169,40 @@ mod tests {
     #[test]
     fn start_is_noop_unless_idle() {
         assert_eq!(
-            ExternalControlAction::Start.to_app_event(AppState::Idle),
-            Some(AppEvent::DoneTogglePressed)
+            ExternalControlAction::Start.resolve(AppState::Idle, true),
+            ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
         );
         assert_eq!(
-            ExternalControlAction::Start.to_app_event(AppState::RecordingDone),
-            None
+            ExternalControlAction::Start.resolve(AppState::RecordingDone, true),
+            ExternalControlOutcome::Noop
+        );
+        assert_eq!(
+            ExternalControlAction::Start.resolve(AppState::Idle, false),
+            ExternalControlOutcome::Disabled
         );
     }
 
     #[test]
     fn stop_and_cancel_depend_on_active_capture() {
         assert_eq!(
-            ExternalControlAction::Stop.to_app_event(AppState::RecordingPushToTalk),
-            Some(AppEvent::PttReleased)
+            ExternalControlAction::Stop.resolve(AppState::RecordingPushToTalk, false),
+            ExternalControlOutcome::Enabled(AppEvent::PttReleased)
         );
         assert_eq!(
-            ExternalControlAction::Stop.to_app_event(AppState::RecordingDone),
-            Some(AppEvent::DoneTogglePressed)
+            ExternalControlAction::Stop.resolve(AppState::RecordingDone, false),
+            ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
         );
         assert_eq!(
-            ExternalControlAction::Stop.to_app_event(AppState::Idle),
-            None
+            ExternalControlAction::Stop.resolve(AppState::Idle, false),
+            ExternalControlOutcome::Noop
         );
         assert_eq!(
-            ExternalControlAction::Cancel.to_app_event(AppState::RecordingDone),
-            Some(AppEvent::CancelPressed)
+            ExternalControlAction::Cancel.resolve(AppState::RecordingDone, false),
+            ExternalControlOutcome::Enabled(AppEvent::CancelPressed)
         );
         assert_eq!(
-            ExternalControlAction::Cancel.to_app_event(AppState::Idle),
-            None
+            ExternalControlAction::Cancel.resolve(AppState::Idle, false),
+            ExternalControlOutcome::Noop
         );
     }
 
@@ -177,18 +211,18 @@ mod tests {
         // A tray click resolves to Toggle; this is the logic that makes a click
         // stop a recording regardless of how it was started.
         assert_eq!(
-            ExternalControlAction::Toggle.to_app_event(AppState::Idle),
-            Some(AppEvent::DoneTogglePressed)
+            ExternalControlAction::Toggle.resolve(AppState::Idle, true),
+            ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
         );
         // Regression: a recording started in done mode (hotkey, MCP, or URL
         // scheme) must stop on the next toggle instead of being a no-op.
         assert_eq!(
-            ExternalControlAction::Toggle.to_app_event(AppState::RecordingDone),
-            Some(AppEvent::DoneTogglePressed)
+            ExternalControlAction::Toggle.resolve(AppState::RecordingDone, false),
+            ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
         );
         assert_eq!(
-            ExternalControlAction::Toggle.to_app_event(AppState::RecordingPushToTalk),
-            Some(AppEvent::PttReleased)
+            ExternalControlAction::Toggle.resolve(AppState::RecordingPushToTalk, false),
+            ExternalControlOutcome::Enabled(AppEvent::PttReleased)
         );
     }
 }
