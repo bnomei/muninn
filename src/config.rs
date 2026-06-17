@@ -4223,6 +4223,16 @@ on_error = "abort"
             r#"
 [external_control]
 start_recording_enabled = true
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "stt"
+cmd = "stt_openai"
+timeout_ms = 100
+on_error = "abort"
 "#,
         )
         .expect("external start opt-in should parse");
