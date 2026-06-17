@@ -13,6 +13,7 @@ use muninn::MuninnEnvelopeV1;
 use muninn::PipelineOutcome;
 use muninn::PipelineTraceEntry;
 use muninn::RecordedAudio;
+use muninn::ReplayDetailMode;
 use muninn::ResolvedTranscriptionRoute;
 use muninn::ResolvedUtteranceConfig;
 use muninn::TargetContextSnapshot;
@@ -42,17 +43,24 @@ pub(crate) struct ReplayStoreSpec {
 #[derive(Debug, Clone, Serialize)]
 struct ReplayRecord {
     schema: &'static str,
+    replay_detail: ReplayDetailMode,
     persisted_at: String,
     utterance_id: String,
     started_at: String,
     copied_audio_file: Option<String>,
     warnings: Vec<String>,
-    redacted_config: Value,
-    resolution: ReplayResolutionContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redacted_config: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution: Option<ReplayResolutionContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     refine_context: Option<ReplayRefineContext>,
-    input_envelope: MuninnEnvelopeV1,
-    pipeline_outcome: PipelineOutcome,
-    injection_route: InjectionRoute,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_envelope: Option<MuninnEnvelopeV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pipeline_outcome: Option<PipelineOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    injection_route: Option<InjectionRoute>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +216,10 @@ fn write_replay_artifact(
     recorded: RecordedAudio,
 ) -> Result<PathBuf> {
     let config = &resolved.effective_config;
+    let replay_detail = config.logging.replay_detail;
+    let full_debug = replay_detail == ReplayDetailMode::FullDebug;
+    let utterance_id = input_envelope.utterance_id.clone();
+    let started_at = input_envelope.started_at.clone();
     let artifact_dir = replay_root.join(artifact_dir_name(&input_envelope));
     fs::create_dir_all(&artifact_dir)
         .with_context(|| format!("creating replay artifact dir {}", artifact_dir.display()))?;
@@ -216,7 +228,7 @@ fn write_replay_artifact(
     let copied_audio_file = match retain_audio_if_available(
         &artifact_dir,
         &recorded,
-        config.logging.replay_retain_audio,
+        full_debug && config.logging.replay_retain_audio,
     ) {
         Ok(path) => path,
         Err(error) => {
@@ -231,31 +243,49 @@ fn write_replay_artifact(
             None
         }
     };
-    let refine_context = replay_refine_context(config);
-    let redacted_config = redacted_config_snapshot(config.clone());
-    let resolution = ReplayResolutionContext {
-        target_context: resolved.target_context.clone(),
-        matched_rule_id: resolved.matched_rule_id.clone(),
-        profile_id: resolved.profile_id.clone(),
-        voice_id: resolved.voice_id.clone(),
-        voice_glyph: resolved.voice_glyph,
-        fallback_reason: resolved.fallback_reason.clone(),
-        transcription_route: resolved.transcription_route.clone(),
+
+    let (
+        redacted_config,
+        resolution,
+        refine_context,
+        input_envelope,
+        pipeline_outcome,
+        injection_route,
+    ) = if full_debug {
+        (
+            Some(redacted_config_snapshot(config.clone())),
+            Some(ReplayResolutionContext {
+                target_context: resolved.target_context.clone(),
+                matched_rule_id: resolved.matched_rule_id.clone(),
+                profile_id: resolved.profile_id.clone(),
+                voice_id: resolved.voice_id.clone(),
+                voice_glyph: resolved.voice_glyph,
+                fallback_reason: resolved.fallback_reason.clone(),
+                transcription_route: resolved.transcription_route.clone(),
+            }),
+            replay_refine_context(config),
+            Some(sanitized_envelope_for_replay(input_envelope)),
+            Some(sanitized_pipeline_outcome_for_replay(outcome)),
+            Some(route),
+        )
+    } else {
+        (None, None, None, None, None, None)
     };
 
     let record = ReplayRecord {
-        schema: "muninn.replay.v1",
+        schema: "muninn.replay.v2",
+        replay_detail,
         persisted_at: Utc::now().to_rfc3339(),
-        utterance_id: input_envelope.utterance_id.clone(),
-        started_at: input_envelope.started_at.clone(),
+        utterance_id,
+        started_at,
         copied_audio_file,
         warnings,
         redacted_config,
         resolution,
         refine_context,
-        input_envelope: sanitized_envelope_for_replay(input_envelope),
-        pipeline_outcome: sanitized_pipeline_outcome_for_replay(outcome),
-        injection_route: route,
+        input_envelope,
+        pipeline_outcome,
+        injection_route,
     };
 
     let record_path = artifact_dir.join("record.json");
@@ -277,10 +307,43 @@ fn redacted_config_snapshot(mut config: AppConfig) -> Value {
     config.providers.google.api_key = None;
     config.providers.google.token = None;
     let mut value = serde_json::to_value(config).expect("AppConfig should serialize to JSON");
-    if let Some(transcript) = value.get_mut("transcript").and_then(Value::as_object_mut) {
-        transcript.remove("system_prompt");
-    }
+    redact_config_value(&mut value);
     value
+}
+
+fn redact_config_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let prompt_keys = map
+                .keys()
+                .filter(|key| is_prompt_config_key(key))
+                .cloned()
+                .collect::<Vec<_>>();
+            for key in prompt_keys {
+                map.remove(&key);
+            }
+
+            for (key, value) in map.iter_mut() {
+                if is_secret_key(key) {
+                    if !value.is_null() {
+                        *value = Value::String(REDACTED_VALUE.to_string());
+                    }
+                    continue;
+                }
+                redact_config_value(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_config_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_prompt_config_key(key: &str) -> bool {
+    matches!(key, "system_prompt" | "system_prompt_append")
 }
 
 fn replay_refine_context(config: &AppConfig) -> Option<ReplayRefineContext> {
@@ -578,7 +641,6 @@ mod tests {
     fn sample_config(root: &Path) -> AppConfig {
         let mut config = AppConfig::launchable_default();
         config.logging.replay_enabled = true;
-        config.logging.replay_retain_audio = true;
         config.logging.replay_dir = root.to_path_buf();
         config.logging.replay_retention_days = 7;
         config.logging.replay_max_bytes = 10_000_000;
@@ -597,13 +659,29 @@ mod tests {
         config
     }
 
+    fn sample_full_debug_config(root: &Path) -> AppConfig {
+        let mut config = sample_config(root);
+        config.logging.replay_detail = ReplayDetailMode::FullDebug;
+        config.logging.replay_retain_audio = true;
+        config
+    }
+
     fn sample_resolved(root: &Path) -> ResolvedUtteranceConfig {
         let effective_config = sample_config(root);
+        sample_resolved_with_config(effective_config)
+    }
+
+    fn sample_full_debug_resolved(root: &Path) -> ResolvedUtteranceConfig {
+        let effective_config = sample_full_debug_config(root);
+        sample_resolved_with_config(effective_config)
+    }
+
+    fn sample_resolved_with_config(effective_config: AppConfig) -> ResolvedUtteranceConfig {
         ResolvedUtteranceConfig {
             target_context: TargetContextSnapshot {
                 bundle_id: Some("com.openai.codex".to_string()),
                 app_name: Some("Codex".to_string()),
-                window_title: Some("muninn".to_string()),
+                window_title: Some("private replay window".to_string()),
                 captured_at: "2026-03-06T10:00:00Z".to_string(),
             },
             matched_rule_id: Some("codex".to_string()),
@@ -683,7 +761,16 @@ mod tests {
 
     #[test]
     fn redacts_provider_secrets_from_replay_snapshot() {
-        let config = sample_config(Path::new("/tmp/replay"));
+        let mut config = sample_config(Path::new("/tmp/replay"));
+        config.transcript.system_prompt_append = Some("private append".to_string());
+        config.voices.insert(
+            "private".to_string(),
+            muninn::config::VoiceConfig {
+                system_prompt: Some("private voice prompt".to_string()),
+                system_prompt_append: Some("private voice append".to_string()),
+                ..Default::default()
+            },
+        );
         let snapshot = redacted_config_snapshot(config);
 
         assert_eq!(snapshot["providers"]["deepgram"]["api_key"], Value::Null);
@@ -691,6 +778,12 @@ mod tests {
         assert_eq!(snapshot["providers"]["google"]["api_key"], Value::Null);
         assert_eq!(snapshot["providers"]["google"]["token"], Value::Null);
         assert_eq!(snapshot["transcript"].get("system_prompt"), None);
+        assert_eq!(snapshot["transcript"].get("system_prompt_append"), None);
+        assert_eq!(snapshot["voices"]["private"].get("system_prompt"), None);
+        assert_eq!(
+            snapshot["voices"]["private"].get("system_prompt_append"),
+            None
+        );
     }
 
     #[test]
@@ -770,9 +863,59 @@ mod tests {
     }
 
     #[test]
-    fn persist_replay_writes_record_and_audio_retention_artifact() {
+    fn persist_replay_writes_minimal_record_without_sensitive_details_by_default() {
         let root = temp_dir("persist");
-        let resolved = sample_resolved(&root);
+        let mut resolved = sample_resolved(&root);
+        resolved.effective_config.logging.replay_retain_audio = true;
+        let source_audio = root.join("source.wav");
+        fs::write(&source_audio, b"wave").expect("write source audio");
+        let recorded = RecordedAudio::new(&source_audio, 1450);
+
+        let artifact_dir = persist_replay(
+            resolved,
+            sample_envelope(),
+            sample_outcome(),
+            sample_route(),
+            recorded,
+        )
+        .expect("persist replay should succeed")
+        .expect("replay should be written");
+
+        let record_path = artifact_dir.join("record.json");
+        assert!(record_path.exists());
+        assert!(!artifact_dir.join("audio.wav").exists());
+
+        let record_text = fs::read_to_string(&record_path).expect("read replay record");
+        let record: Value = serde_json::from_str(&record_text).expect("parse replay record");
+
+        assert_eq!(
+            record["schema"],
+            Value::String("muninn.replay.v2".to_string())
+        );
+        assert_eq!(
+            record["replay_detail"],
+            Value::String("minimal".to_string())
+        );
+        assert_eq!(record["utterance_id"], Value::String("utt-123".to_string()));
+        assert_eq!(record["copied_audio_file"], Value::Null);
+        assert_eq!(record.get("redacted_config"), None);
+        assert_eq!(record.get("resolution"), None);
+        assert_eq!(record.get("refine_context"), None);
+        assert_eq!(record.get("input_envelope"), None);
+        assert_eq!(record.get("pipeline_outcome"), None);
+        assert_eq!(record.get("injection_route"), None);
+        assert!(!record_text.contains("hello"));
+        assert!(!record_text.contains("HELLO"));
+        assert!(!record_text.contains("Keep code tokens intact."));
+        assert!(!record_text.contains("/tmp/input.wav"));
+        assert!(!record_text.contains("com.openai.codex"));
+        assert!(!record_text.contains("private replay window"));
+    }
+
+    #[test]
+    fn persist_replay_writes_full_debug_record_and_audio_retention_artifact() {
+        let root = temp_dir("persist-full-debug");
+        let resolved = sample_full_debug_resolved(&root);
         let source_audio = root.join("source.wav");
         fs::write(&source_audio, b"wave").expect("write source audio");
         let recorded = RecordedAudio::new(&source_audio, 1450);
@@ -797,7 +940,11 @@ mod tests {
 
         assert_eq!(
             record["schema"],
-            Value::String("muninn.replay.v1".to_string())
+            Value::String("muninn.replay.v2".to_string())
+        );
+        assert_eq!(
+            record["replay_detail"],
+            Value::String("full_debug".to_string())
         );
         assert_eq!(record["utterance_id"], Value::String("utt-123".to_string()));
         assert_eq!(
@@ -846,7 +993,7 @@ mod tests {
     #[test]
     fn persist_replay_skips_audio_retention_when_disabled() {
         let root = temp_dir("persist-no-audio");
-        let mut resolved = sample_resolved(&root);
+        let mut resolved = sample_full_debug_resolved(&root);
         resolved.effective_config.logging.replay_retain_audio = false;
         let source_audio = root.join("source.wav");
         fs::write(&source_audio, b"wave").expect("write source audio");
@@ -914,6 +1061,7 @@ mod tests {
         let root = temp_dir("persist-refine");
         let mut config = AppConfig::launchable_default();
         config.logging.replay_enabled = true;
+        config.logging.replay_detail = ReplayDetailMode::FullDebug;
         config.logging.replay_dir = root.clone();
         config.logging.replay_retention_days = 7;
         config.logging.replay_max_bytes = 10_000_000;
@@ -973,7 +1121,7 @@ mod tests {
     #[test]
     fn persist_replay_redacts_envelope_secret_fields() {
         let root = temp_dir("persist-envelope-secrets");
-        let resolved = sample_resolved(&root);
+        let resolved = sample_full_debug_resolved(&root);
         let source_audio = root.join("source.wav");
         fs::write(&source_audio, b"wave").expect("write source audio");
         let recorded = RecordedAudio::new(&source_audio, 1450);

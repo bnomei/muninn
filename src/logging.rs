@@ -213,6 +213,7 @@ pub fn init_logging(config: &AppConfig) -> Result<()> {
     info!(
         target: TARGET_RUNTIME,
         replay_enabled = config.logging.replay_enabled,
+        replay_detail = ?config.logging.replay_detail,
         replay_dir = %config.logging.replay_dir.display(),
         replay_retention_days = config.logging.replay_retention_days,
         replay_max_bytes = config.logging.replay_max_bytes,
