@@ -96,6 +96,7 @@ impl AppRuntime {
         )?)?);
         let mut last_indicator_state = IndicatorState::Idle;
         let mut last_active_glyph = None;
+        let runtime_status = crate::external_control::RuntimeStatusHandle::new(preflight);
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -126,6 +127,7 @@ impl AppRuntime {
                         preflight,
                         proxy.clone(),
                         runtime_events,
+                        runtime_status.clone(),
                     );
                     config_watch::spawn_config_watcher(config_path.clone(), proxy.clone());
                     config_watch::spawn_preview_context_watcher(proxy.clone());
@@ -134,6 +136,7 @@ impl AppRuntime {
                         crate::external_control::spawn_mcp_server(
                             proxy.clone(),
                             current_config.external_control.mcp_bind_address.clone(),
+                            runtime_status.clone(),
                         );
                     }
                 }
@@ -185,6 +188,7 @@ impl AppRuntime {
                 Event::UserEvent(UserEvent::IndicatorUpdated { state, glyph }) => {
                     last_indicator_state = state;
                     last_active_glyph = glyph;
+                    runtime_status.set_indicator_state(state);
                     if let Some(icon) = tray_icon.as_ref() {
                         update_tray_appearance(
                             icon,
@@ -275,6 +279,7 @@ impl AppRuntime {
                 }
                 Event::UserEvent(UserEvent::RuntimeFailure(message)) => {
                     error!(target: logging::TARGET_RUNTIME, %message, "runtime worker failed");
+                    runtime_status.set_failure(message.clone());
                     last_indicator_state = IndicatorState::Idle;
                     last_active_glyph = None;
                     if let Some(icon) = tray_icon.as_ref() {
