@@ -13,7 +13,7 @@ use muninn::{
 use tao::event_loop::EventLoopProxy;
 use tracing::{debug, error, info, warn};
 
-use crate::external_control::ExternalControlAction;
+use crate::external_control::{ExternalControlAction, ExternalControlOutcome};
 use crate::runtime_tray::{send_user_event, EventLoopIndicator, UserEvent};
 use crate::{logging, runtime_pipeline, HOTKEY_RECOVERY_DELAY, OUTPUT_INDICATOR_MIN_DURATION};
 
@@ -203,10 +203,23 @@ where
                             continue;
                         }
                         Some(RuntimeMessage::ExternalControl(action)) => {
-                            let Some(app_event) = action.to_app_event(coordinator.state()) else {
-                                continue;
-                            };
-                            (app_event, RecordingStartSource::External)
+                            match action.resolve(
+                                coordinator.state(),
+                                self.config.external_control.start_recording_enabled,
+                            ) {
+                                ExternalControlOutcome::Enabled(app_event) => {
+                                    (app_event, RecordingStartSource::External)
+                                }
+                                ExternalControlOutcome::Disabled => {
+                                    info!(
+                                        target: logging::TARGET_RECORDING,
+                                        ?action,
+                                        "external recording start blocked because external_control.start_recording_enabled is false"
+                                    );
+                                    continue;
+                                }
+                                ExternalControlOutcome::Noop => continue,
+                            }
                         }
                         None => return Err(anyhow!("runtime event channel closed")),
                     }

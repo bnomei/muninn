@@ -276,16 +276,18 @@ Configure it under `[external_control]`:
 url_scheme_enabled = true
 # Run a localhost MCP server exposing recording-control tools.
 mcp_enabled = false
+# Explicitly opt in before external agents may start microphone capture.
+start_recording_enabled = false
 mcp_bind_address = "127.0.0.1:2769"
 ```
 
 Action semantics, shared by both transports:
-- `start` begins recording and is a no-op unless Muninn is idle.
+- `start` begins recording only when `start_recording_enabled = true`; otherwise the request is rejected, and it is a no-op unless Muninn is idle.
 - `stop` finishes the active recording and runs the transcription pipeline; no-op when idle.
 - `toggle` starts when idle, otherwise stops the active recording.
 - `cancel` discards the active recording without running the pipeline or injecting text.
 
-Recording does not stop on its own. An agent typically calls `start`, and a human ends it with the hotkey, a tray click, or an explicit `stop`/`cancel`.
+Recording does not stop on its own. An agent typically calls `start`, and a human ends it with the hotkey, a tray click, or an explicit `stop`/`cancel`. Opting in with `start_recording_enabled = true` is the local trust decision for configured agents and scripts; Muninn does not ask for a repeated interactive confirmation for every external start request after that opt-in.
 
 ### `muninn://` URL scheme
 
@@ -306,7 +308,7 @@ The scheme only works for the installed `.app` bundle that registers it through 
 
 ### MCP server
 
-When `mcp_enabled = true`, Muninn runs a streamable-HTTP [MCP](https://modelcontextprotocol.io) server at `http://<mcp_bind_address>/mcp` (default `http://127.0.0.1:2769/mcp`) exposing three tools: `start_recording`, `stop_recording`, and `cancel_recording`. (The `muninn://toggle` URL verb has no MCP equivalent — agents should use the explicit start/stop tools.)
+When `mcp_enabled = true`, Muninn runs a streamable-HTTP [MCP](https://modelcontextprotocol.io) server at `http://<mcp_bind_address>/mcp` (default `http://127.0.0.1:2769/mcp`) exposing three tools: `start_recording`, `stop_recording`, and `cancel_recording`. (The `muninn://toggle` URL verb has no MCP equivalent — agents should use the explicit start/stop tools.) The `start_recording` tool returns a structured `enabled` or `disabled` result before dispatching the request.
 
 Register it with an MCP-aware client, for example the Augment CLI:
 
@@ -319,7 +321,7 @@ auggie mcp add muninn --transport http --url http://127.0.0.1:2769/mcp
 
 ### Security
 
-The MCP server has no authentication and relies entirely on a loopback-only bind. Keep `mcp_bind_address` on `127.0.0.1` so only this machine can control recording. Binding to `0.0.0.0` or a LAN IP exposes recording control to any host that can reach the address; Muninn logs a startup warning when the bind address is non-loopback.
+External control has no per-request confirmation prompt; keep it local and enable `start_recording_enabled` only for agents and scripts you trust to start microphone capture. The MCP server has no authentication and relies entirely on a loopback-only bind. Keep `mcp_bind_address` on `127.0.0.1` so only this machine can control recording. Binding to `0.0.0.0` or a LAN IP exposes recording control to any host that can reach the address; Muninn logs a startup warning when the bind address is non-loopback.
 
 ## Quick Start
 

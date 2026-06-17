@@ -25,12 +25,16 @@ use crate::runtime_tray::{send_user_event, UserEvent};
 #[derive(Clone)]
 pub(crate) struct RecordingControlServer {
     proxy: EventLoopProxy<UserEvent>,
+    start_recording_enabled: bool,
 }
 
 #[tool_router]
 impl RecordingControlServer {
-    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
-        Self { proxy }
+    fn new(proxy: EventLoopProxy<UserEvent>, start_recording_enabled: bool) -> Self {
+        Self {
+            proxy,
+            start_recording_enabled,
+        }
     }
 
     fn dispatch(
@@ -61,7 +65,28 @@ impl RecordingControlServer {
         )
     )]
     fn start_recording(&self) -> Result<CallToolResult, McpError> {
-        self.dispatch(ExternalControlAction::Start, "recording start requested")
+        if !self.start_recording_enabled {
+            return Ok(CallToolResult::success(vec![Content::json(
+                serde_json::json!({
+                    "status": "disabled",
+                    "action": "start_recording",
+                    "reason": "external_control.start_recording_enabled is false"
+                }),
+            )?]));
+        }
+
+        send_user_event(
+            &self.proxy,
+            UserEvent::ExternalControl(ExternalControlAction::Start),
+            "mcp_external_control",
+        );
+        Ok(CallToolResult::success(vec![Content::json(
+            serde_json::json!({
+                "status": "enabled",
+                "action": "start_recording",
+                "message": "recording start requested"
+            }),
+        )?]))
     }
 
     #[tool(
@@ -117,7 +142,11 @@ impl ServerHandler for RecordingControlServer {
 }
 
 /// Spawn the MCP server on a dedicated thread with its own current-thread runtime.
-pub(crate) fn spawn_mcp_server(proxy: EventLoopProxy<UserEvent>, bind_address: String) {
+pub(crate) fn spawn_mcp_server(
+    proxy: EventLoopProxy<UserEvent>,
+    bind_address: String,
+    start_recording_enabled: bool,
+) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -129,7 +158,7 @@ pub(crate) fn spawn_mcp_server(proxy: EventLoopProxy<UserEvent>, bind_address: S
                 return;
             }
         };
-        runtime.block_on(serve(proxy, bind_address));
+        runtime.block_on(serve(proxy, bind_address, start_recording_enabled));
     });
 }
 
@@ -152,10 +181,19 @@ fn warn_if_exposed_bind_address(bind_address: &str) {
     }
 }
 
-async fn serve(proxy: EventLoopProxy<UserEvent>, bind_address: String) {
+async fn serve(
+    proxy: EventLoopProxy<UserEvent>,
+    bind_address: String,
+    start_recording_enabled: bool,
+) {
     warn_if_exposed_bind_address(&bind_address);
     let service = StreamableHttpService::new(
-        move || Ok(RecordingControlServer::new(proxy.clone())),
+        move || {
+            Ok(RecordingControlServer::new(
+                proxy.clone(),
+                start_recording_enabled,
+            ))
+        },
         LocalSessionManager::default().into(),
         StreamableHttpServerConfig::default(),
     );

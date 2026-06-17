@@ -134,6 +134,7 @@ impl AppRuntime {
                         crate::external_control::spawn_mcp_server(
                             proxy.clone(),
                             current_config.external_control.mcp_bind_address.clone(),
+                            current_config.external_control.start_recording_enabled,
                         );
                     }
                 }
