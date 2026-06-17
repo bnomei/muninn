@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-06-17
+
+### Added
+
+- Added the read-only MCP `get_status` tool so agents can inspect whether Muninn is idle, recording, busy, permission-blocked, or failed before issuing recording-control requests.
+
+### Changed
+
+- Replay capture is now privacy-preserving by default. Enabling replay writes sparse metadata unless `replay_detail = "full_debug"` is set explicitly.
+- Replay audio retention now defaults to disabled and only retains audio when full-debug replay is explicitly enabled.
+- Split logging config, audio rendering, external-control actions, replay dispatch, and runtime permission handling into focused ownership modules.
+
+### Security
+
+- External recording starts are now gated behind explicit `external_control.start_recording_enabled` opt-in.
+- The external-control MCP server now rejects wildcard, LAN, hostname, and other non-loopback bind addresses.
+- Full-debug replay snapshots redact provider secrets and prompt fields before writing artifacts.
+
 ## [0.5.0] - 2026-06-16
 
 ### Added
