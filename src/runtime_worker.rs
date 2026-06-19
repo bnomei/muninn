@@ -7,7 +7,8 @@ use muninn::{
     capture_frontmost_target_context, map_hotkey_event, ActiveStreamingTranscription, AppConfig,
     AppEvent, AppState, HotkeyEventSource, IndicatorAdapter, IndicatorState, MacosAudioRecorder,
     MacosHotkeyEventSource, MacosPermissionsAdapter, MacosTextInjector, PermissionPreflightStatus,
-    PipelineRunner, ResolvedBuiltinStepConfig, ResolvedUtteranceConfig, RuntimeFlowCoordinator,
+    PipelineRunner, RecordingConfig, ResolvedBuiltinStepConfig, ResolvedUtteranceConfig,
+    RuntimeFlowCoordinator, TargetContextSnapshot,
 };
 use tao::event_loop::EventLoopProxy;
 use tracing::{debug, error, info, warn};
@@ -130,9 +131,10 @@ where
         let replay_persist = crate::replay_dispatch::ReplayPersistenceService::spawn();
         let mut active_utterance: Option<ActiveUtterance> = None;
         let mut prepared_utterance_cache = HashMap::new();
+        let initial_effective_recording_config = initial_recording_config(&self.config);
         let mut coordinator = RuntimeFlowCoordinator::new(
             self.indicator,
-            MacosAudioRecorder::new(self.config.recording.clone()),
+            MacosAudioRecorder::new(initial_effective_recording_config),
             MacosTextInjector::new(),
         );
 
@@ -209,7 +211,7 @@ where
                             } else {
                                 coordinator
                                     .recorder_mut()
-                                    .set_recording_config(self.config.recording.clone());
+                                    .set_recording_config(initial_recording_config(&self.config));
                             }
                             continue;
                         }
@@ -578,6 +580,13 @@ fn prepare_active_utterance(
         runner,
         streaming: ActiveStreamingTranscription::disabled(),
     })
+}
+
+fn initial_recording_config(config: &AppConfig) -> RecordingConfig {
+    config
+        .resolve_effective_config(TargetContextSnapshot::empty_now())
+        .effective_config
+        .recording
 }
 
 fn drain_busy_input_backlog(

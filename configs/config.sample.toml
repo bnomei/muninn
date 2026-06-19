@@ -48,8 +48,10 @@ providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
 #
 # [transcription.streaming]
 # frame_ms = 100
-# finish_timeout_ms = 2500
+# finish_timeout_ms = 10000
 # fallback_to_recorded_on_error = true
+# Deepgram resolves streaming capture to mono and advertises the effective raw LINEAR16 sample rate/channels.
+# When OpenAI is the active streaming provider, Muninn forces 24 kHz mono capture.
 
 [providers.apple_speech]
 # Apple-managed local backend for macOS 26+ completed recordings.
@@ -211,6 +213,7 @@ replay_max_bytes = 52_428_800
 # api_key = "set via OPENAI_API_KEY"
 endpoint = "https://api.openai.com/v1/audio/transcriptions"
 model = "gpt-4o-mini-transcribe"
+# Completed recording uploads are preflighted against OpenAI's 25 MB audio limit.
 # Realtime transcription settings used only when [transcription].mode = "streaming".
 # realtime_endpoint = "wss://api.openai.com/v1/realtime"
 # realtime_model = "gpt-realtime-whisper"

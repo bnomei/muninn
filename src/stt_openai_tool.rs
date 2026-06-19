@@ -13,6 +13,9 @@ use std::process::ExitCode;
 use std::sync::OnceLock;
 use tracing::{error, info, warn};
 
+const OPENAI_AUDIO_UPLOAD_MAX_BYTES: u64 = 25_000_000;
+const MIN_AUDIO_UPLOAD_BYTES: u64 = 45;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
     code: &'static str,
@@ -255,6 +258,8 @@ where
 async fn transcribe_with_openai(
     request: &PreparedTranscriptionRequest,
 ) -> Result<String, CliError> {
+    validate_audio_upload_size(&request.wav_path)?;
+
     let file_part = Part::file(&request.wav_path)
         .await
         .map_err(|source| {
@@ -309,8 +314,13 @@ async fn transcribe_with_openai(
     })?;
 
     if !status.is_success() {
+        let code = if status.as_u16() == 413 {
+            "audio_file_too_large"
+        } else {
+            "openai_http_error"
+        };
         let error = CliError::new(
-            "openai_http_error",
+            code,
             format!(
                 "OpenAI transcription request failed with status {}: {}",
                 status,
@@ -322,6 +332,45 @@ async fn transcribe_with_openai(
     }
 
     extract_transcript_text(&body)
+}
+
+fn validate_audio_upload_size(path: &Path) -> Result<(), CliError> {
+    let metadata = std::fs::metadata(path).map_err(|source| {
+        let error = CliError::new(
+            "audio_file_metadata_failed",
+            format!(
+                "failed to inspect audio file at {} before OpenAI upload: {source}",
+                path.display()
+            ),
+        );
+        log_provider_error(&error);
+        error
+    })?;
+    let bytes = metadata.len();
+    if bytes < MIN_AUDIO_UPLOAD_BYTES {
+        let error = CliError::new(
+            "audio_file_too_small",
+            format!(
+                "OpenAI transcription requires non-empty audio; {} is {bytes} bytes",
+                path.display()
+            ),
+        );
+        log_provider_error(&error);
+        return Err(error);
+    }
+    if bytes > OPENAI_AUDIO_UPLOAD_MAX_BYTES {
+        let error = CliError::new(
+            "audio_file_too_large",
+            format!(
+                "OpenAI transcription uploads are limited to 25 MB; {} is {bytes} bytes, max {OPENAI_AUDIO_UPLOAD_MAX_BYTES} bytes",
+                path.display()
+            ),
+        );
+        log_provider_error(&error);
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 fn http_client() -> &'static reqwest::Client {
@@ -517,6 +566,7 @@ fn resolved_config_from_builtin_steps(config: &ResolvedBuiltinStepConfig) -> Ope
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use tempfile::NamedTempFile;
 
     fn baseline_envelope() -> MuninnEnvelopeV1 {
         let mut envelope = MuninnEnvelopeV1::new("utt-123", "2026-03-05T17:30:00Z")
@@ -643,6 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn upload_preflight_rejects_header_only_audio() {
+        let audio = temp_audio_file_with_len(MIN_AUDIO_UPLOAD_BYTES - 1);
+
+        let error =
+            validate_audio_upload_size(audio.path()).expect_err("header-only audio should fail");
+
+        assert_eq!(error.code, "audio_file_too_small");
+    }
+
+    #[test]
+    fn upload_preflight_rejects_files_over_openai_limit() {
+        let audio = temp_audio_file_with_len(OPENAI_AUDIO_UPLOAD_MAX_BYTES + 1);
+
+        let error =
+            validate_audio_upload_size(audio.path()).expect_err("oversized audio should fail");
+
+        assert_eq!(error.code, "audio_file_too_large");
+    }
+
+    #[test]
+    fn upload_preflight_accepts_file_within_openai_limit() {
+        let audio = temp_audio_file_with_len(MIN_AUDIO_UPLOAD_BYTES);
+
+        validate_audio_upload_size(audio.path()).expect("small non-empty audio should pass");
+    }
+
+    #[test]
     fn response_json_empty_text_is_accepted() {
         let transcript = extract_transcript_text(br#"{"text":"","usage":{"output_tokens":2}}"#)
             .expect("empty text should be accepted");
@@ -751,5 +828,11 @@ mod tests {
         let decoded = read_envelope_from_reader(output.as_slice()).expect("read envelope");
 
         assert_eq!(decoded, envelope);
+    }
+
+    fn temp_audio_file_with_len(len: u64) -> NamedTempFile {
+        let file = NamedTempFile::new().expect("temp audio file");
+        file.as_file().set_len(len).expect("set temp audio len");
+        file
     }
 }

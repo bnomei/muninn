@@ -231,6 +231,11 @@ impl AppConfig {
         transcript.materialize_system_prompt();
 
         let transcription_route = resolve_transcription_route_from_parts(&transcription, &pipeline);
+        apply_streaming_recording_requirements(
+            &mut recording,
+            &transcription,
+            &transcription_route,
+        );
         let pipeline = expand_pipeline_with_transcription_route(&pipeline, &transcription_route);
         let providers = self.providers.clone();
         let logging = self.logging.clone();
@@ -647,7 +652,7 @@ impl Default for StreamingTranscriptionConfig {
     fn default() -> Self {
         Self {
             frame_ms: 100,
-            finish_timeout_ms: 2_500,
+            finish_timeout_ms: 10_000,
             fallback_to_recorded_on_error: true,
         }
     }
@@ -1991,6 +1996,36 @@ fn is_streaming_capable_transcription_provider(provider: TranscriptionProvider) 
     )
 }
 
+fn apply_streaming_recording_requirements(
+    recording: &mut RecordingConfig,
+    transcription: &TranscriptionConfig,
+    route: &ResolvedTranscriptionRoute,
+) {
+    if transcription.mode != TranscriptionMode::Streaming {
+        return;
+    }
+
+    let Some(provider) = route
+        .providers
+        .iter()
+        .copied()
+        .find(|provider| is_streaming_capable_transcription_provider(*provider))
+    else {
+        return;
+    };
+
+    match provider {
+        TranscriptionProvider::Deepgram => {
+            recording.mono = true;
+        }
+        TranscriptionProvider::OpenAi => {
+            recording.sample_rate_khz = 24;
+            recording.mono = true;
+        }
+        _ => {}
+    }
+}
+
 fn expand_pipeline_with_transcription_route(
     pipeline: &PipelineConfig,
     route: &ResolvedTranscriptionRoute,
@@ -2127,7 +2162,7 @@ mod tests {
         assert!(!config.logging.replay_retain_audio);
         assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
         assert_eq!(config.transcription.streaming.frame_ms, 100);
-        assert_eq!(config.transcription.streaming.finish_timeout_ms, 2_500);
+        assert_eq!(config.transcription.streaming.finish_timeout_ms, 10_000);
         assert!(config.transcription.streaming.fallback_to_recorded_on_error);
         assert_eq!(config.providers.openai.model, "gpt-4o-mini-transcribe");
         assert_eq!(config.providers.apple_speech.locale, None);
@@ -2208,7 +2243,7 @@ mod tests {
         assert!(!config.logging.replay_retain_audio);
         assert_eq!(config.transcription.mode, TranscriptionMode::Recorded);
         assert_eq!(config.transcription.streaming.frame_ms, 100);
-        assert_eq!(config.transcription.streaming.finish_timeout_ms, 2_500);
+        assert_eq!(config.transcription.streaming.finish_timeout_ms, 10_000);
         assert!(config.transcription.streaming.fallback_to_recorded_on_error);
         assert_eq!(config.scoring.min_top_score, 0.84);
         assert_eq!(config.scoring.min_margin, 0.10);
@@ -2515,6 +2550,149 @@ on_error = "continue"
                 "refine",
             ]
         );
+    }
+
+    #[test]
+    fn streaming_openai_overrides_effective_recording_config_for_realtime() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[recording]
+sample_rate_khz = 16
+mono = false
+
+[transcription]
+mode = "streaming"
+providers = ["apple_speech", "openai"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("streaming OpenAI config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.streaming_transcription_route(),
+            vec![TranscriptionProvider::OpenAi]
+        );
+        assert_eq!(resolved.effective_config.recording.sample_rate_khz, 24);
+        assert!(resolved.effective_config.recording.mono);
+    }
+
+    #[test]
+    fn streaming_openai_requirement_wins_over_profile_recording_overrides() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[app]
+profile = "default"
+
+[recording]
+sample_rate_khz = 16
+mono = true
+
+[transcription]
+mode = "streaming"
+providers = ["openai"]
+
+[profiles.default.recording]
+sample_rate_khz = 48
+mono = false
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("profile recording override config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(resolved.effective_config.recording.sample_rate_khz, 24);
+        assert!(resolved.effective_config.recording.mono);
+    }
+
+    #[test]
+    fn deepgram_streaming_forces_mono_recording_config() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[recording]
+sample_rate_khz = 16
+mono = false
+
+[transcription]
+mode = "streaming"
+providers = ["deepgram", "openai"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("streaming Deepgram config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert_eq!(
+            resolved.streaming_transcription_route(),
+            vec![
+                TranscriptionProvider::Deepgram,
+                TranscriptionProvider::OpenAi
+            ]
+        );
+        assert_eq!(resolved.effective_config.recording.sample_rate_khz, 16);
+        assert!(resolved.effective_config.recording.mono);
+    }
+
+    #[test]
+    fn recorded_openai_keeps_configured_recording_config() {
+        let config = AppConfig::from_toml_str(
+            r#"
+[recording]
+sample_rate_khz = 16
+mono = false
+
+[transcription]
+mode = "recorded"
+providers = ["openai"]
+
+[pipeline]
+deadline_ms = 500
+payload_format = "json_object"
+
+[[pipeline.steps]]
+id = "refine"
+cmd = "refine"
+timeout_ms = 100
+on_error = "continue"
+"#,
+        )
+        .expect("recorded OpenAI config should parse");
+
+        let resolved = config.resolve_effective_config(target_context(None, None, None));
+
+        assert!(resolved.streaming_transcription_route().is_empty());
+        assert_eq!(resolved.effective_config.recording.sample_rate_khz, 16);
+        assert!(!resolved.effective_config.recording.mono);
     }
 
     #[test]

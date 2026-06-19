@@ -140,6 +140,17 @@ pub(super) fn output_wav_spec(
     }
 }
 
+pub(super) fn render_output_pcm_i16(
+    samples: &[i16],
+    source_sample_rate: u32,
+    source_channels: u16,
+    output_config: &RecordingConfig,
+) -> Vec<i16> {
+    OutputSampleIter::new(samples, source_sample_rate, source_channels, output_config)
+        .map(|sample| normalized_f32_to_pcm_i16(sample.clamp(-1.0, 1.0)))
+        .collect()
+}
+
 #[doc(hidden)]
 #[must_use]
 pub fn benchmark_render_output_checksum(
@@ -193,10 +204,9 @@ pub(super) fn write_wav_file(
         )
     })?;
 
-    for sample in OutputSampleIter::new(samples, source_sample_rate, source_channels, output_config)
+    for sample in render_output_pcm_i16(samples, source_sample_rate, source_channels, output_config)
     {
-        let scaled = (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16;
-        writer.write_sample(scaled).map_err(|error| {
+        writer.write_sample(sample).map_err(|error| {
             MacosAdapterError::operation_failed(
                 "stop_recording",
                 format!("writing wav sample: {error}"),

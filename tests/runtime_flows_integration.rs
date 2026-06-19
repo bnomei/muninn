@@ -266,7 +266,18 @@ providers = ["deepgram"]
     )
     .await;
 
-    assert!(active.finish().await.is_none());
+    let outcome = active
+        .finish()
+        .await
+        .expect("streaming error diagnostic should be preserved");
+
+    assert!(outcome.raw_text.is_none());
+    assert_eq!(outcome.provider, TranscriptionProvider::Deepgram);
+    assert_eq!(outcome.attempt.code, "stream_closed");
+    assert_eq!(
+        outcome.attempt.outcome,
+        TranscriptionAttemptOutcome::RequestFailed
+    );
     assert_eq!(state.lock().expect("fake state poisoned").start_calls, 1);
 }
 

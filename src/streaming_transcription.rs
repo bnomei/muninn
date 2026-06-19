@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::warn;
 
 use crate::{
     append_transcription_attempt, AudioFrame, MuninnEnvelopeV1, ResolvedUtteranceConfig,
@@ -17,7 +17,7 @@ pub mod deepgram;
 pub mod google;
 pub mod openai;
 
-const STREAMING_FRAME_QUEUE_CAPACITY: usize = 8;
+const STREAMING_FRAME_QUEUE_CAPACITY: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamingTranscriptOutcome {
@@ -344,23 +344,30 @@ impl ActiveStreamingTranscription {
         error: StreamingTranscriptionError,
         resolved: &ResolvedUtteranceConfig,
     ) -> Self {
-        if resolved
+        let fallback_to_recorded = resolved
             .effective_config
             .transcription
             .streaming
-            .fallback_to_recorded_on_error
-            || matches!(error, StreamingTranscriptionError::Cancelled { .. })
-        {
-            debug!(
-                provider = %error.provider(),
-                error = %error,
-                "streaming transcription unavailable; using recorded transcription route"
+            .fallback_to_recorded_on_error;
+        let is_cancelled = matches!(error, StreamingTranscriptionError::Cancelled { .. });
+        let provider = error.provider();
+        let detail = error.to_string();
+        let outcome = StreamingTranscriptOutcome::from_error(error);
+
+        if fallback_to_recorded || is_cancelled {
+            warn!(
+                provider = %provider,
+                error = %detail,
+                "streaming transcription unavailable; using recorded transcription route and preserving diagnostic"
             );
-            Self::disabled()
+            Self {
+                controller: None,
+                startup_outcome: Some(outcome),
+            }
         } else {
             Self {
                 controller: None,
-                startup_outcome: Some(StreamingTranscriptOutcome::from_error(error)),
+                startup_outcome: Some(outcome),
             }
         }
     }
@@ -422,58 +429,53 @@ impl StreamingTranscriptionController {
             StreamingWorkerResult::Finished(Ok(Ok(outcome)))
                 if self.fallback_to_recorded_on_error =>
             {
-                debug!(
+                warn!(
                     provider = %outcome.provider,
-                    "streaming transcription produced no final text; using recorded transcription route"
+                    code = %outcome.attempt.code,
+                    "streaming transcription produced no final text; using recorded transcription route and preserving diagnostic"
                 );
-                None
+                Some(outcome)
             }
             StreamingWorkerResult::Finished(Ok(Ok(outcome))) => Some(outcome),
             StreamingWorkerResult::Finished(Ok(Err(error)))
                 if self.fallback_to_recorded_on_error =>
             {
+                let outcome = StreamingTranscriptOutcome::from_error(error);
                 warn!(
-                    provider = %error.provider(),
-                    error = %error,
-                    "streaming transcription failed; using recorded transcription route"
+                    provider = %outcome.provider,
+                    code = %outcome.attempt.code,
+                    "streaming transcription failed; using recorded transcription route and preserving diagnostic"
                 );
-                None
+                Some(outcome)
             }
             StreamingWorkerResult::Finished(Ok(Err(error))) => {
                 Some(StreamingTranscriptOutcome::from_error(error))
             }
             StreamingWorkerResult::Finished(Err(error)) if self.fallback_to_recorded_on_error => {
+                let detail = error.to_string();
+                let outcome = streaming_task_failed_outcome(self.provider, error);
                 warn!(
                     provider = %self.provider,
-                    error = %error,
-                    "streaming transcription task failed; using recorded transcription route"
+                    error = %detail,
+                    "streaming transcription task failed; using recorded transcription route and preserving diagnostic"
                 );
-                None
+                Some(outcome)
             }
-            StreamingWorkerResult::Finished(Err(error)) => Some(
-                StreamingTranscriptOutcome::from_error(StreamingTranscriptionError::failed(
-                    self.provider,
-                    "streaming_session_task_failed",
-                    format!("streaming session task failed: {error}"),
-                )),
-            ),
+            StreamingWorkerResult::Finished(Err(error)) => {
+                Some(streaming_task_failed_outcome(self.provider, error))
+            }
             StreamingWorkerResult::TimedOut if self.fallback_to_recorded_on_error => {
+                let outcome = streaming_finish_timeout_outcome(self.provider, self.finish_timeout);
                 warn!(
                     provider = %self.provider,
                     timeout_ms = self.finish_timeout.as_millis(),
-                    "streaming transcription finish timed out; using recorded transcription route"
+                    "streaming transcription finish timed out; using recorded transcription route and preserving diagnostic"
                 );
-                None
+                Some(outcome)
             }
-            StreamingWorkerResult::TimedOut => Some(StreamingTranscriptOutcome::from_error(
-                StreamingTranscriptionError::failed(
-                    self.provider,
-                    "streaming_finish_timeout",
-                    format!(
-                        "streaming transcription did not finish within {} ms",
-                        self.finish_timeout.as_millis()
-                    ),
-                ),
+            StreamingWorkerResult::TimedOut => Some(streaming_finish_timeout_outcome(
+                self.provider,
+                self.finish_timeout,
             )),
         }
     }
@@ -504,6 +506,31 @@ enum StreamingWorkerResult {
         >,
     ),
     TimedOut,
+}
+
+fn streaming_task_failed_outcome(
+    provider: TranscriptionProvider,
+    error: tokio::task::JoinError,
+) -> StreamingTranscriptOutcome {
+    StreamingTranscriptOutcome::from_error(StreamingTranscriptionError::failed(
+        provider,
+        "streaming_session_task_failed",
+        format!("streaming session task failed: {error}"),
+    ))
+}
+
+fn streaming_finish_timeout_outcome(
+    provider: TranscriptionProvider,
+    finish_timeout: Duration,
+) -> StreamingTranscriptOutcome {
+    StreamingTranscriptOutcome::from_error(StreamingTranscriptionError::failed(
+        provider,
+        "streaming_finish_timeout",
+        format!(
+            "streaming transcription did not finish within {} ms",
+            finish_timeout.as_millis()
+        ),
+    ))
 }
 
 async fn run_streaming_session(
@@ -699,7 +726,18 @@ providers = ["deepgram"]
         )
         .await;
 
-        assert!(active.finish().await.is_none());
+        let outcome = active
+            .finish()
+            .await
+            .expect("streaming error diagnostic should be preserved");
+
+        assert!(outcome.raw_text.is_none());
+        assert_eq!(outcome.provider, TranscriptionProvider::Deepgram);
+        assert_eq!(outcome.attempt.code, "stream_closed");
+        assert_eq!(
+            outcome.attempt.outcome,
+            TranscriptionAttemptOutcome::RequestFailed
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

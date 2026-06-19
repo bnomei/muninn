@@ -110,7 +110,7 @@ Setup:
 - Apple Speech: no API key is required; this local leg requires macOS 26+ and Apple-managed Speech assets for the selected locale
 - Whisper.cpp: no API key is required; Muninn auto-downloads the selected or default model on first use when it knows the canonical upstream file name, or you can still point `providers.whisper_cpp.model` at a local `.bin` file
 - Deepgram: set `DEEPGRAM_API_KEY`; recorded mode uses the prerecorded `/v1/listen` API, while streaming mode uses Deepgram's live WebSocket API
-- OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg, OpenAI Realtime streaming, and the default refine pass
+- OpenAI: set `OPENAI_API_KEY` for the OpenAI route leg, OpenAI Realtime streaming, and the default refine pass; recorded uploads are preflighted against OpenAI's 25 MB audio upload limit
 - Google: set `GOOGLE_API_KEY` or `GOOGLE_STT_TOKEN` for recorded REST transcription; Google streaming uses Speech-to-Text v2 through the official `google-cloud-speech-v2` crate and requires credentials accepted by that client
 - optional provider settings such as endpoints and models live in the config you control
 
@@ -149,18 +149,18 @@ providers = ["deepgram", "openai", "google"]
 
 [transcription.streaming]
 frame_ms = 100
-finish_timeout_ms = 2500
+finish_timeout_ms = 10000
 fallback_to_recorded_on_error = true
 ```
 
 Streaming provider support:
-- Deepgram uses the live WebSocket API with `DEEPGRAM_API_KEY`.
-- OpenAI uses Realtime transcription with `gpt-realtime-whisper` and `OPENAI_API_KEY`.
+- Deepgram uses the live WebSocket API with `DEEPGRAM_API_KEY`; Muninn resolves streaming capture to mono and sends raw LINEAR16 with the effective sample rate and channel count in the handshake.
+- OpenAI uses Realtime transcription with `gpt-realtime-whisper` and `OPENAI_API_KEY`; when OpenAI is the active streaming provider, Muninn forces 24 kHz mono capture for that utterance.
 - Google uses Speech-to-Text v2 through the official `google-cloud-speech-v2` crate. The crate may require Rust 1.88+; Muninn's crate metadata now declares that MSRV. API-key-only Google REST credentials remain valid for recorded fallback but are not enough for the streaming client.
 
 Fallback and replay behavior:
 - Muninn still writes the completed WAV during streaming, so fallback can use the recorded route when the streaming provider fails, is unavailable, times out, or returns no final transcript.
-- `fallback_to_recorded_on_error = false` keeps the structured streaming attempt/error in the envelope without inventing transcript text.
+- Streaming fallback keeps the structured streaming attempt/error in the envelope without inventing transcript text; the recorded route still runs when `transcript.raw_text` is empty.
 - Streaming success only seeds `transcript.raw_text`; `refine`, scoring, replay, and injection keep the same downstream semantics as recorded mode.
 - Partial/interim streaming results are transient. There is no partial transcript UI, and replay artifacts do not persist partial transcript history.
 

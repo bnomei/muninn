@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.1] - 2026-06-19
+
+### Changed
+
+- Increased the streaming transcription finish timeout default to 10 seconds and enlarged the live audio frame queue so providers have more room to flush final transcripts after recording stops.
+- When OpenAI is the active streaming provider, Muninn now resolves the effective recording config to 24 kHz mono capture for that utterance while leaving recorded OpenAI and non-OpenAI-first streaming routes on the configured recording settings.
+- Deepgram streaming now resolves to mono capture, advertises the effective raw LINEAR16 channel count in its WebSocket handshake, and rejects mismatched audio frames before sending them.
+
+### Fixed
+
+- OpenAI recorded transcription now preflights missing, empty, and over-25-MB audio uploads before sending them to the provider, producing explicit envelope diagnostics instead of opaque HTTP failures.
+- Streaming fallback now preserves structured error, empty-transcript, task-failure, and timeout diagnostics in the envelope while still allowing the recorded fallback route to run when no transcript text was produced.
+- Streaming audio queue backpressure is now counted and logged instead of silently dropping live audio frames.
+
 ## [0.6.0] - 2026-06-17
 
 ### Added

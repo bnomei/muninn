@@ -37,6 +37,7 @@ impl StreamingTranscriptionProvider for DeepgramStreamingTranscriptionProvider {
         Ok(Box::new(DeepgramStreamingSession::new(
             socket,
             request.sample_rate_hz,
+            request.channels,
         )))
     }
 }
@@ -48,6 +49,7 @@ struct DeepgramStreamingRequest {
     model: String,
     language: String,
     sample_rate_hz: u32,
+    channels: u16,
     interim_results: bool,
 }
 
@@ -71,6 +73,11 @@ impl DeepgramStreamingRequest {
             model: config.model.clone(),
             language: config.language.clone(),
             sample_rate_hz: resolved.effective_config.recording.sample_rate_hz(),
+            channels: if resolved.effective_config.recording.mono {
+                1
+            } else {
+                2
+            },
             interim_results: config.streaming_interim_results,
         })
     }
@@ -103,6 +110,7 @@ impl DeepgramStreamingRequest {
             .append_pair("language", self.language.trim())
             .append_pair("encoding", "linear16")
             .append_pair("sample_rate", &self.sample_rate_hz.to_string())
+            .append_pair("channels", &self.channels.to_string())
             .append_pair(
                 "interim_results",
                 if self.interim_results {
@@ -154,14 +162,16 @@ async fn connect_deepgram_websocket(
 struct DeepgramStreamingSession<S> {
     socket: S,
     expected_sample_rate_hz: u32,
+    expected_channels: u16,
     transcript: DeepgramTranscriptAccumulator,
 }
 
 impl<S> DeepgramStreamingSession<S> {
-    fn new(socket: S, expected_sample_rate_hz: u32) -> Self {
+    fn new(socket: S, expected_sample_rate_hz: u32, expected_channels: u16) -> Self {
         Self {
             socket,
             expected_sample_rate_hz,
+            expected_channels,
             transcript: DeepgramTranscriptAccumulator::default(),
         }
     }
@@ -180,6 +190,17 @@ where
                 format!(
                     "Deepgram streaming session expected {} Hz audio but received {} Hz",
                     self.expected_sample_rate_hz, frame.sample_rate_hz
+                ),
+            ));
+        }
+
+        if frame.channels != self.expected_channels {
+            return Err(StreamingTranscriptionError::failed(
+                PROVIDER,
+                "deepgram_streaming_channel_mismatch",
+                format!(
+                    "Deepgram streaming session expected {} audio channels but received {}",
+                    self.expected_channels, frame.channels
                 ),
             ));
         }
@@ -455,6 +476,7 @@ mod tests {
             model: "nova-3".to_string(),
             language: "en-IE".to_string(),
             sample_rate_hz: 16_000,
+            channels: 1,
             interim_results: false,
         };
 
@@ -472,6 +494,7 @@ mod tests {
                 ("language".into(), "en-IE".into()),
                 ("encoding".into(), "linear16".into()),
                 ("sample_rate".into(), "16000".into()),
+                ("channels".into(), "1".into()),
                 ("interim_results".into(), "false".into()),
             ]
         );
@@ -505,6 +528,29 @@ providers = ["deepgram"]
             }
             other => panic!("expected unavailable credentials, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn request_uses_effective_mono_channel_count() {
+        let resolved = resolved_config(
+            r#"
+[recording]
+mono = false
+
+[transcription]
+mode = "streaming"
+providers = ["deepgram"]
+
+[providers.deepgram]
+api_key = "secret"
+"#,
+        );
+
+        let request = DeepgramStreamingRequest::from_resolved(&resolved)
+            .expect("configured credentials should build request");
+
+        assert_eq!(request.sample_rate_hz, 16_000);
+        assert_eq!(request.channels, 1);
     }
 
     #[test]
@@ -635,7 +681,7 @@ providers = ["deepgram"]
                 Message::Close(None),
             ],
         );
-        let mut session = DeepgramStreamingSession::new(socket, 16_000);
+        let mut session = DeepgramStreamingSession::new(socket, 16_000, 1);
 
         session
             .send_audio(AudioFrame {
@@ -665,7 +711,7 @@ providers = ["deepgram"]
             [Message::Ping(vec![1, 2, 3]), Message::Close(None)],
         );
 
-        let _ = Box::new(DeepgramStreamingSession::new(socket, 16_000))
+        let _ = Box::new(DeepgramStreamingSession::new(socket, 16_000, 1))
             .finish()
             .await
             .expect("session should finalize after ping");
@@ -680,7 +726,7 @@ providers = ["deepgram"]
     async fn session_rejects_sample_rate_mismatch() {
         let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
         let socket = FakeDeepgramWebSocket::new(Arc::clone(&state), []);
-        let mut session = DeepgramStreamingSession::new(socket, 16_000);
+        let mut session = DeepgramStreamingSession::new(socket, 16_000, 1);
 
         let error = session
             .send_audio(AudioFrame {
@@ -703,11 +749,37 @@ providers = ["deepgram"]
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn session_rejects_channel_mismatch() {
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeDeepgramWebSocket::new(Arc::clone(&state), []);
+        let mut session = DeepgramStreamingSession::new(socket, 16_000, 1);
+
+        let error = session
+            .send_audio(AudioFrame {
+                samples: vec![1],
+                sample_rate_hz: 16_000,
+                channels: 2,
+            })
+            .await
+            .expect_err("channel mismatch should fail");
+
+        assert_eq!(
+            error.to_attempt().code,
+            "deepgram_streaming_channel_mismatch"
+        );
+        assert!(state
+            .lock()
+            .expect("fake state poisoned")
+            .binary_payloads
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_cancel_sends_close_controls() {
         let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
         let socket = FakeDeepgramWebSocket::new(Arc::clone(&state), []);
 
-        Box::new(DeepgramStreamingSession::new(socket, 16_000))
+        Box::new(DeepgramStreamingSession::new(socket, 16_000, 1))
             .cancel()
             .await;
 

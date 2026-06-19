@@ -16,8 +16,10 @@ pub use render::benchmark_render_output_checksum;
 #[cfg(target_os = "macos")]
 use render::write_wav_file;
 #[cfg(test)]
-use render::{collect_output_samples, output_wav_spec, pcm_i16_to_normalized_f32};
-use render::{normalized_f32_to_pcm_i16, pcm_u16_to_pcm_i16};
+use render::{collect_output_samples, pcm_i16_to_normalized_f32};
+use render::{
+    normalized_f32_to_pcm_i16, output_wav_spec, pcm_u16_to_pcm_i16, render_output_pcm_i16,
+};
 
 const MAX_BUFFERED_RECORDING_SECS: usize = 180;
 const DEFAULT_STREAMING_FRAME_MS: u16 = 100;
@@ -53,14 +55,18 @@ struct CaptureBuffer {
     audio_sink: Option<Sender<AudioFrame>>,
     pending_audio_frame_samples: Vec<i16>,
     audio_frame_config: Option<AudioFrameBatchConfig>,
+    dropped_streaming_audio_frames: u64,
 }
 
 #[cfg(any(target_os = "macos", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct AudioFrameBatchConfig {
-    sample_rate_hz: u32,
-    channels: u16,
-    frame_sample_count: usize,
+    source_sample_rate_hz: u32,
+    source_channels: u16,
+    output_config: RecordingConfig,
+    output_sample_rate_hz: u32,
+    output_channels: u16,
+    source_frame_sample_count: usize,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -92,9 +98,10 @@ impl MacosAudioRecorder {
     }
 
     pub fn set_recording_config(&mut self, output_config: RecordingConfig) {
+        let config_changed = self.output_config != output_config;
         self.output_config = output_config;
         #[cfg(target_os = "macos")]
-        if self.started_at.is_none() {
+        if config_changed && self.started_at.is_none() {
             self.engine = None;
         }
     }
@@ -158,6 +165,7 @@ impl AudioRecorder for MacosAudioRecorder {
                         sink,
                         engine.sample_rate,
                         engine.channels,
+                        &engine.requested_output_config,
                         streaming_frame_ms,
                     );
                     capture.active = true;
@@ -753,22 +761,32 @@ fn append_capped_samples(
 fn configure_audio_sink(
     capture: &mut CaptureBuffer,
     sink: Option<Sender<AudioFrame>>,
-    sample_rate_hz: u32,
-    channels: u16,
+    source_sample_rate_hz: u32,
+    source_channels: u16,
+    output_config: &RecordingConfig,
     frame_ms: u16,
 ) {
     capture.audio_sink = sink;
     capture.pending_audio_frame_samples.clear();
+    capture.dropped_streaming_audio_frames = 0;
+    let output_spec = output_wav_spec(source_channels, output_config);
     capture.audio_frame_config = capture.audio_sink.as_ref().map(|_| AudioFrameBatchConfig {
-        sample_rate_hz,
-        channels,
-        frame_sample_count: audio_frame_sample_count(sample_rate_hz, channels, frame_ms),
+        source_sample_rate_hz,
+        source_channels,
+        output_config: output_config.clone(),
+        output_sample_rate_hz: output_spec.sample_rate,
+        output_channels: output_spec.channels,
+        source_frame_sample_count: audio_frame_sample_count(
+            source_sample_rate_hz,
+            source_channels,
+            frame_ms,
+        ),
     });
 
-    if let Some(config) = capture.audio_frame_config {
+    if let Some(config) = capture.audio_frame_config.as_ref() {
         capture
             .pending_audio_frame_samples
-            .reserve(config.frame_sample_count);
+            .reserve(config.source_frame_sample_count);
     }
 }
 
@@ -790,7 +808,7 @@ fn audio_frame_sample_count(sample_rate_hz: u32, channels: u16, frame_ms: u16) -
 
 #[cfg(any(target_os = "macos", test))]
 fn push_audio_frame_sample(capture: &mut CaptureBuffer, sample: i16) {
-    let Some(config) = capture.audio_frame_config else {
+    let Some(config) = capture.audio_frame_config.as_ref() else {
         return;
     };
     if capture.audio_sink.is_none() {
@@ -798,42 +816,73 @@ fn push_audio_frame_sample(capture: &mut CaptureBuffer, sample: i16) {
     }
 
     capture.pending_audio_frame_samples.push(sample);
-    if capture.pending_audio_frame_samples.len() < config.frame_sample_count {
+    if capture.pending_audio_frame_samples.len() < config.source_frame_sample_count {
         return;
     }
 
-    send_pending_audio_frame(capture, config);
+    send_pending_audio_frame(capture);
 }
 
 #[cfg(any(target_os = "macos", test))]
 fn flush_pending_audio_frame(capture: &mut CaptureBuffer) {
-    let Some(config) = capture.audio_frame_config else {
+    if capture.audio_frame_config.is_none() {
         return;
     };
     if capture.pending_audio_frame_samples.is_empty() || capture.audio_sink.is_none() {
         return;
     }
 
-    send_pending_audio_frame(capture, config);
+    send_pending_audio_frame(capture);
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn send_pending_audio_frame(capture: &mut CaptureBuffer, config: AudioFrameBatchConfig) {
+fn send_pending_audio_frame(capture: &mut CaptureBuffer) {
+    let Some(config) = capture.audio_frame_config.clone() else {
+        return;
+    };
     let samples = std::mem::replace(
         &mut capture.pending_audio_frame_samples,
-        Vec::with_capacity(config.frame_sample_count),
+        Vec::with_capacity(config.source_frame_sample_count),
     );
+    let samples = render_output_pcm_i16(
+        &samples,
+        config.source_sample_rate_hz,
+        config.source_channels,
+        &config.output_config,
+    );
+    if samples.is_empty() {
+        return;
+    }
     let frame = AudioFrame {
         samples,
-        sample_rate_hz: config.sample_rate_hz,
-        channels: config.channels,
+        sample_rate_hz: config.output_sample_rate_hz,
+        channels: config.output_channels,
     };
 
     let Some(sink) = capture.audio_sink.as_ref() else {
         return;
     };
-    if matches!(sink.try_send(frame), Err(TrySendError::Closed(_))) {
-        capture.audio_sink = None;
+    match sink.try_send(frame) {
+        Ok(()) => {}
+        Err(TrySendError::Closed(_)) => {
+            capture.audio_sink = None;
+        }
+        Err(TrySendError::Full(frame)) => {
+            capture.dropped_streaming_audio_frames =
+                capture.dropped_streaming_audio_frames.saturating_add(1);
+            if capture.dropped_streaming_audio_frames == 1
+                || capture.dropped_streaming_audio_frames.is_power_of_two()
+            {
+                tracing::warn!(
+                    target: TARGET_RECORDING,
+                    dropped_streaming_audio_frames = capture.dropped_streaming_audio_frames,
+                    frame_samples = frame.samples.len(),
+                    sample_rate_hz = frame.sample_rate_hz,
+                    channels = frame.channels,
+                    "dropping streaming audio frame because transcription queue is full"
+                );
+            }
+        }
     }
 }
 
@@ -927,11 +976,21 @@ mod tests {
             active: true,
             ..CaptureBuffer::default()
         };
-        configure_audio_sink(&mut capture, Some(sink), 1_000, 2, 2);
+        configure_audio_sink(
+            &mut capture,
+            Some(sink),
+            1_000,
+            2,
+            &RecordingConfig {
+                mono: false,
+                sample_rate_khz: 1,
+            },
+            2,
+        );
 
-        append_capped_samples(&mut capture, 16, 1..=9);
+        append_capped_samples(&mut capture, 16, 1..=10);
 
-        assert_eq!(capture.samples, (1..=9).collect::<Vec<_>>());
+        assert_eq!(capture.samples, (1..=10).collect::<Vec<_>>());
         assert_eq!(
             frames.try_recv().expect("first live frame"),
             crate::AudioFrame {
@@ -954,7 +1013,7 @@ mod tests {
         assert_eq!(
             frames.try_recv().expect("partial live frame"),
             crate::AudioFrame {
-                samples: vec![9],
+                samples: vec![9, 10],
                 sample_rate_hz: 1_000,
                 channels: 2,
             }
@@ -968,11 +1027,22 @@ mod tests {
             active: true,
             ..CaptureBuffer::default()
         };
-        configure_audio_sink(&mut capture, Some(sink), 1_000, 1, 2);
+        configure_audio_sink(
+            &mut capture,
+            Some(sink),
+            1_000,
+            1,
+            &RecordingConfig {
+                mono: true,
+                sample_rate_khz: 1,
+            },
+            2,
+        );
 
         append_capped_samples(&mut capture, 16, 1..=6);
 
         assert_eq!(capture.samples, (1..=6).collect::<Vec<_>>());
+        assert_eq!(capture.dropped_streaming_audio_frames, 2);
         assert_eq!(
             frames.try_recv().expect("first live frame is retained"),
             crate::AudioFrame {
@@ -982,6 +1052,41 @@ mod tests {
             }
         );
         assert!(frames.try_recv().is_err());
+    }
+
+    #[test]
+    fn append_capped_samples_emits_audio_frames_in_output_recording_format() {
+        let (sink, mut frames) = tokio::sync::mpsc::channel(4);
+        let mut capture = CaptureBuffer {
+            active: true,
+            ..CaptureBuffer::default()
+        };
+        configure_audio_sink(
+            &mut capture,
+            Some(sink),
+            1_000,
+            2,
+            &RecordingConfig {
+                mono: true,
+                sample_rate_khz: 1,
+            },
+            2,
+        );
+
+        append_capped_samples(
+            &mut capture,
+            16,
+            [i16::MAX, -i16::MAX, 8_192, 24_576].into_iter(),
+        );
+
+        assert_eq!(
+            frames.try_recv().expect("downmixed live frame"),
+            crate::AudioFrame {
+                samples: vec![0, 16_384],
+                sample_rate_hz: 1_000,
+                channels: 1,
+            }
+        );
     }
 
     #[test]

@@ -22,6 +22,7 @@ use crate::{
 
 const PROVIDER: TranscriptionProvider = TranscriptionProvider::OpenAi;
 const MISSING_API_KEY_CODE: &str = "missing_openai_api_key";
+const RECORDING_CONFIG_UNSUPPORTED_CODE: &str = "openai_realtime_recording_config_unsupported";
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 24_000;
 const REQUIRED_CHANNELS: u16 = 1;
 
@@ -64,6 +65,7 @@ impl OpenAiRealtimeTranscriptionRequest {
                 "missing OpenAI API key; set OPENAI_API_KEY or provide providers.openai.api_key in config",
             ));
         };
+        validate_recording_config(resolved)?;
 
         Ok(Self {
             api_key,
@@ -136,6 +138,24 @@ impl OpenAiRealtimeTranscriptionRequest {
             },
         })
     }
+}
+
+fn validate_recording_config(
+    resolved: &ResolvedUtteranceConfig,
+) -> Result<(), StreamingTranscriptionError> {
+    let recording = &resolved.effective_config.recording;
+    if recording.sample_rate_hz() == REQUIRED_SAMPLE_RATE_HZ && recording.mono {
+        return Ok(());
+    }
+
+    Err(StreamingTranscriptionError::unavailable_runtime_capability(
+        PROVIDER,
+        RECORDING_CONFIG_UNSUPPORTED_CODE,
+        format!(
+            "OpenAI Realtime transcription requires recording.sample_rate_khz = 24 and recording.mono = true; current recording.sample_rate_khz = {}, recording.mono = {}",
+            recording.sample_rate_khz, recording.mono
+        ),
+    ))
 }
 
 async fn connect_openai_websocket(
@@ -596,6 +616,72 @@ providers = ["openai"]
             }
             other => panic!("expected unavailable credentials, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn recording_config_mismatch_maps_to_unavailable_runtime_capability_when_bypassing_resolution()
+    {
+        let _guard = EnvVarGuard::remove("OPENAI_API_KEY");
+        let mut resolved = resolved_config(
+            r#"
+[recording]
+sample_rate_khz = 24
+mono = true
+
+[transcription]
+mode = "streaming"
+providers = ["openai"]
+
+[providers.openai]
+api_key = "config-key"
+"#,
+        );
+        resolved.effective_config.recording.sample_rate_khz = 16;
+
+        let error = OpenAiRealtimeTranscriptionRequest::from_resolved(&resolved)
+            .expect_err("recording config mismatch should fail before connecting");
+
+        match error {
+            StreamingTranscriptionError::Unavailable {
+                provider,
+                outcome,
+                code,
+                detail,
+            } => {
+                assert_eq!(provider, PROVIDER);
+                assert_eq!(
+                    outcome,
+                    TranscriptionAttemptOutcome::UnavailableRuntimeCapability
+                );
+                assert_eq!(code, RECORDING_CONFIG_UNSUPPORTED_CODE);
+                assert!(detail.contains("sample_rate_khz = 24"));
+            }
+            other => panic!("expected unavailable runtime capability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recording_config_accepts_24khz_mono() {
+        let _guard = EnvVarGuard::remove("OPENAI_API_KEY");
+        let resolved = resolved_config(
+            r#"
+[recording]
+sample_rate_khz = 24
+mono = true
+
+[transcription]
+mode = "streaming"
+providers = ["openai"]
+
+[providers.openai]
+api_key = "config-key"
+"#,
+        );
+
+        let request = OpenAiRealtimeTranscriptionRequest::from_resolved(&resolved)
+            .expect("24 kHz mono recording should be compatible");
+
+        assert_eq!(request.model, "gpt-realtime-whisper");
     }
 
     #[test]
