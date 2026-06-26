@@ -592,18 +592,27 @@ fn extract_google_transcript_text(body: &[u8]) -> Result<String, CliError> {
         )
     })?;
 
+    // Google's speech:recognize returns one `results` entry per consecutive audio
+    // segment for longer audio; the full transcript is the concatenation of each
+    // segment's top alternative. Aggregate all results (taking alternatives[0] per
+    // result) rather than keeping only the first segment, matching the Whisper and
+    // Deepgram adapters. Segment transcripts carry their own leading spaces, so we
+    // concatenate without a separator and trim the joined string.
     let transcript = value
         .get("results")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|result| result.get("alternatives").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|alternative| alternative.get("transcript").and_then(Value::as_str))
-        .next()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
+        .filter_map(|result| {
+            result
+                .get("alternatives")
+                .and_then(Value::as_array)
+                .and_then(|alternatives| alternatives.first())
+                .and_then(|alternative| alternative.get("transcript"))
+                .and_then(Value::as_str)
+        })
+        .collect::<String>();
+    let transcript = transcript.trim().to_string();
 
     if !transcript.is_empty() || value.get("results").is_some() {
         return Ok(transcript);
@@ -957,6 +966,27 @@ mod tests {
         )
         .expect("extract text from json");
         assert_eq!(transcript, "hello from google");
+    }
+
+    #[test]
+    fn response_json_concatenates_multiple_result_segments() {
+        // Regression: longer audio returns one `results` entry per segment; the
+        // full transcript is their concatenation, not just the first segment.
+        let transcript = extract_google_transcript_text(
+            br#"{"results":[{"alternatives":[{"transcript":"hello world"}]},{"alternatives":[{"transcript":" goodbye now"}]}]}"#,
+        )
+        .expect("extract text from multi-segment json");
+        assert_eq!(transcript, "hello world goodbye now");
+    }
+
+    #[test]
+    fn response_json_uses_first_alternative_per_result() {
+        // Only the top alternative of each result contributes to the transcript.
+        let transcript = extract_google_transcript_text(
+            br#"{"results":[{"alternatives":[{"transcript":"primary","confidence":0.9},{"transcript":"secondary","confidence":0.4}]}]}"#,
+        )
+        .expect("extract text using first alternative");
+        assert_eq!(transcript, "primary");
     }
 
     #[test]
