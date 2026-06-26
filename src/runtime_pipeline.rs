@@ -45,6 +45,12 @@ where
         replay_persist,
         streaming_outcome,
     } = context;
+    // When the replay worker accepts the request it takes ownership of the temp
+    // WAV and deletes it only after audio retention completes. Otherwise this
+    // function must delete the WAV itself (see cleanup below). Default to false so
+    // that any early return — including an injection error after enqueue — still
+    // leaves cleanup with whoever actually owns the file.
+    let mut worker_owns_wav = false;
     let result = async {
         let envelope = build_envelope(resolved, recorded, streaming_outcome);
         let mut outcome = run_pipeline_with_indicator_stages(
@@ -73,7 +79,8 @@ where
         let missing_credentials_feedback = should_show_missing_credentials_feedback(&outcome);
         let permissions = MacosPermissionsAdapter::new();
 
-        replay_persist.enqueue(replay_config, envelope, outcome, route, replay_recorded);
+        worker_owns_wav =
+            replay_persist.enqueue(replay_config, envelope, outcome, route, replay_recorded);
 
         *state = state.on_event(AppEvent::ProcessingFinished);
 
@@ -141,7 +148,9 @@ where
     .await;
 
     *state = state.on_event(AppEvent::InjectionFinished);
-    cleanup_recording_file(&recorded.wav_path);
+    if !worker_owns_wav {
+        cleanup_recording_file(&recorded.wav_path);
+    }
     result?;
     let indicator_state = indicator
         .state()
@@ -545,7 +554,7 @@ fn resolve_step_command(cmd: &str) -> Result<String> {
     Ok(cmd.to_string())
 }
 
-fn cleanup_recording_file(path: &Path) {
+pub(crate) fn cleanup_recording_file(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         warn!(
             target: logging::TARGET_RECORDING,
