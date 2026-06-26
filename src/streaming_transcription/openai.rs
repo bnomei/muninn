@@ -1,3 +1,10 @@
+//! OpenAI Realtime transcription over the streaming WebSocket API.
+//!
+//! Requires 24 kHz mono recording, sends base64 PCM via `input_audio_buffer.append`,
+//! and waits for `conversation.item.input_audio_transcription.completed` events
+//! after `input_audio_buffer.commit`. Implements [`StreamingTranscriptionProvider`]
+//! for [`TranscriptionProvider::OpenAi`].
+
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
@@ -28,6 +35,7 @@ const REQUIRED_SAMPLE_RATE_HZ: u32 = 24_000;
 const REQUIRED_CHANNELS: u16 = 1;
 const STREAM_CLOSED_WITH_ERROR_CODE: &str = "openai_realtime_closed_with_error";
 
+/// OpenAI Realtime [`StreamingTranscriptionProvider`] using `tokio-tungstenite`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenAiStreamingTranscriptionProvider;
 
@@ -277,14 +285,6 @@ where
             ))
             .await?;
 
-        // The realtime session is persistent and does not close after a single
-        // utterance. The server acknowledges this commit with the user item id
-        // (`input_audio_buffer.committed`) and later finalizes the item with its
-        // audio content indexes (`conversation.item.done`). Wait until each audio
-        // content part of that committed item has a completed transcript instead of
-        // using a fixed post-completion grace, which can truncate delayed final
-        // events. The upstream finish timeout remains the outer bound for a missing
-        // acknowledgement/finalization/completion.
         let mut error_close: Option<StreamingTranscriptionError> = None;
         loop {
             let Some(message) = self.socket.next().await? else {
@@ -303,10 +303,6 @@ where
                     self.socket.send(Message::Pong(payload)).await?;
                 }
                 Message::Close(frame) => {
-                    // A server-initiated error close (auth/quota/policy) must be a
-                    // provider failure, not an empty-success outcome that would be
-                    // reported to the user as "no speech detected". Benign closes
-                    // (1000 Normal, 1001 Going Away, or no frame) just end the loop.
                     if let Some(frame) = frame {
                         let code = u16::from(frame.code);
                         if !matches!(code, 1000 | 1001) {
@@ -327,8 +323,6 @@ where
 
         let _ = self.socket.close().await;
         let outcome = self.transcript.into_outcome();
-        // Prefer a transcript that was produced before an error close; only surface
-        // the close as a failure when there is no usable final text.
         match error_close {
             Some(error) if !outcome.has_final_text() => Err(error),
             _ => Ok(outcome),
@@ -1007,7 +1001,6 @@ api_key = "config-key"
             .await
             .expect("session should finalize");
 
-        // Regression: finish() must not stop after the first completed segment.
         assert_eq!(
             outcome.raw_text.as_deref(),
             Some("first segment second segment")
@@ -1042,8 +1035,6 @@ api_key = "config-key"
             .await
             .expect("session should wait for the committed item's delayed completion");
 
-        // Regression: a fixed post-completion grace can close the persistent socket
-        // before a delayed final event arrives.
         assert_eq!(outcome.raw_text.as_deref(), Some("delayed final text"));
     }
 

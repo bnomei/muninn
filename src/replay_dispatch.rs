@@ -1,3 +1,9 @@
+//! Background worker that offloads replay persistence from the hot path.
+//!
+//! The runtime worker enqueues replay requests on a bounded sync channel; a
+//! dedicated thread owns [`ReplayStore`] instances and deletes temporary WAV
+//! files after persistence completes.
+
 use std::collections::HashMap;
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::thread::JoinHandle;
@@ -19,21 +25,20 @@ struct ReplayPersistRequest {
     recorded: RecordedAudio,
 }
 
+/// Bounded-queue replay writer running on a background OS thread.
 pub(crate) struct ReplayPersistenceService {
     sender: Option<SyncSender<ReplayPersistRequest>>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl ReplayPersistenceService {
+    /// Start the replay persistence worker thread.
     pub(crate) fn spawn() -> Self {
         let (sender, receiver) =
             sync_channel::<ReplayPersistRequest>(REPLAY_PERSIST_QUEUE_CAPACITY);
         let worker = std::thread::spawn(move || {
             let mut stores = HashMap::<std::path::PathBuf, replay::ReplayStore>::new();
             while let Ok(request) = receiver.recv() {
-                // The worker owns the temp WAV for this request. Capture its path so
-                // we can delete it after persistence (and thus after audio retention)
-                // regardless of which branch persist_request returns through.
                 let wav_path = request.recorded.wav_path.clone();
                 persist_request(&mut stores, request);
                 crate::runtime_pipeline::cleanup_recording_file(&wav_path);
@@ -46,14 +51,11 @@ impl ReplayPersistenceService {
         }
     }
 
-    /// Hand a replay persistence request to the background worker.
+    /// Queue replay persistence for one utterance.
     ///
-    /// Returns `true` when the worker has accepted the request and thereby taken
-    /// ownership of the recorded temp WAV: the worker deletes it only after audio
-    /// retention has had a chance to copy it. Returns `false` when replay is
-    /// disabled or the request was dropped, in which case the caller remains
-    /// responsible for deleting the WAV. This ordering prevents a race where the
-    /// runtime deletes the temp WAV before the async worker can retain its audio.
+    /// Returns `true` when the worker accepted the request and will delete the
+    /// temporary WAV after writing. Returns `false` when replay is disabled, the
+    /// queue is full, or the worker is unavailable.
     pub(crate) fn enqueue(
         &self,
         resolved: Option<ResolvedUtteranceConfig>,

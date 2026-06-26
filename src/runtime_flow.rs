@@ -1,3 +1,9 @@
+//! Recording and injection state machine coordinator.
+//!
+//! Encapsulates [`AppState`] transitions with the indicator, audio recorder, and
+//! text injector adapters. Called from the runtime worker Tokio runtime; does not
+//! touch the tao event loop directly.
+
 use std::time::Duration;
 
 use crate::{
@@ -7,6 +13,7 @@ use crate::{
 };
 use tracing::warn;
 
+/// Coordinates recording capture, indicator updates, and text injection.
 #[derive(Debug)]
 pub struct RuntimeFlowCoordinator<I, R, T>
 where
@@ -26,6 +33,7 @@ where
     R: AudioRecorder,
     T: TextInjector,
 {
+    /// Create a coordinator starting in [`AppState::Idle`].
     pub fn new(indicator: I, recorder: R, injector: T) -> Self {
         Self {
             state: AppState::Idle,
@@ -35,38 +43,47 @@ where
         }
     }
 
+    /// Current high-level runtime state.
     pub fn state(&self) -> AppState {
         self.state
     }
 
+    /// Mutable access for callers that apply transitions outside this type.
     pub fn state_mut(&mut self) -> &mut AppState {
         &mut self.state
     }
 
+    /// Mutable indicator adapter handle.
     pub fn indicator_mut(&mut self) -> &mut I {
         &mut self.indicator
     }
 
+    /// Mutable recorder adapter handle.
     pub fn recorder_mut(&mut self) -> &mut R {
         &mut self.recorder
     }
 
+    /// Text injector used after pipeline routing.
     pub fn injector(&self) -> &T {
         &self.injector
     }
 
+    /// Borrow state, indicator, and injector together for post-recording processing.
     pub fn processing_parts(&mut self) -> (&mut AppState, &mut I, &T) {
         (&mut self.state, &mut self.indicator, &self.injector)
     }
 
+    /// Initialize the indicator to idle appearance.
     pub async fn initialize(&mut self) -> MacosAdapterResult<()> {
         self.indicator.initialize().await
     }
 
+    /// Begin push-to-talk recording. No-op when the state machine rejects [`AppEvent::PttPressed`].
     pub async fn start_push_to_talk(&mut self, glyph: Option<char>) -> MacosAdapterResult<bool> {
         self.start_push_to_talk_with_audio_sink(glyph, None).await
     }
 
+    /// Begin push-to-talk recording with an optional live audio frame sink.
     pub async fn start_push_to_talk_with_audio_sink(
         &mut self,
         glyph: Option<char>,
@@ -76,10 +93,12 @@ where
             .await
     }
 
+    /// Begin done-mode recording. No-op when the state machine rejects [`AppEvent::DoneTogglePressed`].
     pub async fn start_done_mode(&mut self, glyph: Option<char>) -> MacosAdapterResult<bool> {
         self.start_done_mode_with_audio_sink(glyph, None).await
     }
 
+    /// Begin done-mode recording with an optional live audio frame sink.
     pub async fn start_done_mode_with_audio_sink(
         &mut self,
         glyph: Option<char>,
@@ -94,6 +113,9 @@ where
         .await
     }
 
+    /// Stop push-to-talk capture and enter processing with the given initial indicator.
+    ///
+    /// Returns `None` when release is ignored. Resets to idle if stop fails.
     pub async fn finish_push_to_talk_for_processing(
         &mut self,
         initial_indicator: IndicatorState,
@@ -103,6 +125,9 @@ where
             .await
     }
 
+    /// Stop done-mode capture and enter processing with the given initial indicator.
+    ///
+    /// Returns `None` when the toggle is ignored. Resets to idle if stop fails.
     pub async fn finish_done_mode_for_processing(
         &mut self,
         initial_indicator: IndicatorState,
@@ -112,6 +137,9 @@ where
             .await
     }
 
+    /// Discard the active recording and flash the cancelled indicator briefly.
+    ///
+    /// No-op when cancel is not valid for the current state.
     pub async fn cancel_current_capture(
         &mut self,
         glyph: Option<char>,
@@ -137,6 +165,10 @@ where
         Ok(true)
     }
 
+    /// Inject routed text after processing and drive output indicator timing.
+    ///
+    /// No-op unless the coordinator is in [`AppState::Processing`]. Resets the
+    /// indicator to idle after injection failures.
     pub async fn complete_processing_with_route(
         &mut self,
         route: &InjectionRoute,
@@ -259,6 +291,9 @@ where
     }
 }
 
+/// Map a macOS hotkey edge to the corresponding [`AppEvent`].
+///
+/// Release events for toggle and cancel chords are ignored.
 pub fn map_hotkey_event(event: HotkeyEvent) -> Option<AppEvent> {
     match (event.action, event.kind) {
         (HotkeyAction::PushToTalk, HotkeyEventKind::Pressed) => Some(AppEvent::PttPressed),

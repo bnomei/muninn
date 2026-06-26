@@ -1,3 +1,9 @@
+//! Async subprocess transport for external pipeline steps.
+//!
+//! Spawns a child with piped stdin/stdout/stderr, writes step input, and
+//! collects capped output streams concurrently so large stdin payloads cannot
+//! deadlock against unread stdout. Used by [`super::execution`].
+
 use std::io;
 use std::process::Stdio;
 use std::time::Duration;
@@ -7,6 +13,7 @@ use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+/// Successful child process completion with capped stream captures.
 #[derive(Debug)]
 pub(super) struct CommandResult {
     pub(super) stdout: CapturedOutput,
@@ -15,34 +22,46 @@ pub(super) struct CommandResult {
     pub(super) success: bool,
 }
 
+/// Byte capture from a child stream with truncation metadata.
 #[derive(Debug, Default)]
 pub(super) struct CapturedOutput {
     pub(super) bytes: Vec<u8>,
+    /// True when additional bytes were read but discarded past the capture limit.
     pub(super) truncated: bool,
 }
 
+/// Failure phase while spawning, writing stdin, waiting, or reading streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CommandErrorKind {
+    /// `Command::spawn` failed.
     Spawn,
+    /// Child stdin pipe was unavailable after spawn.
     MissingStdin,
+    /// Child stdout pipe was unavailable after spawn.
     MissingStdout,
+    /// Child stderr pipe was unavailable after spawn.
     MissingStderr,
+    /// Writing step input to stdin failed.
     WriteStdin,
+    /// Shutting down stdin after the write failed.
     CloseStdin,
+    /// Waiting for child exit failed.
     Wait,
+    /// Draining the stdout reader task failed.
     ReadStdout,
+    /// Draining the stderr reader task failed.
     ReadStderr,
+    /// The overall command exceeded `timeout_budget`.
     Timeout,
 }
 
-/// Which phase of the bounded write/wait future failed, so the outer timeout can
-/// map it back to the right [`CommandErrorKind`].
 enum WritePhaseError {
     Write(io::Error),
     Close(io::Error),
     Wait(io::Error),
 }
 
+/// Transport-layer failure with optional partial stderr capture.
 #[derive(Debug)]
 pub(super) struct CommandError {
     pub(super) kind: CommandErrorKind,
@@ -52,6 +71,11 @@ pub(super) struct CommandError {
     pub(super) stderr: CapturedOutput,
 }
 
+/// Spawn `cmd` with `args`, write `stdin_bytes`, and collect capped stdout/stderr.
+///
+/// The child is killed on drop and again during timeout or I/O failure cleanup.
+/// Returns [`CommandErrorKind::Timeout`] when `timeout_budget` elapses before
+/// stdin is fully written and the process exits.
 pub(super) async fn run_command(
     cmd: &str,
     args: &[String],
@@ -100,19 +124,11 @@ pub(super) async fn run_command(
         stderr: CapturedOutput::default(),
     })?;
 
-    // Spawn the stdout/stderr drains BEFORE writing stdin. A child that emits
-    // output while consuming input would otherwise fill its stdout pipe, stop
-    // reading stdin, and deadlock the parent's write_all. Draining concurrently
-    // keeps the child unblocked so the write can make progress.
     let stdout_reader =
         tokio::spawn(async move { read_to_end_capped(stdout, max_stdout_bytes).await });
     let stderr_reader =
         tokio::spawn(async move { read_to_end_capped(stderr, max_stderr_bytes).await });
 
-    // Drive the stdin write/shutdown and child.wait() under a single
-    // timeout_budget. Previously the write phase ran outside any timeout and with
-    // no concurrent stdout drain, so a child that never reads stdin to EOF (or
-    // stalls) blocked write_all forever and the timeout was never reached.
     let write_and_wait = async {
         stdin
             .write_all(stdin_bytes)
@@ -288,15 +304,10 @@ fn format_command_error_details(primary: String, cleanup_notes: Vec<String>) -> 
 mod tests {
     use super::*;
 
-    // Far larger than any OS pipe buffer (~64 KB), so a child that reads and writes
-    // concurrently, or that never reads stdin, exposes back-pressure deadlocks.
     const LARGE_PAYLOAD_BYTES: usize = 512 * 1024;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drains_stdout_while_writing_large_stdin_without_deadlock() {
-        // `cat` echoes stdin to stdout. If stdin were fully written before the
-        // stdout reader was spawned, cat would fill its stdout pipe, stop reading
-        // stdin, and the parent's write_all would deadlock.
         let payload = vec![b'x'; LARGE_PAYLOAD_BYTES];
 
         let result = run_command(
@@ -317,9 +328,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn times_out_when_child_never_reads_stdin() {
-        // `sleep` never reads stdin, so a payload larger than the pipe buffer blocks
-        // the parent's write_all. The write phase must now be bounded by
-        // timeout_budget instead of hanging forever.
         let payload = vec![b'x'; LARGE_PAYLOAD_BYTES];
 
         let error = run_command(

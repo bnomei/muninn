@@ -1,6 +1,16 @@
+//! Versioned pipeline artifact envelope (`muninn.envelope.v1`).
+//!
+//! Serializable contract between capture, transcription, refinement, and replay.
+//! Each section carries an `extra` map so new fields can be added without
+//! breaking older readers.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Pipeline output document persisted per utterance and replayed offline.
+///
+/// Unknown top-level JSON fields deserialize into `extra`. Optional sections
+/// default to empty values when omitted from input JSON.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MuninnEnvelopeV1 {
     #[serde(default = "default_schema")]
@@ -26,8 +36,10 @@ pub struct MuninnEnvelopeV1 {
 }
 
 impl MuninnEnvelopeV1 {
+    /// Schema identifier written to the `schema` field.
     pub const SCHEMA: &'static str = "muninn.envelope.v1";
 
+    /// Minimal envelope with required identifiers and empty optional sections.
     pub fn new(utterance_id: impl Into<String>, started_at: impl Into<String>) -> Self {
         Self {
             schema: default_schema(),
@@ -44,53 +56,63 @@ impl MuninnEnvelopeV1 {
         }
     }
 
+    /// Set captured WAV path and duration on the envelope.
     pub fn with_audio(mut self, wav_path: Option<String>, duration_ms: u64) -> Self {
         self.audio.wav_path = wav_path;
         self.audio.duration_ms = duration_ms;
         self
     }
 
+    /// Set provider raw transcript text.
     pub fn with_transcript_raw_text(mut self, raw_text: impl Into<String>) -> Self {
         self.transcript.raw_text = Some(raw_text.into());
         self
     }
 
+    /// Record which transcription provider produced `raw_text`.
     pub fn with_transcript_provider(mut self, provider: impl Into<String>) -> Self {
         self.transcript.provider = Some(provider.into());
         self
     }
 
+    /// Attach the refinement system prompt used after transcription.
     pub fn with_transcript_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.transcript.system_prompt = Some(system_prompt.into());
         self
     }
 
+    /// Set the post-processed text ready for injection or replay.
     pub fn with_output_final_text(mut self, final_text: impl Into<String>) -> Self {
         self.output.final_text = Some(final_text.into());
         self
     }
 
+    /// Append a span the pipeline could not confidently transcribe.
     pub fn push_uncertain_span(mut self, span: impl Into<Value>) -> Self {
         self.uncertain_spans.push(span.into());
         self
     }
 
+    /// Append a refinement candidate considered for a span.
     pub fn push_candidate(mut self, candidate: impl Into<Value>) -> Self {
         self.candidates.push(candidate.into());
         self
     }
 
+    /// Append a replacement applied during post-processing.
     pub fn push_replacement(mut self, replacement: impl Into<Value>) -> Self {
         self.replacements.push(replacement.into());
         self
     }
 
+    /// Append a non-fatal pipeline warning or step error.
     pub fn push_error(mut self, error: impl Into<Value>) -> Self {
         self.errors.push(error.into());
         self
     }
 }
 
+/// Captured audio metadata for an utterance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct EnvelopeAudio {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +123,7 @@ pub struct EnvelopeAudio {
     pub extra: Map<String, Value>,
 }
 
+/// Transcription inputs and provider output for an utterance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct EnvelopeTranscript {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,6 +136,7 @@ pub struct EnvelopeTranscript {
     pub extra: Map<String, Value>,
 }
 
+/// Final injected or clipboard text produced by the pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct EnvelopeOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]

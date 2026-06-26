@@ -1,3 +1,9 @@
+//! Disk-backed replay artifacts for utterance debugging.
+//!
+//! Writes redacted `record.json` trees under `logging.replay_dir`, optionally
+//! retaining audio via hard link. Prunes by retention age and max byte budget on
+//! a throttled schedule. Invoked from the replay persistence worker thread.
+
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -33,10 +39,14 @@ const SECRET_KEYS: &[&str] = &[
     "google_stt_token",
 ];
 
+/// On-disk location and retention limits for replay artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ReplayStoreSpec {
+    /// Absolute replay root directory.
     pub(crate) root: PathBuf,
+    /// Maximum age in days before artifacts are eligible for pruning.
     pub(crate) retention_days: u32,
+    /// Maximum total bytes to retain across artifact directories.
     pub(crate) max_bytes: u64,
 }
 
@@ -86,6 +96,7 @@ struct ReplayEntryMeta {
     bytes: u64,
 }
 
+/// Mutable replay index with throttled pruning for one root directory.
 pub(crate) struct ReplayStore {
     root: PathBuf,
     retention_days: u32,
@@ -94,6 +105,7 @@ pub(crate) struct ReplayStore {
     entries: Vec<ReplayEntryMeta>,
 }
 
+/// Resolve replay directory and retention limits from effective logging config.
 pub(crate) fn replay_store_spec(config: &AppConfig) -> Result<ReplayStoreSpec> {
     Ok(ReplayStoreSpec {
         root: expand_replay_dir(&config.logging.replay_dir)
@@ -104,6 +116,7 @@ pub(crate) fn replay_store_spec(config: &AppConfig) -> Result<ReplayStoreSpec> {
 }
 
 impl ReplayStore {
+    /// Open or create a replay store and index existing artifact directories.
     pub(crate) fn open(spec: ReplayStoreSpec) -> Result<Self> {
         fs::create_dir_all(&spec.root)
             .with_context(|| format!("creating replay root {}", spec.root.display()))?;
@@ -117,11 +130,15 @@ impl ReplayStore {
         })
     }
 
+    /// Apply updated retention limits without reopening the store.
     pub(crate) fn update_limits(&mut self, spec: &ReplayStoreSpec) {
         self.retention_days = spec.retention_days;
         self.max_bytes = spec.max_bytes;
     }
 
+    /// Write one replay artifact when `logging.replay_enabled` is true.
+    ///
+    /// Returns `None` when replay is disabled or persistence is skipped.
     pub(crate) fn persist(
         &mut self,
         resolved: ResolvedUtteranceConfig,
@@ -190,6 +207,10 @@ impl ReplayStore {
     }
 }
 
+/// One-shot convenience wrapper that opens a store and persists one utterance.
+///
+/// Prefer [`ReplayStore`] via [`crate::replay_dispatch::ReplayPersistenceService`]
+/// in the hot path.
 #[allow(dead_code)]
 pub fn persist_replay(
     resolved: ResolvedUtteranceConfig,
@@ -357,11 +378,6 @@ fn replay_refine_context(config: &AppConfig) -> Option<ReplayRefineContext> {
         return None;
     }
 
-    // Redact the prompt text. The README promises full-debug replay redacts prompt
-    // fields, and config/envelope snapshots already strip system_prompt; persisting
-    // the verbatim refine prompt here would leak private vocabulary, names, and
-    // project hints into shared/backed-up replay directories. Keep the field present
-    // as a marker so the artifact still records that a refine prompt was configured.
     Some(ReplayRefineContext {
         system_prompt: REDACTED_VALUE.to_string(),
     })
@@ -1109,8 +1125,6 @@ mod tests {
         )
         .expect("parse replay record");
 
-        // refine_context is present (a non-empty refine prompt was configured) but
-        // the prompt text itself is redacted, matching the README redaction promise.
         assert!(!config.transcript.system_prompt.trim().is_empty());
         assert_eq!(
             record["refine_context"]["system_prompt"],

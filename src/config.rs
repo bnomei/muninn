@@ -1,3 +1,10 @@
+//! TOML-backed application configuration, validation, and per-utterance resolution.
+//!
+//! [`AppConfig`] is the root schema loaded from `~/.config/muninn/config.toml` (or
+//! `MUNINN_CONFIG`). Profiles, voices, and [`ProfileRuleConfig`] matchers layer
+//! overrides onto recording, transcription, pipeline, and refine settings before each
+//! capture. See [`ResolvedUtteranceConfig`] for the effective settings the runtime uses.
+
 use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::OsString;
@@ -19,6 +26,7 @@ mod logging;
 
 pub use logging::{LoggingConfig, ReplayDetailMode};
 
+/// Root `config.toml` schema for Muninn runtime, pipeline, and provider settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppConfig {
@@ -43,11 +51,13 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Load config from the resolved default path, writing a launchable default when missing.
     pub fn load() -> Result<Self, ConfigError> {
         let path = resolve_config_path()?;
         Self::load_or_create_default(path)
     }
 
+    /// Load and validate config from an explicit path. Errors when the file is absent.
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -70,6 +80,7 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Parse and validate config from a TOML string (used by config hot reload).
     pub fn from_toml_str(raw: &str) -> Result<Self, ConfigError> {
         let config: Self =
             toml::from_str(raw).map_err(|source| ConfigError::ParseToml { source })?;
@@ -77,6 +88,7 @@ impl AppConfig {
         Ok(config)
     }
 
+    /// Default config that passes validation and can run without user edits.
     pub fn launchable_default() -> Self {
         let mut config = Self::default();
         config.pipeline.deadline_ms = 40_000;
@@ -102,6 +114,7 @@ impl AppConfig {
         Self::load_from_path(path)
     }
 
+    /// Check semantic constraints beyond serde deserialization.
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         validate_identifier(self.app.profile.trim(), "app.profile")?;
 
@@ -151,6 +164,7 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Pick profile and voice from [`ProfileRuleConfig`] matchers, falling back to [`AppSettings::profile`].
     #[must_use]
     pub fn resolve_profile_selection(
         &self,
@@ -192,6 +206,10 @@ impl AppConfig {
         }
     }
 
+    /// Merge profile and voice overrides into per-utterance effective settings.
+    ///
+    /// Expands the transcription route, applies streaming recording requirements, and
+    /// materializes transcript prompts before returning [`ResolvedUtteranceConfig`].
     #[must_use]
     pub fn resolve_effective_config(
         &self,
@@ -284,6 +302,7 @@ impl AppConfig {
     }
 }
 
+/// Global app behavior flags and the default profile id.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppSettings {
@@ -328,6 +347,7 @@ impl Default for ExternalControlConfig {
     }
 }
 
+/// Hotkey bindings for push-to-talk, done-mode toggle, and capture cancel.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeysConfig {
@@ -358,6 +378,7 @@ impl Default for HotkeysConfig {
     }
 }
 
+/// Single hotkey chord with trigger semantics and optional double-tap timing.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct HotkeyBinding {
@@ -378,6 +399,7 @@ impl Default for HotkeyBinding {
 }
 
 impl HotkeyBinding {
+    /// Double-tap window in milliseconds, using the global default when unset.
     #[must_use]
     pub fn effective_double_tap_timeout_ms(&self) -> u64 {
         self.double_tap_timeout_ms
@@ -385,15 +407,20 @@ impl HotkeyBinding {
     }
 }
 
+/// How a hotkey chord activates capture controls.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerType {
+    /// Fire while the chord is held down.
     Hold,
+    /// Fire once on chord press.
     #[default]
     Press,
+    /// Fire when the same chord is pressed twice within the timeout window.
     DoubleTap,
 }
 
+/// Tray indicator visibility and color palette for capture lifecycle states.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndicatorConfig {
@@ -413,6 +440,7 @@ impl Default for IndicatorConfig {
     }
 }
 
+/// `#RRGGBB` hex colors for each indicator lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct IndicatorColorsConfig {
@@ -427,6 +455,7 @@ pub struct IndicatorColorsConfig {
 }
 
 impl IndicatorColorsConfig {
+    /// Require every configured color to be a valid `#RRGGBB` hex string.
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         for (color_name, color_value) in [
             ("indicator.colors.idle", self.idle.as_str()),
@@ -465,6 +494,7 @@ impl Default for IndicatorColorsConfig {
     }
 }
 
+/// Microphone capture format settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RecordingConfig {
@@ -473,6 +503,7 @@ pub struct RecordingConfig {
 }
 
 impl RecordingConfig {
+    /// Require a positive sample rate.
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         if self.sample_rate_khz == 0 {
             return Err(ConfigValidationError::RecordingSampleRateKhzMustBePositive);
@@ -481,6 +512,7 @@ impl RecordingConfig {
         Ok(())
     }
 
+    /// Sample rate in hertz derived from [`RecordingConfig::sample_rate_khz`].
     #[must_use]
     pub const fn sample_rate_hz(&self) -> u32 {
         self.sample_rate_khz * 1_000
@@ -496,6 +528,7 @@ impl Default for RecordingConfig {
     }
 }
 
+/// Post-transcription pipeline deadline, payload shape, and ordered step list.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct PipelineConfig {
@@ -514,6 +547,7 @@ impl Default for PipelineConfig {
     }
 }
 
+/// External command invoked as one pipeline step after transcription.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineStepConfig {
@@ -529,31 +563,42 @@ pub struct PipelineStepConfig {
     pub on_error: OnErrorPolicy,
 }
 
+/// How a pipeline step reads stdin and writes stdout.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StepIoMode {
+    /// Infer IO mode from the step command name.
     #[default]
     Auto,
+    /// Expect and emit JSON envelope objects.
     EnvelopeJson,
+    /// Pass transcript text through a filter command.
     TextFilter,
 }
 
+/// Pipeline behavior when a step exits with an error.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum OnErrorPolicy {
+    /// Skip the failed step and continue with the previous output.
     Continue,
+    /// Substitute the raw transcript and continue downstream steps.
     FallbackRaw,
+    /// Stop the pipeline and surface the failure.
     #[default]
     Abort,
 }
 
+/// JSON shape passed between pipeline steps.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadFormat {
+    /// Single JSON object envelope per step.
     #[default]
     JsonObject,
 }
 
+/// Confidence thresholds for transcript candidate scoring and acronym handling.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ScoringConfig {
@@ -574,6 +619,7 @@ impl Default for ScoringConfig {
     }
 }
 
+/// System prompt fragments used by built-in transcript refinement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptConfig {
@@ -622,14 +668,18 @@ impl TranscriptConfig {
 const MIN_STREAMING_FRAME_MS: u16 = 20;
 const MAX_STREAMING_FRAME_MS: u16 = 200;
 
+/// Whether utterances are transcribed after capture or incrementally while recording.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionMode {
+    /// Transcribe the full recording when capture finishes.
     #[default]
     Recorded,
+    /// Stream audio frames to providers during capture.
     Streaming,
 }
 
+/// Frame timing and fallback policy for streaming transcription mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct StreamingTranscriptionConfig {
@@ -658,6 +708,7 @@ impl Default for StreamingTranscriptionConfig {
     }
 }
 
+/// Transcription mode, streaming tuning, and optional provider route override.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptionConfig {
@@ -678,6 +729,7 @@ impl TranscriptionConfig {
     }
 }
 
+/// Partial overrides for [`StreamingTranscriptionConfig`] applied by profiles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct StreamingTranscriptionOverrides {
@@ -716,6 +768,7 @@ impl StreamingTranscriptionOverrides {
     }
 }
 
+/// Partial overrides for [`TranscriptionConfig`] applied by profiles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptionOverrides {
@@ -752,6 +805,7 @@ impl TranscriptionOverrides {
     }
 }
 
+/// LLM refine step endpoint, model, and output guardrail limits.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RefineConfig {
@@ -766,6 +820,7 @@ pub struct RefineConfig {
 }
 
 impl RefineConfig {
+    /// Require non-empty endpoint/model and in-range temperature and ratio guardrails.
     pub fn validate(&self) -> Result<(), ConfigValidationError> {
         if self.endpoint.trim().is_empty() {
             return Err(ConfigValidationError::RefineEndpointMustNotBeEmpty);
@@ -810,13 +865,16 @@ impl Default for RefineConfig {
     }
 }
 
+/// Backend used by the built-in refine step.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum RefineProvider {
+    /// OpenAI chat-completions compatible refine endpoint.
     #[serde(rename = "openai")]
     #[default]
     OpenAi,
 }
 
+/// Named voice preset that overrides transcript prompts and refine guardrails.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct VoiceConfig {
@@ -839,6 +897,7 @@ pub struct VoiceConfig {
 }
 
 impl VoiceConfig {
+    /// Single uppercase ASCII letter for the indicator glyph, when configured.
     #[must_use]
     pub fn normalized_indicator_glyph(&self) -> Option<char> {
         self.indicator_glyph
@@ -911,6 +970,7 @@ impl VoiceConfig {
     }
 }
 
+/// Profile-level overrides layered onto base config before each utterance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfileConfig {
@@ -952,6 +1012,7 @@ impl ProfileConfig {
     }
 }
 
+/// Partial overrides for [`RecordingConfig`] applied by profiles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RecordingOverrides {
@@ -979,6 +1040,7 @@ impl RecordingOverrides {
     }
 }
 
+/// Partial overrides for [`PipelineConfig`] applied by profiles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct PipelineOverrides {
@@ -1017,6 +1079,7 @@ impl PipelineOverrides {
     }
 }
 
+/// Partial overrides for [`TranscriptConfig`] applied by profiles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct TranscriptOverrides {
@@ -1053,6 +1116,7 @@ impl TranscriptOverrides {
     }
 }
 
+/// Partial overrides for [`RefineConfig`] applied by profiles.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct RefineOverrides {
@@ -1128,6 +1192,7 @@ impl RefineOverrides {
     }
 }
 
+/// Context matcher that selects a profile from frontmost app and window metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProfileRuleConfig {
@@ -1194,6 +1259,7 @@ impl ProfileRuleConfig {
             || self.window_title_contains.is_some()
     }
 
+    /// Return whether every configured matcher agrees with `target_context`.
     #[must_use]
     pub fn matches(&self, target_context: &TargetContextSnapshot) -> bool {
         if !match_optional_exact(
@@ -1224,6 +1290,7 @@ impl ProfileRuleConfig {
     }
 }
 
+/// Profile and voice chosen for an utterance before overrides are applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedProfileSelection {
     pub matched_rule_id: Option<String>,
@@ -1233,6 +1300,7 @@ pub struct ResolvedProfileSelection {
     pub fallback_reason: Option<String>,
 }
 
+/// Fully resolved per-utterance settings after profile, voice, and route expansion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedUtteranceConfig {
     pub target_context: TargetContextSnapshot,
@@ -1247,6 +1315,7 @@ pub struct ResolvedUtteranceConfig {
 }
 
 impl ResolvedUtteranceConfig {
+    /// Streaming-capable providers from the resolved route. Empty when mode is [`TranscriptionMode::Recorded`].
     #[must_use]
     pub fn streaming_transcription_route(&self) -> Vec<TranscriptionProvider> {
         if self.effective_config.transcription.mode != TranscriptionMode::Streaming {
@@ -1262,6 +1331,7 @@ impl ResolvedUtteranceConfig {
     }
 }
 
+/// Materialized built-in transcript and refine settings for pipeline execution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedBuiltinStepConfig {
     pub transcript: TranscriptConfig,
@@ -1270,6 +1340,7 @@ pub struct ResolvedBuiltinStepConfig {
 }
 
 impl ResolvedBuiltinStepConfig {
+    /// Build builtin-step settings from an [`AppConfig`], materializing transcript prompts.
     #[must_use]
     pub fn from_app_config(config: &AppConfig) -> Self {
         let mut transcript = config.transcript.clone();
@@ -1283,6 +1354,7 @@ impl ResolvedBuiltinStepConfig {
     }
 }
 
+/// Provider-specific credentials and endpoints for each transcription backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProvidersConfig {
@@ -1303,6 +1375,7 @@ impl ProvidersConfig {
     }
 }
 
+/// macOS Apple Speech on-device transcription settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AppleSpeechProviderConfig {
@@ -1332,15 +1405,20 @@ impl Default for AppleSpeechProviderConfig {
     }
 }
 
+/// Compute device preference for local `whisper.cpp` inference.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WhisperCppDevicePreference {
+    /// Let `whisper.cpp` pick CPU or GPU automatically.
     #[default]
     Auto,
+    /// Force CPU inference.
     Cpu,
+    /// Prefer GPU acceleration when available.
     Gpu,
 }
 
+/// Local `whisper.cpp` model path and device settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WhisperCppProviderConfig {
@@ -1375,6 +1453,7 @@ impl Default for WhisperCppProviderConfig {
     }
 }
 
+/// Deepgram batch and streaming transcription API settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct DeepgramProviderConfig {
@@ -1418,6 +1497,7 @@ impl DeepgramProviderConfig {
     }
 }
 
+/// OpenAI batch and realtime transcription API settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct OpenAiProviderConfig {
@@ -1461,6 +1541,7 @@ impl OpenAiProviderConfig {
     }
 }
 
+/// Google Speech-to-Text batch and streaming API settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct GoogleProviderConfig {
@@ -1520,73 +1601,94 @@ impl GoogleProviderConfig {
     }
 }
 
+/// Errors loading, parsing, or bootstrapping the config file.
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// `HOME` is unset and no explicit `MUNINN_CONFIG` or `XDG_CONFIG_HOME` path applies.
     #[error("unable to resolve config path because HOME is not set")]
     HomeDirectoryNotSet,
+    /// Explicit load requested a path that does not exist.
     #[error("config file not found at expected path: {path}")]
     NotFound { path: PathBuf },
+    /// Config file exists but could not be read from disk.
     #[error("failed to read config file at {path}: {source}")]
     Read {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// TOML in a known config path failed to deserialize.
     #[error("failed to parse config TOML at {path}: {source}")]
     ParseTomlAtPath {
         path: PathBuf,
         #[source]
         source: toml::de::Error,
     },
+    /// TOML string (for example from hot reload) failed to deserialize.
     #[error("failed to parse config TOML: {source}")]
     ParseToml {
         #[source]
         source: toml::de::Error,
     },
+    /// Parent directory for a new default config could not be created.
     #[error("failed to create config directory at {path}: {source}")]
     CreateConfigDir {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// Launchable default config could not be serialized to TOML.
     #[error("failed to serialize launchable default config: {source}")]
     SerializeDefaultConfig {
         #[source]
         source: toml::ser::Error,
     },
+    /// Serialized default config could not be written to disk.
     #[error("failed to write default config file at {path}: {source}")]
     WriteDefaultConfig {
         path: PathBuf,
         #[source]
         source: std::io::Error,
     },
+    /// Parsed config failed [`AppConfig::validate`].
     #[error(transparent)]
     Validation(#[from] ConfigValidationError),
 }
 
+/// Semantic validation failures surfaced by [`AppConfig::validate`].
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum ConfigValidationError {
+    /// Identifier field (profile, voice, rule id, etc.) is empty or whitespace.
     #[error("{field_name} must not be empty")]
     ConfigIdentifierMustNotBeEmpty { field_name: String },
+    /// Explicit transcription provider list is present but empty.
     #[error("{field_name} must include at least one provider")]
     TranscriptionProvidersMustNotBeEmpty { field_name: String },
+    /// Transcription provider list repeats the same provider id.
     #[error("{field_name} must not contain duplicate providers ({provider_ids:?})")]
     DuplicateTranscriptionProviders {
         field_name: String,
         provider_ids: Vec<String>,
     },
+    /// `providers.apple_speech.locale` is set but empty.
     #[error("providers.apple_speech.locale must not be empty")]
     AppleSpeechLocaleMustNotBeEmpty,
+    /// `providers.whisper_cpp.model` is set but empty.
     #[error("providers.whisper_cpp.model must not be empty")]
     WhisperCppModelMustNotBeEmpty,
+    /// `providers.whisper_cpp.model_dir` is empty.
     #[error("providers.whisper_cpp.model_dir must not be empty")]
     WhisperCppModelDirMustNotBeEmpty,
+    /// `providers.deepgram.endpoint` is empty.
     #[error("providers.deepgram.endpoint must not be empty")]
     DeepgramEndpointMustNotBeEmpty,
+    /// `providers.deepgram.model` is empty.
     #[error("providers.deepgram.model must not be empty")]
     DeepgramModelMustNotBeEmpty,
+    /// `providers.deepgram.language` is empty.
     #[error("providers.deepgram.language must not be empty")]
     DeepgramLanguageMustNotBeEmpty,
+    /// Streaming frame interval is outside the allowed millisecond range.
     #[error("{field_name} must be between {min} and {max} milliseconds inclusive (got {value})")]
     StreamingFrameMsOutOfRange {
         field_name: String,
@@ -1594,61 +1696,84 @@ pub enum ConfigValidationError {
         min: u16,
         max: u16,
     },
+    /// Streaming finish timeout is zero.
     #[error("{field_name} must be greater than 0")]
     StreamingFinishTimeoutMsMustBePositive { field_name: String },
+    /// Required provider config string field is empty.
     #[error("{field_name} must not be empty")]
     ProviderConfigFieldMustNotBeEmpty { field_name: String },
+    /// Required provider config string list is empty.
     #[error("{field_name} must include at least one value")]
     ProviderConfigListMustNotBeEmpty { field_name: String },
+    /// `pipeline.deadline_ms` is zero.
     #[error("pipeline.deadline_ms must be greater than 0")]
     PipelineDeadlineMsMustBePositive,
+    /// Pipeline step list is empty.
     #[error("pipeline must include at least one step")]
     PipelineMustContainAtLeastOneStep,
+    /// A pipeline step has `timeout_ms` equal to zero.
     #[error("pipeline step timeout_ms must be greater than 0 (step id: {step_id})")]
     StepTimeoutMsMustBePositive { step_id: String },
+    /// Two pipeline steps share the same `id`.
     #[error("pipeline step ids must be unique (duplicate id: {step_id})")]
     DuplicatePipelineStepId { step_id: String },
+    /// Hotkey binding has an empty chord.
     #[error("hotkey chord must not be empty ({hotkey_name})")]
     HotkeyChordMustNotBeEmpty { hotkey_name: String },
+    /// Double-tap hotkey sets `double_tap_timeout_ms` to zero.
     #[error("double_tap timeout must be greater than 0 ({hotkey_name})")]
     DoubleTapTimeoutMsMustBePositive { hotkey_name: String },
+    /// Indicator color is not a valid `#RRGGBB` hex string.
     #[error("indicator color must be a #RRGGBB hex string ({color_name}={color_value})")]
     IndicatorColorMustBeHex {
         color_name: String,
         color_value: String,
     },
+    /// `recording.sample_rate_khz` is zero.
     #[error("recording.sample_rate_khz must be greater than 0")]
     RecordingSampleRateKhzMustBePositive,
+    /// `refine.endpoint` is empty.
     #[error("refine.endpoint must not be empty")]
     RefineEndpointMustNotBeEmpty,
+    /// `refine.model` is empty.
     #[error("refine.model must not be empty")]
     RefineModelMustNotBeEmpty,
+    /// `refine.temperature` is negative or non-finite.
     #[error("refine.temperature must be non-negative")]
     RefineTemperatureMustBeNonNegative,
+    /// `refine.max_output_tokens` is zero.
     #[error("refine.max_output_tokens must be greater than 0")]
     RefineMaxOutputTokensMustBePositive,
+    /// Refine ratio guardrail is outside `0.0..=1.0`.
     #[error("{field_name} must be between 0.0 and 1.0 inclusive (got {value})")]
     RefineRatioMustBeBetweenZeroAndOne { field_name: String, value: String },
+    /// Voice `indicator_glyph` is not exactly one ASCII letter.
     #[error("voice indicator_glyph must be exactly one ASCII letter ({voice_id}={value})")]
     VoiceIndicatorGlyphMustBeSingleAsciiLetter { voice_id: String, value: String },
+    /// Profile references a voice id missing from `[voices]`.
     #[error("profile references unknown voice ({profile_id} -> {voice_id})")]
     UnknownVoiceReference {
         profile_id: String,
         voice_id: String,
     },
+    /// Profile rule or profile field references an unknown profile id.
     #[error("{field_name} references unknown profile ({profile_id})")]
     UnknownProfileReference {
         field_name: String,
         profile_id: String,
     },
+    /// Two profile rules share the same `id`.
     #[error("profile rule ids must be unique (duplicate id: {rule_id})")]
     DuplicateProfileRuleId { rule_id: String },
+    /// Profile rule defines no bundle, app, or window matchers.
     #[error("profile rule must include at least one matcher ({rule_id})")]
     ProfileRuleMustIncludeAtLeastOneMatcher { rule_id: String },
+    /// Profile rule matcher field is present but empty.
     #[error("profile rule field must not be empty ({rule_id}.{field_name})")]
     ProfileRuleFieldMustNotBeEmpty { rule_id: String, field_name: String },
 }
 
+/// Resolve the config file path from `MUNINN_CONFIG`, `XDG_CONFIG_HOME`, or `~/.config/muninn`.
 pub fn resolve_config_path() -> Result<PathBuf, ConfigError> {
     resolve_config_path_with(
         |key| env::var_os(key),

@@ -1,11 +1,19 @@
+//! macOS text injection for transcribed output via Core Graphics keyboard events.
+//!
+//! [`MacosTextInjector`] implements [`TextInjector`] by posting synthetic key-down
+//! and key-up events with the UTF-8 payload. Requires Accessibility permission;
+//! returns [`MacosAdapterError::MissingPermissions`] when the app is untrusted.
+
 use async_trait::async_trait;
 
 use crate::{MacosAdapterError, MacosAdapterResult, TextInjector};
 
+/// macOS [`TextInjector`] backed by Core Graphics keyboard events.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacosTextInjector;
 
 impl MacosTextInjector {
+    /// Returns the shared zero-sized injector handle.
     #[must_use]
     pub const fn new() -> Self {
         Self
@@ -14,6 +22,10 @@ impl MacosTextInjector {
 
 #[async_trait]
 impl TextInjector for MacosTextInjector {
+    /// Post the text as a synthetic keyboard event through the HID event tap.
+    ///
+    /// macOS only. Prompts for Accessibility access when untrusted; non-macOS
+    /// returns [`crate::MacosAdapterError::UnsupportedPlatform`].
     async fn inject_unicode_text(&self, text: &str) -> MacosAdapterResult<()> {
         #[cfg(not(target_os = "macos"))]
         {

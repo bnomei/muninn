@@ -1,3 +1,9 @@
+//! Muninn desktop binary entry point.
+//!
+//! Initializes tracing, synchronizes macOS autostart state, and hands off to
+//! [`AppRuntime`] for the tao event loop. `__internal_step` invocations
+//! short-circuit before the menu-bar runtime starts.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -556,9 +562,6 @@ mod tests {
 
     #[test]
     fn injection_proceeds_after_accessibility_prompt_when_now_granted() {
-        // A fresh Accessibility grant that the refreshed preflight already reflects
-        // must not abort: the utterance is fully transcribed and aborting would
-        // delete the WAV with no retry path, losing the transcript.
         assert!(!should_abort_injection(
             PermissionPreflightStatus::all_granted(),
             true,

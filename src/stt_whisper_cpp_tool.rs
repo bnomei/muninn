@@ -1,3 +1,10 @@
+//! Builtin whisper.cpp STT pipeline step.
+//!
+//! Loads a local GGML model (auto-downloading defaults when configured),
+//! transcribes `audio.wav_path` on a blocking worker thread, and writes
+//! `transcript.raw_text`. Runnable as a subprocess internal tool or in-process
+//! via [`process_input_in_process`].
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -24,6 +31,7 @@ const TARGET_SAMPLE_RATE_HZ: u32 = 16_000;
 const MODEL_DOWNLOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 const MODEL_DOWNLOAD_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Whisper.cpp step failure surfaced to the pipeline runner or internal-tool stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
     code: &'static str,
@@ -38,6 +46,7 @@ impl CliError {
         }
     }
 
+    /// Serialize the error as JSON for subprocess stderr consumers.
     pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
@@ -48,6 +57,7 @@ impl CliError {
         .to_string()
     }
 
+    /// Borrow the human-readable error message.
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -155,6 +165,10 @@ impl Drop for ModelDownloadLock {
     }
 }
 
+/// Entry point for `muninn __internal_step stt_whisper_cpp` subprocess invocation.
+///
+/// Reads a [`MuninnEnvelopeV1`] from stdin and writes the updated envelope to
+/// stdout; failures log and emit JSON on stderr before returning failure.
 pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -264,6 +278,7 @@ async fn run_transcription_request(
     }
 }
 
+/// Run whisper.cpp STT inside the pipeline process using resolved builtin configuration.
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
     config: &ResolvedBuiltinStepConfig,

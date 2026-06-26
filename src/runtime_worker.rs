@@ -1,3 +1,10 @@
+//! Background runtime worker for hotkeys, recording, and pipeline processing.
+//!
+//! Runs on a dedicated OS thread with a multi-threaded Tokio runtime. Receives
+//! [`RuntimeMessage`] commands from the main-thread event loop and drives
+//! [`RuntimeFlowCoordinator`] transitions, permission refresh, and
+//! [`runtime_pipeline::process_and_inject`].
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -21,13 +28,21 @@ use crate::runtime_permissions::{
 use crate::runtime_tray::{send_user_event, EventLoopIndicator, UserEvent};
 use crate::{logging, runtime_pipeline, HOTKEY_RECOVERY_DELAY, OUTPUT_INDICATOR_MIN_DURATION};
 
+/// Commands forwarded from the main-thread event loop to the runtime worker.
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeMessage {
+    /// Tray left-click toggle mapped to [`ExternalControlAction`].
     TrayControl(ExternalControlAction),
+    /// Live config reload; hotkey bindings stay frozen until process restart.
     ReloadConfig(Box<AppConfig>),
+    /// MCP or `muninn://` URL scheme recording control.
     ExternalControl(ExternalControlAction),
 }
 
+/// Spawn the runtime worker on a background OS thread.
+///
+/// Failures to build or run the Tokio runtime post [`UserEvent::RuntimeFailure`]
+/// back to the main thread so the tray can reset to idle.
 pub(crate) fn spawn_runtime_worker(
     config: AppConfig,
     preflight: PermissionPreflightStatus,

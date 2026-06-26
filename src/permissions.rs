@@ -1,3 +1,11 @@
+//! macOS TCC permission preflight and request prompts.
+//!
+//! [`MacosPermissionsAdapter`] implements [`PermissionsAdapter`], querying
+//! microphone (`AVAudioApplication`), accessibility (`AXIsProcessTrusted`), and
+//! input monitoring (`CGPreflightListenEventAccess`) status. Request methods show
+//! system prompts on macOS; non-macOS preflight reports unsupported and requests
+//! return [`crate::MacosAdapterError::UnsupportedPlatform`].
+
 use async_trait::async_trait;
 
 #[cfg(not(target_os = "macos"))]
@@ -8,10 +16,12 @@ use crate::{
 #[cfg(target_os = "macos")]
 use crate::{MacosAdapterResult, PermissionPreflightStatus, PermissionStatus, PermissionsAdapter};
 
+/// macOS [`PermissionsAdapter`] for microphone, accessibility, and input monitoring.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MacosPermissionsAdapter;
 
 impl MacosPermissionsAdapter {
+    /// Returns the shared zero-sized permissions adapter.
     #[must_use]
     pub const fn new() -> Self {
         Self
@@ -20,6 +30,10 @@ impl MacosPermissionsAdapter {
 
 #[async_trait]
 impl PermissionsAdapter for MacosPermissionsAdapter {
+    /// Read current TCC status without showing system prompts.
+    ///
+    /// On macOS, queries microphone, accessibility, and input-monitoring state.
+    /// Non-macOS returns [`PermissionPreflightStatus::unsupported`].
     async fn preflight(&self) -> MacosAdapterResult<PermissionPreflightStatus> {
         #[cfg(target_os = "macos")]
         {
@@ -32,6 +46,10 @@ impl PermissionsAdapter for MacosPermissionsAdapter {
         }
     }
 
+    /// Show the macOS microphone consent dialog and return whether access was granted.
+    ///
+    /// Blocks until the `AVAudioApplication` completion handler fires. Non-macOS
+    /// returns [`crate::MacosAdapterError::UnsupportedPlatform`].
     async fn request_microphone_access(&self) -> MacosAdapterResult<bool> {
         #[cfg(target_os = "macos")]
         {
@@ -44,6 +62,9 @@ impl PermissionsAdapter for MacosPermissionsAdapter {
         }
     }
 
+    /// Show the macOS Input Monitoring consent dialog via `CGRequestListenEventAccess`.
+    ///
+    /// Non-macOS returns [`crate::MacosAdapterError::UnsupportedPlatform`].
     async fn request_input_monitoring_access(&self) -> MacosAdapterResult<bool> {
         #[cfg(target_os = "macos")]
         {
@@ -56,6 +77,9 @@ impl PermissionsAdapter for MacosPermissionsAdapter {
         }
     }
 
+    /// Prompt for Accessibility trust via `application_is_trusted_with_prompt`.
+    ///
+    /// Non-macOS returns [`crate::MacosAdapterError::UnsupportedPlatform`].
     async fn request_accessibility_access(&self) -> MacosAdapterResult<bool> {
         #[cfg(target_os = "macos")]
         {

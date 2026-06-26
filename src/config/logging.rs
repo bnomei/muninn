@@ -1,15 +1,21 @@
+//! Replay logging and retention settings nested under `[logging]` in `config.toml`.
+
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// How much detail replay artifacts capture for each utterance.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplayDetailMode {
+    /// Store compact replay metadata without full debug payloads.
     #[default]
     Minimal,
+    /// Store expanded debug payloads suitable for post-mortem inspection.
     FullDebug,
 }
 
+/// Replay capture, storage path, and retention limits for diagnostic artifacts.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {

@@ -1,3 +1,9 @@
+//! Deepgram live transcription over the streaming WebSocket `/v1/listen` API.
+//!
+//! Sends linear16 PCM in binary frames, accumulates `is_final` `Results` messages,
+//! and closes with a `CloseStream` control message. Implements
+//! [`StreamingTranscriptionProvider`] for [`TranscriptionProvider::Deepgram`].
+
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
@@ -24,6 +30,7 @@ const STREAM_CLOSED_WITH_ERROR_CODE: &str = "deepgram_closed_with_error";
 const MISSING_API_KEY_CODE: &str = "missing_deepgram_api_key";
 const CLOSE_STREAM_CONTROL: &str = r#"{"type":"CloseStream"}"#;
 
+/// Deepgram [`StreamingTranscriptionProvider`] using `tokio-tungstenite`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeepgramStreamingTranscriptionProvider;
 
@@ -233,11 +240,6 @@ where
                     self.socket.send(Message::Pong(payload)).await?;
                 }
                 Message::Close(frame) => {
-                    // A server-initiated error close (e.g. 1008/4xxx
-                    // "insufficient_credits", auth/policy failure) must be a provider
-                    // failure, not an empty-success outcome reported as "no speech
-                    // detected". Benign closes (1000 Normal, 1001 Going Away, or no
-                    // frame) just end the loop.
                     if let Some(frame) = frame {
                         let code = u16::from(frame.code);
                         if !matches!(code, 1000 | 1001) {
@@ -257,8 +259,6 @@ where
         }
 
         let outcome = self.transcript.into_outcome();
-        // Prefer a transcript produced before an error close; only surface the close
-        // as a failure when there is no usable final text.
         match error_close {
             Some(error) if !outcome.has_final_text() => Err(error),
             _ => Ok(outcome),

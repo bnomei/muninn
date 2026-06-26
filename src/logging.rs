@@ -1,3 +1,8 @@
+//! `tracing` initialization and structured diagnostic helpers.
+//!
+//! On macOS, routes [`TARGET_*`] constants into unified logging (oslog) by target.
+//! [`init_logging`] runs once during bootstrap before the event loop starts.
+
 use anyhow::{anyhow, Result};
 use muninn::AppConfig;
 #[cfg(test)]
@@ -11,31 +16,43 @@ use tracing_oslog::OsLogger;
 #[cfg(target_os = "macos")]
 use tracing_subscriber::filter::filter_fn;
 
+/// tracing target for runtime lifecycle and worker events.
 pub const TARGET_RUNTIME: &str = muninn::TARGET_RUNTIME;
+/// tracing target for pipeline execution and injection.
 pub const TARGET_PIPELINE: &str = muninn::TARGET_PIPELINE;
+/// tracing target for STT and refine provider calls.
 pub const TARGET_PROVIDER: &str = muninn::TARGET_PROVIDER;
+/// tracing target for config load, reload, and watchers.
 pub const TARGET_CONFIG: &str = muninn::TARGET_CONFIG;
+/// tracing target for global hotkey listener events.
 pub const TARGET_HOTKEY: &str = muninn::TARGET_HOTKEY;
+/// tracing target for audio capture and permission prompts.
 pub const TARGET_RECORDING: &str = muninn::TARGET_RECORDING;
+/// tracing target for logs that do not match a dedicated subsystem target.
 pub const TARGET_DEFAULT: &str = muninn::TARGET_DEFAULT;
 
 #[cfg(target_os = "macos")]
 const OSLOG_SUBSYSTEM: &str = "com.bnomei.muninn";
 
+/// Structured diagnostic events captured for tests and mirrored to tracing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DiagnosticEvent {
+    /// Main-thread event-loop proxy rejected a [`UserEvent`] delivery.
     ProxySendFailed {
         target: &'static str,
         context: &'static str,
         detail: String,
     },
+    /// Background config or preview watcher thread started.
     WatcherStarted {
         kind: &'static str,
         path: Option<String>,
     },
+    /// Config file change detected on disk.
     ConfigChanged {
         path: String,
     },
+    /// Recording capture began after permissions passed.
     RecordingStarted {
         profile_id: String,
         voice_id: Option<String>,
@@ -45,6 +62,7 @@ pub(crate) enum DiagnosticEvent {
         mono: bool,
         source: &'static str,
     },
+    /// Runtime worker failed to build or exited with an error.
     RuntimeWorkerFailed {
         stage: &'static str,
         detail: String,
@@ -68,6 +86,7 @@ fn record_diagnostic_event(event: DiagnosticEvent) {
     let _ = event;
 }
 
+/// Log a failed delivery to the tao event-loop proxy.
 pub(crate) fn log_proxy_send_failed(context: &'static str, detail: impl Into<String>) {
     let detail = detail.into();
     record_diagnostic_event(DiagnosticEvent::ProxySendFailed {
@@ -83,6 +102,7 @@ pub(crate) fn log_proxy_send_failed(context: &'static str, detail: impl Into<Str
     );
 }
 
+/// Log startup of a background config or preview watcher.
 pub(crate) fn log_watcher_started(kind: &'static str, path: Option<&std::path::Path>) {
     let path = path.map(|value| value.display().to_string());
     record_diagnostic_event(DiagnosticEvent::WatcherStarted {
@@ -99,12 +119,14 @@ pub(crate) fn log_watcher_started(kind: &'static str, path: Option<&std::path::P
     }
 }
 
+/// Log detection of an on-disk config file change.
 pub(crate) fn log_config_changed(path: impl AsRef<std::path::Path>) {
     let path = path.as_ref().display().to_string();
     record_diagnostic_event(DiagnosticEvent::ConfigChanged { path: path.clone() });
     info!(target: TARGET_CONFIG, path, "detected config change");
 }
 
+/// Log structured metadata when recording capture starts.
 pub(crate) fn log_recording_started(
     profile_id: &str,
     voice_id: Option<&str>,
@@ -136,6 +158,7 @@ pub(crate) fn log_recording_started(
     );
 }
 
+/// Log a fatal runtime worker build or run failure.
 pub(crate) fn log_runtime_worker_failed(stage: &'static str, detail: impl Into<String>) {
     let detail = detail.into();
     record_diagnostic_event(DiagnosticEvent::RuntimeWorkerFailed {
@@ -160,6 +183,10 @@ pub(crate) fn take_diagnostic_events() -> Vec<DiagnosticEvent> {
         .collect()
 }
 
+/// Install the global `tracing` subscriber and emit replay settings.
+///
+/// Honors `RUST_LOG` when set; otherwise defaults to `info`. On macOS, mirrors
+/// subsystem targets into unified logging (oslog).
 pub fn init_logging(config: &AppConfig) -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).compact();

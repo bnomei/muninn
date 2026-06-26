@@ -1,3 +1,9 @@
+//! In-memory test doubles for macOS runtime adapter traits.
+//!
+//! Each mock records call history, queues scripted errors, and implements the
+//! same [`IndicatorAdapter`], [`PermissionsAdapter`], [`HotkeyEventSource`],
+//! [`AudioRecorder`], and [`TextInjector`] contracts as production adapters.
+
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex},
@@ -12,6 +18,7 @@ use crate::{
     RecordedAudio, TextInjector,
 };
 
+/// Thread-safe mock menu-bar indicator with injectable failures.
 #[derive(Debug, Clone)]
 pub struct MockIndicatorAdapter {
     inner: Arc<Mutex<IndicatorStateInner>>,
@@ -47,6 +54,7 @@ impl Default for MockIndicatorAdapter {
 }
 
 impl MockIndicatorAdapter {
+    /// Build a mock that starts in [`IndicatorState::Idle`] with no queued errors.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -54,6 +62,7 @@ impl MockIndicatorAdapter {
         }
     }
 
+    /// Force the next [`IndicatorAdapter::initialize`] call to return `error`.
     pub fn set_initialize_error(&self, error: Option<MacosAdapterError>) {
         self.inner
             .lock()
@@ -61,6 +70,7 @@ impl MockIndicatorAdapter {
             .initialize_error = error;
     }
 
+    /// Queue an error returned before the next successful [`IndicatorAdapter::set_state`].
     pub fn enqueue_set_state_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -69,6 +79,7 @@ impl MockIndicatorAdapter {
             .push_back(error);
     }
 
+    /// Force [`IndicatorAdapter::state`] reads to fail until cleared.
     pub fn set_state_error(&self, error: Option<MacosAdapterError>) {
         self.inner
             .lock()
@@ -76,6 +87,7 @@ impl MockIndicatorAdapter {
             .state_error = error;
     }
 
+    /// Count how many times initialize was invoked.
     #[must_use]
     pub fn initialize_calls(&self) -> usize {
         self.inner
@@ -84,6 +96,7 @@ impl MockIndicatorAdapter {
             .initialize_calls
     }
 
+    /// Ordered list of states passed to [`IndicatorAdapter::set_state`].
     #[must_use]
     pub fn state_history(&self) -> Vec<IndicatorState> {
         self.inner
@@ -135,6 +148,7 @@ impl IndicatorAdapter for MockIndicatorAdapter {
     }
 }
 
+/// Configurable mock for macOS permission preflight and request flows.
 #[derive(Debug, Clone)]
 pub struct MockPermissionsAdapter {
     inner: Arc<Mutex<PermissionsInner>>,
@@ -176,6 +190,7 @@ impl Default for MockPermissionsAdapter {
 }
 
 impl MockPermissionsAdapter {
+    /// Build a mock that returns default granted preflight status.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -183,6 +198,7 @@ impl MockPermissionsAdapter {
         }
     }
 
+    /// Configure the status returned by [`PermissionsAdapter::preflight`].
     pub fn set_preflight_status(&self, status: PermissionPreflightStatus) {
         self.inner
             .lock()
@@ -190,6 +206,7 @@ impl MockPermissionsAdapter {
             .preflight_result = Ok(status);
     }
 
+    /// Make preflight fail with a fixed adapter error.
     pub fn set_preflight_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -197,6 +214,7 @@ impl MockPermissionsAdapter {
             .preflight_result = Err(error);
     }
 
+    /// Count preflight invocations.
     #[must_use]
     pub fn preflight_calls(&self) -> usize {
         self.inner
@@ -205,6 +223,7 @@ impl MockPermissionsAdapter {
             .preflight_calls
     }
 
+    /// Configure the result of [`PermissionsAdapter::request_input_monitoring_access`].
     pub fn set_request_input_monitoring_result(&self, granted: bool) {
         self.inner
             .lock()
@@ -212,6 +231,7 @@ impl MockPermissionsAdapter {
             .request_input_monitoring_result = Ok(granted);
     }
 
+    /// Make input-monitoring requests fail with a fixed adapter error.
     pub fn set_request_input_monitoring_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -219,6 +239,7 @@ impl MockPermissionsAdapter {
             .request_input_monitoring_result = Err(error);
     }
 
+    /// Configure the result of [`PermissionsAdapter::request_microphone_access`].
     pub fn set_request_microphone_result(&self, granted: bool) {
         self.inner
             .lock()
@@ -226,6 +247,7 @@ impl MockPermissionsAdapter {
             .request_microphone_result = Ok(granted);
     }
 
+    /// Make microphone requests fail with a fixed adapter error.
     pub fn set_request_microphone_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -233,6 +255,7 @@ impl MockPermissionsAdapter {
             .request_microphone_result = Err(error);
     }
 
+    /// Configure the result of [`PermissionsAdapter::request_accessibility_access`].
     pub fn set_request_accessibility_result(&self, granted: bool) {
         self.inner
             .lock()
@@ -240,6 +263,7 @@ impl MockPermissionsAdapter {
             .request_accessibility_result = Ok(granted);
     }
 
+    /// Make accessibility requests fail with a fixed adapter error.
     pub fn set_request_accessibility_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -247,6 +271,7 @@ impl MockPermissionsAdapter {
             .request_accessibility_result = Err(error);
     }
 
+    /// Queue a preflight status applied after the next successful permission request.
     pub fn set_post_request_preflight_status(&self, status: PermissionPreflightStatus) {
         self.inner
             .lock()
@@ -255,6 +280,7 @@ impl MockPermissionsAdapter {
             .push_back(Ok(status));
     }
 
+    /// Count input-monitoring request invocations.
     #[must_use]
     pub fn request_input_monitoring_calls(&self) -> usize {
         self.inner
@@ -263,6 +289,7 @@ impl MockPermissionsAdapter {
             .request_input_monitoring_calls
     }
 
+    /// Count microphone request invocations.
     #[must_use]
     pub fn request_microphone_calls(&self) -> usize {
         self.inner
@@ -271,6 +298,7 @@ impl MockPermissionsAdapter {
             .request_microphone_calls
     }
 
+    /// Count accessibility request invocations.
     #[must_use]
     pub fn request_accessibility_calls(&self) -> usize {
         self.inner
@@ -325,6 +353,7 @@ impl PermissionsAdapter for MockPermissionsAdapter {
     }
 }
 
+/// FIFO queue mock for deterministic hotkey event delivery in tests.
 #[derive(Debug, Clone)]
 pub struct MockHotkeyEventSource {
     inner: Arc<Mutex<HotkeyInner>>,
@@ -343,6 +372,7 @@ impl Default for MockHotkeyEventSource {
 }
 
 impl MockHotkeyEventSource {
+    /// Build an empty hotkey source that closes after the queue drains.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -350,6 +380,7 @@ impl MockHotkeyEventSource {
         }
     }
 
+    /// Build a source preloaded with successful hotkey events.
     #[must_use]
     pub fn with_events(events: impl IntoIterator<Item = HotkeyEvent>) -> Self {
         let source = Self::new();
@@ -357,6 +388,7 @@ impl MockHotkeyEventSource {
         source
     }
 
+    /// Enqueue a hotkey event returned by the next [`HotkeyEventSource::next_event`].
     pub fn push_event(&self, event: HotkeyEvent) {
         self.inner
             .lock()
@@ -365,6 +397,7 @@ impl MockHotkeyEventSource {
             .push_back(Ok(event));
     }
 
+    /// Enqueue an adapter error instead of a hotkey event.
     pub fn push_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -373,6 +406,7 @@ impl MockHotkeyEventSource {
             .push_back(Err(error));
     }
 
+    /// Append multiple successful events to the queue.
     pub fn extend_events(&self, events: impl IntoIterator<Item = HotkeyEvent>) {
         let mut inner = self.inner.lock().expect("hotkey mutex poisoned");
         for event in events {
@@ -380,6 +414,7 @@ impl MockHotkeyEventSource {
         }
     }
 
+    /// Number of queued events or errors not yet consumed.
     #[must_use]
     pub fn pending_events(&self) -> usize {
         self.inner
@@ -389,6 +424,7 @@ impl MockHotkeyEventSource {
             .len()
     }
 
+    /// Count how many times [`HotkeyEventSource::next_event`] was polled.
     #[must_use]
     pub fn next_event_calls(&self) -> usize {
         self.inner
@@ -411,6 +447,7 @@ impl HotkeyEventSource for MockHotkeyEventSource {
     }
 }
 
+/// Stateful mock audio recorder with queued start/stop/cancel outcomes.
 #[derive(Debug, Clone)]
 pub struct MockAudioRecorder {
     inner: Arc<Mutex<AudioRecorderInner>>,
@@ -454,6 +491,7 @@ impl Default for MockAudioRecorder {
 }
 
 impl MockAudioRecorder {
+    /// Build an idle recorder with a default successful stop payload.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -461,6 +499,7 @@ impl MockAudioRecorder {
         }
     }
 
+    /// Queue an error returned on the next start attempt.
     pub fn enqueue_start_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -469,6 +508,7 @@ impl MockAudioRecorder {
             .push_back(error);
     }
 
+    /// Queue a stop result consumed before the default stop payload.
     pub fn enqueue_stop_result(&self, result: MacosAdapterResult<RecordedAudio>) {
         self.inner
             .lock()
@@ -477,6 +517,7 @@ impl MockAudioRecorder {
             .push_back(result);
     }
 
+    /// Queue an error returned on the next cancel attempt.
     pub fn enqueue_cancel_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -485,6 +526,7 @@ impl MockAudioRecorder {
             .push_back(error);
     }
 
+    /// Set the stop result used after the queued stop results are exhausted.
     pub fn set_default_stop_result(&self, result: MacosAdapterResult<RecordedAudio>) {
         self.inner
             .lock()
@@ -492,6 +534,7 @@ impl MockAudioRecorder {
             .default_stop_result = result;
     }
 
+    /// Whether a recording session is currently active.
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.inner
@@ -500,6 +543,7 @@ impl MockAudioRecorder {
             .active
     }
 
+    /// Count start invocations (plain and audio-sink starts).
     #[must_use]
     pub fn start_calls(&self) -> usize {
         self.inner
@@ -508,6 +552,7 @@ impl MockAudioRecorder {
             .start_calls
     }
 
+    /// Count starts that went through [`AudioRecorder::start_recording_with_audio_sink`].
     #[must_use]
     pub fn start_with_audio_sink_calls(&self) -> usize {
         self.inner
@@ -516,6 +561,7 @@ impl MockAudioRecorder {
             .start_with_audio_sink_calls
     }
 
+    /// Whether each audio-sink start passed `Some` sink sender.
     #[must_use]
     pub fn audio_sink_start_history(&self) -> Vec<bool> {
         self.inner
@@ -525,6 +571,7 @@ impl MockAudioRecorder {
             .clone()
     }
 
+    /// Count stop invocations.
     #[must_use]
     pub fn stop_calls(&self) -> usize {
         self.inner
@@ -533,6 +580,7 @@ impl MockAudioRecorder {
             .stop_calls
     }
 
+    /// Count cancel invocations.
     #[must_use]
     pub fn cancel_calls(&self) -> usize {
         self.inner
@@ -614,6 +662,7 @@ impl MockAudioRecorder {
     }
 }
 
+/// Mock text injector that records injected payloads for assertions.
 #[derive(Debug, Clone)]
 pub struct MockTextInjector {
     inner: Arc<Mutex<TextInjectorInner>>,
@@ -633,6 +682,7 @@ impl Default for MockTextInjector {
 }
 
 impl MockTextInjector {
+    /// Build an injector with no queued errors and an empty payload log.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -640,6 +690,7 @@ impl MockTextInjector {
         }
     }
 
+    /// Queue an error returned before the next successful inject.
     pub fn enqueue_inject_error(&self, error: MacosAdapterError) {
         self.inner
             .lock()
@@ -648,6 +699,7 @@ impl MockTextInjector {
             .push_back(error);
     }
 
+    /// All text payloads successfully injected in order.
     #[must_use]
     pub fn injected_text(&self) -> Vec<String> {
         self.inner
@@ -657,6 +709,7 @@ impl MockTextInjector {
             .clone()
     }
 
+    /// Count inject invocations, including those that fail after dequeue.
     #[must_use]
     pub fn inject_calls(&self) -> usize {
         self.inner

@@ -1,3 +1,10 @@
+//! tao event-loop shell for the Muninn menu-bar runtime.
+//!
+//! Owns the main-thread [`tao`] loop, tray icon lifecycle, and forwarding of
+//! [`UserEvent`] messages into the background [`RuntimeWorker`]. On macOS the
+//! process runs as an accessory app (no dock icon). URL-scheme and MCP handlers
+//! register on this thread *before* the loop starts.
+
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -21,6 +28,7 @@ use crate::{config_watch, logging};
 
 const CONFIG_RELOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Loaded configuration and startup permission snapshot for the menu-bar runtime.
 pub(crate) struct AppRuntime {
     config_path: PathBuf,
     config: AppConfig,
@@ -29,6 +37,10 @@ pub(crate) struct AppRuntime {
 }
 
 impl AppRuntime {
+    /// Validate platform support, run macOS permission preflight, and build runtime state.
+    ///
+    /// Uses a short-lived current-thread Tokio runtime on the calling thread so
+    /// permission adapters can run before the tao event loop starts.
     pub(crate) fn new(config_path: PathBuf, config: AppConfig) -> Result<Self> {
         let platform = detect_platform();
         ensure_supported_platform().with_context(|| {
@@ -51,6 +63,11 @@ impl AppRuntime {
         })
     }
 
+    /// Run the main-thread tao event loop until the process exits.
+    ///
+    /// Spawns the [`RuntimeWorker`], config watchers, and optional MCP server on
+    /// `StartCause::Init`. Tray, indicator, and config-reload [`UserEvent`]
+    /// updates are handled here; recording state lives on the worker thread.
     pub(crate) fn run(self) -> Result<()> {
         let mut event_loop_builder = EventLoopBuilder::<UserEvent>::with_user_event();
         let mut event_loop = event_loop_builder.build();
@@ -68,13 +85,6 @@ impl AppRuntime {
         // macOS delivers the launch GetURL Apple Event during
         // applicationWillFinishLaunching, earlier than StartCause::Init, so the
         // observer set up here must already be in place to catch cold-launch URLs.
-        //
-        // The handler is always installed, but URL dispatch is gated on the
-        // runtime url_scheme_enabled flag (seeded here and refreshed on every live
-        // config reload). This makes url_scheme_enabled a real runtime control
-        // surface: disabling it via reload immediately stops external URL control
-        // even though the Apple Event handler stays registered for the process
-        // lifetime.
         #[cfg(target_os = "macos")]
         {
             crate::external_control::set_url_scheme_enabled(
@@ -225,8 +235,6 @@ impl AppRuntime {
                 }
                 Event::UserEvent(UserEvent::ConfigReloaded(config)) => {
                     current_config = (*config).clone();
-                    // Refresh the URL-scheme gate so disabling (or re-enabling)
-                    // url_scheme_enabled via live reload takes effect immediately.
                     #[cfg(target_os = "macos")]
                     crate::external_control::set_url_scheme_enabled(
                         current_config.external_control.url_scheme_enabled,

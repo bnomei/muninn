@@ -28,16 +28,12 @@ const AE_GET_URL: u32 = 0x4755_524C; // 'GURL'
 
 static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
 
-/// Whether `muninn://` URLs should currently drive the runtime. The Apple Event
-/// handler is installed once at launch, but `url_scheme_enabled` can change at
-/// runtime via live config reload, so dispatch is gated on this flag rather than
-/// on whether the handler is installed. Defaults to disabled until the launch
-/// config is applied.
 static URL_SCHEME_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Update whether `muninn://` URLs are honored. Called with the launch config at
-/// bootstrap and again on every live config reload so that disabling
-/// `url_scheme_enabled` at runtime immediately stops external URL control.
+/// Enable or disable handling of incoming `muninn://` URLs.
+///
+/// When false, parsed URLs are logged and dropped so automation can be turned
+/// off via `external_control.url_scheme_enabled` without unregistering the handler.
 pub(crate) fn set_url_scheme_enabled(enabled: bool) {
     URL_SCHEME_ENABLED.store(enabled, Ordering::SeqCst);
 }

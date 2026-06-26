@@ -1,3 +1,10 @@
+//! Global hotkey listener that maps configured chords to [`HotkeyEvent`] values.
+//!
+//! On macOS, a background thread runs `rdev::listen` and forwards press/release
+//! events through a bounded tokio channel. Bindings support press, hold, and
+//! double-tap modifier triggers from [`HotkeysConfig`]. Non-macOS builds parse
+//! config but never emit events.
+
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,6 +24,7 @@ type PlatformKey = rdev::Key;
 #[cfg(not(target_os = "macos"))]
 type PlatformKey = u32;
 
+/// Parsed hotkey binding with trigger semantics resolved from config.
 #[derive(Debug, Clone)]
 pub struct MacosHotkeyBinding {
     action: HotkeyAction,
@@ -27,11 +35,13 @@ pub struct MacosHotkeyBinding {
     double_tap_timeout_ms: u64,
 }
 
+/// Collection of runtime hotkey bindings built from [`HotkeysConfig`].
 #[derive(Debug, Clone)]
 pub struct MacosHotkeyBindings {
     bindings: Vec<MacosHotkeyBinding>,
 }
 
+/// Background `rdev` listener bridged to async [`HotkeyEvent`] delivery.
 #[derive(Debug)]
 pub struct MacosHotkeyEventSource {
     receiver: Receiver<MacosAdapterResult<HotkeyEvent>>,
@@ -78,6 +88,7 @@ struct ModifierTapTimes {
 static HOTKEY_DROP_DIAGNOSTICS: OnceLock<Mutex<HotkeyDropDiagnostics>> = OnceLock::new();
 
 impl MacosHotkeyBindings {
+    /// Parse push-to-talk, done-mode toggle, and cancel-capture bindings from config.
     pub fn from_config(config: &HotkeysConfig) -> MacosAdapterResult<Self> {
         Ok(Self {
             bindings: vec![
@@ -93,6 +104,10 @@ impl MacosHotkeyBindings {
 }
 
 impl MacosHotkeyEventSource {
+    /// Spawn the global listener thread and return a channel-backed event source.
+    ///
+    /// On macOS, starts `rdev::listen` on a dedicated thread. Non-macOS immediately
+    /// delivers [`crate::MacosAdapterError::UnsupportedPlatform`].
     pub fn from_config(config: &HotkeysConfig) -> MacosAdapterResult<Self> {
         let bindings = MacosHotkeyBindings::from_config(config)?;
         let (sender, receiver) = channel(HOTKEY_EVENT_BUFFER_CAPACITY);
@@ -134,6 +149,10 @@ impl MacosHotkeyEventSource {
 
 #[async_trait]
 impl HotkeyEventSource for MacosHotkeyEventSource {
+    /// Wait for the next hotkey press or release from the `rdev` listener thread.
+    ///
+    /// Events dropped when the bounded queue is full are non-fatal; warnings are
+    /// rate-limited in the listener thread.
     async fn next_event(&mut self) -> MacosAdapterResult<HotkeyEvent> {
         match self.receiver.recv().await {
             Some(result) => result,
@@ -143,6 +162,9 @@ impl HotkeyEventSource for MacosHotkeyEventSource {
 }
 
 impl MacosHotkeyEventSource {
+    /// Poll for a hotkey event without awaiting.
+    ///
+    /// Returns `None` when the queue is empty.
     #[must_use]
     pub fn try_next_event(&mut self) -> Option<MacosAdapterResult<HotkeyEvent>> {
         self.receiver.try_recv().ok()

@@ -1,4 +1,8 @@
 //! Localhost streamable-HTTP MCP server exposing recording-control tools.
+//!
+//! Binds only to explicit loopback addresses from `mcp_bind_address`. Tool calls
+//! enqueue [`UserEvent::ExternalControl`] on the tao loop; status probes read
+//! [`RuntimeStatusHandle::snapshot`].
 
 use std::net::SocketAddr;
 

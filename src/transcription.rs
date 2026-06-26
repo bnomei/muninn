@@ -1,3 +1,9 @@
+//! Transcription provider registry and envelope metadata for STT routing.
+//!
+//! Defines the canonical provider vocabulary, default fallback order, and
+//! helpers that attach resolved routes and per-provider attempt records into
+//! `envelope.extra["transcription"]` for pipeline diagnostics.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -24,28 +30,37 @@ const DEFAULT_PROVIDER_ROUTE: [TranscriptionProvider; 5] = [
     TranscriptionProvider::Google,
 ];
 
+/// Supported speech-to-text backends and their config/step identifiers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionProvider {
+    /// On-device Apple Speech framework.
     AppleSpeech,
+    /// Local `whisper.cpp` inference.
     WhisperCpp,
+    /// Deepgram cloud API.
     Deepgram,
+    /// OpenAI transcription API.
     #[serde(rename = "openai")]
     OpenAi,
+    /// Google speech-to-text API.
     Google,
 }
 
 impl TranscriptionProvider {
+    /// All known providers in declaration order.
     #[must_use]
     pub const fn all() -> &'static [Self] {
         &ALL_PROVIDERS
     }
 
+    /// Default provider attempt order when configuration does not override it.
     #[must_use]
     pub const fn default_ordered_route() -> &'static [Self] {
         &DEFAULT_PROVIDER_ROUTE
     }
 
+    /// Snake-case id used under `providers.*` in configuration.
     #[must_use]
     pub const fn config_id(self) -> &'static str {
         match self {
@@ -57,6 +72,7 @@ impl TranscriptionProvider {
         }
     }
 
+    /// Builtin pipeline step command name for this provider.
     #[must_use]
     pub const fn canonical_step_name(self) -> &'static str {
         match self {
@@ -68,6 +84,7 @@ impl TranscriptionProvider {
         }
     }
 
+    /// Suggested per-step timeout when configuration leaves `timeout_ms` unset.
     #[must_use]
     pub const fn default_timeout_ms(self) -> u64 {
         match self {
@@ -77,11 +94,13 @@ impl TranscriptionProvider {
         }
     }
 
+    /// True for on-device providers that do not require cloud credentials.
     #[must_use]
     pub const fn is_local(self) -> bool {
         matches!(self, Self::AppleSpeech | Self::WhisperCpp)
     }
 
+    /// Parse a configuration provider id into a known variant.
     #[must_use]
     pub fn lookup_config_id(raw: &str) -> Option<Self> {
         match raw {
@@ -94,6 +113,7 @@ impl TranscriptionProvider {
         }
     }
 
+    /// Parse a pipeline step command name into a known variant.
     #[must_use]
     pub fn lookup_step_name(raw: &str) -> Option<Self> {
         match raw {
@@ -113,13 +133,17 @@ impl std::fmt::Display for TranscriptionProvider {
     }
 }
 
+/// How the transcription provider route was chosen.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionRouteSource {
+    /// User configuration supplied an explicit provider list.
     ExplicitConfig,
+    /// Route inferred from pipeline builtin step ordering.
     PipelineInferred,
 }
 
+/// Ordered provider list attached to an envelope before STT attempts run.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResolvedTranscriptionRoute {
     pub providers: Vec<TranscriptionProvider>,
@@ -127,24 +151,34 @@ pub struct ResolvedTranscriptionRoute {
 }
 
 impl ResolvedTranscriptionRoute {
+    /// True when no providers remain to attempt.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
 }
 
+/// Result category for one provider attempt in the transcription chain.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionAttemptOutcome {
+    /// Provider returned non-empty `transcript.raw_text`.
     ProducedTranscript,
+    /// Provider succeeded but produced no usable transcript text.
     EmptyTranscript,
+    /// Provider is unsupported on the current platform.
     UnavailablePlatform,
+    /// Required API keys or secrets were missing.
     UnavailableCredentials,
+    /// Local models or assets required by the provider were missing.
     UnavailableAssets,
+    /// Runtime capability (microphone, speech framework, etc.) was unavailable.
     UnavailableRuntimeCapability,
+    /// Provider request failed after prerequisites were satisfied.
     RequestFailed,
 }
 
+/// One STT provider attempt recorded on the envelope for diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TranscriptionAttempt {
     pub provider: TranscriptionProvider,
@@ -155,6 +189,7 @@ pub struct TranscriptionAttempt {
 }
 
 impl TranscriptionAttempt {
+    /// Build an attempt record with the provider's canonical step name.
     #[must_use]
     pub fn new(
         provider: TranscriptionProvider,
@@ -172,6 +207,7 @@ impl TranscriptionAttempt {
     }
 }
 
+/// Store `route` under `envelope.extra["transcription"]["route"]`.
 pub fn attach_transcription_route(
     envelope: &mut MuninnEnvelopeV1,
     route: &ResolvedTranscriptionRoute,
@@ -182,6 +218,7 @@ pub fn attach_transcription_route(
     );
 }
 
+/// Append `attempt` to `envelope.extra["transcription"]["attempts"]`.
 pub fn append_transcription_attempt(
     envelope: &mut MuninnEnvelopeV1,
     attempt: TranscriptionAttempt,
@@ -201,6 +238,7 @@ pub fn append_transcription_attempt(
     items.push(serde_json::to_value(attempt).expect("transcription attempt should serialize"));
 }
 
+/// Read all recorded transcription attempts from the envelope extras.
 #[must_use]
 pub fn transcription_attempts(envelope: &MuninnEnvelopeV1) -> Vec<TranscriptionAttempt> {
     envelope
@@ -218,6 +256,7 @@ pub fn transcription_attempts(envelope: &MuninnEnvelopeV1) -> Vec<TranscriptionA
         .unwrap_or_default()
 }
 
+/// Read the resolved provider route previously attached to the envelope.
 #[must_use]
 pub fn resolved_transcription_route(
     envelope: &MuninnEnvelopeV1,

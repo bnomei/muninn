@@ -1,3 +1,9 @@
+//! Builtin Google Cloud Speech STT pipeline step.
+//!
+//! Base64-encodes `audio.wav_path` into a `speech:recognize` REST request and
+//! writes `transcript.raw_text`. Runnable as a subprocess internal tool or
+//! in-process via [`process_input_in_process`].
+
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use muninn::resolve_secret;
 use muninn::MuninnEnvelopeV1;
@@ -21,6 +27,7 @@ use tracing::{error, info, warn};
 const DEFAULT_LANGUAGE_CODE: &str = "en-US";
 const PROVIDER_LOG_TARGET: &str = muninn::TARGET_PROVIDER;
 
+/// Google STT step failure surfaced to the pipeline runner or internal-tool stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
     code: &'static str,
@@ -35,6 +42,7 @@ impl CliError {
         }
     }
 
+    /// Serialize the error as JSON for subprocess stderr consumers.
     pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
@@ -45,6 +53,7 @@ impl CliError {
         .to_string()
     }
 
+    /// Borrow the human-readable error message.
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -132,6 +141,10 @@ struct GoogleRecognitionConfig<'a> {
     model: Option<&'a str>,
 }
 
+/// Entry point for `muninn __internal_step stt_google` subprocess invocation.
+///
+/// Reads a [`MuninnEnvelopeV1`] from stdin and writes the updated envelope to
+/// stdout; failures log and emit JSON on stderr before returning failure.
 pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -203,6 +216,7 @@ where
     }
 }
 
+/// Run Google STT inside the pipeline process using resolved builtin configuration.
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
     config: &ResolvedBuiltinStepConfig,
@@ -592,12 +606,6 @@ fn extract_google_transcript_text(body: &[u8]) -> Result<String, CliError> {
         )
     })?;
 
-    // Google's speech:recognize returns one `results` entry per consecutive audio
-    // segment for longer audio; the full transcript is the concatenation of each
-    // segment's top alternative. Aggregate all results (taking alternatives[0] per
-    // result) rather than keeping only the first segment, matching the Whisper and
-    // Deepgram adapters. Segment transcripts carry their own leading spaces, so we
-    // concatenate without a separator and trim the joined string.
     let transcript = value
         .get("results")
         .and_then(Value::as_array)
@@ -970,8 +978,6 @@ mod tests {
 
     #[test]
     fn response_json_concatenates_multiple_result_segments() {
-        // Regression: longer audio returns one `results` entry per segment; the
-        // full transcript is their concatenation, not just the first segment.
         let transcript = extract_google_transcript_text(
             br#"{"results":[{"alternatives":[{"transcript":"hello world"}]},{"alternatives":[{"transcript":" goodbye now"}]}]}"#,
         )
@@ -981,7 +987,6 @@ mod tests {
 
     #[test]
     fn response_json_uses_first_alternative_per_result() {
-        // Only the top alternative of each result contributes to the transcript.
         let transcript = extract_google_transcript_text(
             br#"{"results":[{"alternatives":[{"transcript":"primary","confidence":0.9},{"transcript":"secondary","confidence":0.4}]}]}"#,
         )

@@ -1,15 +1,24 @@
+//! PCM resampling, channel downmixing, and WAV serialization for recorded audio.
+//!
+//! Source buffers from the `cpal` callback are normalized to 16-bit PCM, then
+//! transformed to match [`RecordingConfig`] (mono downmix and target sample rate)
+//! before writing the temp WAV or streaming [`AudioFrame`] batches.
+
 use crate::config::RecordingConfig;
 #[cfg(target_os = "macos")]
 use crate::{MacosAdapterError, MacosAdapterResult};
 
+/// Convert a normalized float sample to 16-bit PCM, clamping to `[-1.0, 1.0]`.
 pub(super) fn normalized_f32_to_pcm_i16(sample: f32) -> i16 {
     (sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16
 }
 
+/// Convert 16-bit PCM to a normalized float in `[-1.0, 1.0]`.
 pub(super) fn pcm_i16_to_normalized_f32(sample: i16) -> f32 {
     sample as f32 / i16::MAX as f32
 }
 
+/// Convert unsigned 16-bit PCM to signed 16-bit PCM.
 pub(super) fn pcm_u16_to_pcm_i16(sample: u16) -> i16 {
     normalized_f32_to_pcm_i16((sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
 }
@@ -121,11 +130,15 @@ impl Iterator for OutputSampleIter<'_> {
     }
 }
 
+/// Output WAV header fields derived from source channels and [`RecordingConfig`].
 pub(super) struct OutputWavSpec {
+    /// Sample rate in hertz for the rendered WAV.
     pub(super) sample_rate: u32,
+    /// Channel count after optional mono downmix.
     pub(super) channels: u16,
 }
 
+/// Derive WAV format metadata for the configured output recording settings.
 pub(super) fn output_wav_spec(
     source_channels: u16,
     output_config: &RecordingConfig,
@@ -140,6 +153,7 @@ pub(super) fn output_wav_spec(
     }
 }
 
+/// Resample, optionally downmix to mono, and encode as 16-bit PCM.
 pub(super) fn render_output_pcm_i16(
     samples: &[i16],
     source_sample_rate: u32,
@@ -151,6 +165,10 @@ pub(super) fn render_output_pcm_i16(
         .collect()
 }
 
+/// Stable checksum harness for render-path performance benchmarks.
+///
+/// Hidden from public rustdoc; returns rendered sample count and a wrapping sum
+/// of quantized PCM values so benchmark runs can detect output drift.
 #[doc(hidden)]
 #[must_use]
 pub fn benchmark_render_output_checksum(
@@ -182,6 +200,9 @@ pub(super) fn collect_output_samples(
     OutputSampleIter::new(samples, source_sample_rate, source_channels, output_config).collect()
 }
 
+/// Write resampled PCM to a unique temp WAV file under the system temp directory.
+///
+/// macOS only; used when finalizing [`AudioRecorder::stop_recording`].
 #[cfg(target_os = "macos")]
 pub(super) fn write_wav_file(
     samples: &[i16],

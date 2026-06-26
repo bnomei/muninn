@@ -1,3 +1,12 @@
+//! Live transcription during capture via provider WebSocket or gRPC sessions.
+//!
+//! [`ActiveStreamingTranscription`] starts the first provider from
+//! [`ResolvedUtteranceConfig::streaming_transcription_route`], forwards
+//! [`AudioFrame`]s through a bounded channel, and maps finish/cancel outcomes
+//! onto [`StreamingTranscriptOutcome`] for seeding the utterance envelope before
+//! recorded transcription runs. Provider implementations live in
+//! [`deepgram`], [`openai`], and [`google`].
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +28,7 @@ pub mod openai;
 
 const STREAMING_FRAME_QUEUE_CAPACITY: usize = 64;
 
+/// Final streaming transcription result merged into the utterance envelope.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamingTranscriptOutcome {
     pub provider: TranscriptionProvider,
@@ -28,6 +38,7 @@ pub struct StreamingTranscriptOutcome {
 }
 
 impl StreamingTranscriptOutcome {
+    /// Build a successful outcome with non-empty transcript text.
     #[must_use]
     pub fn produced(provider: TranscriptionProvider, raw_text: impl Into<String>) -> Self {
         Self {
@@ -43,6 +54,7 @@ impl StreamingTranscriptOutcome {
         }
     }
 
+    /// Build an empty-transcript outcome that records a diagnostic error entry.
     #[must_use]
     pub fn empty(provider: TranscriptionProvider, detail: impl Into<String>) -> Self {
         let detail = detail.into();
@@ -64,6 +76,7 @@ impl StreamingTranscriptOutcome {
         }
     }
 
+    /// Map a streaming failure into an outcome with attempt and error payload.
     #[must_use]
     pub fn from_error(error: StreamingTranscriptionError) -> Self {
         let provider = error.provider();
@@ -75,6 +88,7 @@ impl StreamingTranscriptOutcome {
         }
     }
 
+    /// Write provider, trimmed `transcript.raw_text`, attempt, and errors onto `envelope`.
     pub fn apply_to_envelope(self, envelope: &mut MuninnEnvelopeV1) {
         envelope.transcript.provider = Some(self.provider.to_string());
         if let Some(raw_text) = self
@@ -96,8 +110,11 @@ impl StreamingTranscriptOutcome {
     }
 }
 
+/// Failure or cancellation from a streaming provider session.
 #[derive(Debug, Clone, Error, PartialEq)]
 pub enum StreamingTranscriptionError {
+    /// Provider cannot run: missing credentials, unsupported recording config, or
+    /// unregistered implementation. Maps to the embedded `outcome` variant.
     #[error("{provider} streaming transcription unavailable: {detail}")]
     Unavailable {
         provider: TranscriptionProvider,
@@ -105,17 +122,20 @@ pub enum StreamingTranscriptionError {
         code: String,
         detail: String,
     },
+    /// Active session or transport failure after connect.
     #[error("{provider} streaming transcription failed: {detail}")]
     Failed {
         provider: TranscriptionProvider,
         code: String,
         detail: String,
     },
+    /// Session stopped by [`ActiveStreamingTranscription::cancel`].
     #[error("{provider} streaming transcription was cancelled")]
     Cancelled { provider: TranscriptionProvider },
 }
 
 impl StreamingTranscriptionError {
+    /// Unavailable because the runtime or recording config cannot satisfy the provider.
     #[must_use]
     pub fn unavailable_runtime_capability(
         provider: TranscriptionProvider,
@@ -130,6 +150,7 @@ impl StreamingTranscriptionError {
         }
     }
 
+    /// Unavailable because API keys or tokens are missing.
     #[must_use]
     pub fn unavailable_credentials(
         provider: TranscriptionProvider,
@@ -144,6 +165,7 @@ impl StreamingTranscriptionError {
         }
     }
 
+    /// Active-session failure with provider-specific `code` and `detail`.
     #[must_use]
     pub fn failed(
         provider: TranscriptionProvider,
@@ -157,11 +179,13 @@ impl StreamingTranscriptionError {
         }
     }
 
+    /// Cancellation sentinel for aborted streaming workers.
     #[must_use]
     pub const fn cancelled(provider: TranscriptionProvider) -> Self {
         Self::Cancelled { provider }
     }
 
+    /// Return the provider associated with this error.
     #[must_use]
     pub const fn provider(&self) -> TranscriptionProvider {
         match self {
@@ -171,6 +195,7 @@ impl StreamingTranscriptionError {
         }
     }
 
+    /// Convert to a [`TranscriptionAttempt`] for envelope diagnostics.
     #[must_use]
     pub fn to_attempt(&self) -> TranscriptionAttempt {
         match self {
@@ -199,6 +224,7 @@ impl StreamingTranscriptionError {
         }
     }
 
+    /// Serialize an envelope `errors` entry with `source = streaming_transcription`.
     #[must_use]
     pub fn to_error_value(&self) -> Value {
         match self {
@@ -228,23 +254,30 @@ impl StreamingTranscriptionError {
     }
 }
 
+/// Provider-specific streaming session that accepts audio and returns a final transcript.
 #[async_trait]
 pub trait StreamingTranscriptionSession: Send {
+    /// Send one PCM frame. No-op when `frame.samples` is empty.
     async fn send_audio(&mut self, frame: AudioFrame) -> Result<(), StreamingTranscriptionError>;
+    /// Flush the stream and return the accumulated final transcript.
     async fn finish(
         self: Box<Self>,
     ) -> Result<StreamingTranscriptOutcome, StreamingTranscriptionError>;
+    /// Close the provider connection without requiring a transcript.
     async fn cancel(self: Box<Self>);
 }
 
+/// Factory that opens a [`StreamingTranscriptionSession`] from resolved config.
 #[async_trait]
 pub trait StreamingTranscriptionProvider: Send + Sync {
+    /// Open a provider session using credentials and recording settings from `resolved`.
     async fn start(
         &self,
         resolved: &ResolvedUtteranceConfig,
     ) -> Result<Box<dyn StreamingTranscriptionSession>, StreamingTranscriptionError>;
 }
 
+/// Registered [`TranscriptionProvider`] paired with its streaming implementation.
 #[derive(Clone)]
 pub struct StreamingTranscriptionProviderEntry {
     provider: TranscriptionProvider,
@@ -252,6 +285,7 @@ pub struct StreamingTranscriptionProviderEntry {
 }
 
 impl StreamingTranscriptionProviderEntry {
+    /// Register a provider implementation for [`ActiveStreamingTranscription::start_with_providers`].
     #[must_use]
     pub fn new<P>(provider: TranscriptionProvider, implementation: P) -> Self
     where
@@ -263,18 +297,21 @@ impl StreamingTranscriptionProviderEntry {
         }
     }
 
+    /// Return the registered provider id.
     #[must_use]
     pub const fn provider(&self) -> TranscriptionProvider {
         self.provider
     }
 }
 
+/// Handle for an active or failed streaming session started during capture.
 pub struct ActiveStreamingTranscription {
     controller: Option<StreamingTranscriptionController>,
     startup_outcome: Option<StreamingTranscriptOutcome>,
 }
 
 impl ActiveStreamingTranscription {
+    /// Inert handle when streaming mode is off or no route is configured.
     #[must_use]
     pub const fn disabled() -> Self {
         Self {
@@ -283,10 +320,12 @@ impl ActiveStreamingTranscription {
         }
     }
 
+    /// Start streaming with the default built-in provider registry.
     pub async fn start(resolved: &ResolvedUtteranceConfig) -> Self {
         Self::start_with_providers(resolved, default_provider_entries()).await
     }
 
+    /// Start streaming using a custom provider registry (primarily for tests).
     pub async fn start_with_providers(
         resolved: &ResolvedUtteranceConfig,
         providers: impl IntoIterator<Item = StreamingTranscriptionProviderEntry>,
@@ -320,6 +359,7 @@ impl ActiveStreamingTranscription {
         }
     }
 
+    /// Frame sender for the capture path. `None` when startup failed or streaming is disabled.
     #[must_use]
     pub fn sink(&self) -> Option<mpsc::Sender<AudioFrame>> {
         self.controller
@@ -327,6 +367,8 @@ impl ActiveStreamingTranscription {
             .map(StreamingTranscriptionController::sink)
     }
 
+    /// Drain the session and return an outcome. Honors `streaming.finish_timeout_ms` and
+    /// `streaming.fallback_to_recorded_on_error` from config.
     pub async fn finish(self) -> Option<StreamingTranscriptOutcome> {
         if let Some(controller) = self.controller {
             return controller.finish().await;
@@ -334,6 +376,7 @@ impl ActiveStreamingTranscription {
         self.startup_outcome
     }
 
+    /// Abort the worker without requiring a finish outcome.
     pub async fn cancel(self) {
         if let Some(controller) = self.controller {
             controller.cancel().await;

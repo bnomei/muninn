@@ -1,3 +1,11 @@
+//! Google Cloud Speech v2 live transcription adapter.
+//!
+//! Builds `StreamingRecognize` requests with explicit linear16 decoding and
+//! chunks audio at 15 KiB. The official `google-cloud-speech-v2` crate currently
+//! lacks a callable streaming RPC, so connect reports
+//! `google_official_client_streaming_rpc_unavailable` after credentials resolve.
+//! Implements [`StreamingTranscriptionProvider`] for [`TranscriptionProvider::Google`].
+
 use std::marker::PhantomData;
 
 use async_trait::async_trait;
@@ -22,6 +30,7 @@ const MISSING_PROJECT_ID_CODE: &str = "missing_google_streaming_project_id";
 const OFFICIAL_STREAMING_RPC_UNAVAILABLE_CODE: &str =
     "google_official_client_streaming_rpc_unavailable";
 
+/// Google Speech v2 [`StreamingTranscriptionProvider`] (RPC stub until crate support lands).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GoogleStreamingTranscriptionProvider;
 

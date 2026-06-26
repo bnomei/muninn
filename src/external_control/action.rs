@@ -1,3 +1,9 @@
+//! Transport-agnostic external recording-control actions and state resolution.
+//!
+//! [`ExternalControlAction`] values originate from the `muninn://` URL scheme or
+//! MCP tools and are resolved against [`AppState`] before the runtime worker
+//! applies the resulting [`AppEvent`].
+
 use muninn::{AppEvent, AppState};
 
 /// A transport-agnostic recording-control request from an external agent.
@@ -7,29 +13,29 @@ pub(crate) enum ExternalControlAction {
     Start,
     /// Finish the active recording and run the pipeline. No-op when idle.
     Stop,
-    /// Start when idle (gated by `start_recording_enabled`, like `Start`),
-    /// otherwise finish the active recording.
+    /// Start when idle, otherwise finish the active recording.
     Toggle,
     /// Discard the active recording without running the pipeline.
     Cancel,
 }
 
+/// Result of resolving an [`ExternalControlAction`] against the current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalControlOutcome {
+    /// Action maps to an [`AppEvent`] the runtime worker should apply.
     Enabled(AppEvent),
+    /// Start or toggle was rejected because `external_control.start_recording_enabled`
+    /// is false while idle.
     Disabled,
+    /// Action is allowed but has no state transition in the current state.
     Noop,
 }
 
 impl ExternalControlAction {
     /// Map an action onto the [`AppEvent`] appropriate for the current state.
     ///
-    /// Starting capture from idle is explicitly gated by `start_recording_enabled`
-    /// for both `Start` and `Toggle`, so an external agent cannot bypass the
-    /// microphone opt-in by sending `toggle` instead of `start`. (The tray click
-    /// path resolves with the gate forced on via `to_app_event`, since a local
-    /// human action is already trusted.) `Noop` means the action is allowed but has
-    /// no state transition to perform.
+    /// Start requests are explicitly gated by config. `Noop` means the action
+    /// is allowed but has no state transition to perform.
     pub(crate) fn resolve(
         self,
         state: AppState,
@@ -66,6 +72,9 @@ impl ExternalControlAction {
         }
     }
 
+    /// Resolve with start recording enabled and return only an enabled [`AppEvent`].
+    ///
+    /// Treats [`ExternalControlOutcome::Disabled`] like [`ExternalControlOutcome::Noop`].
     pub(crate) fn to_app_event(self, state: AppState) -> Option<AppEvent> {
         match self.resolve(state, true) {
             ExternalControlOutcome::Enabled(app_event) => Some(app_event),
@@ -203,9 +212,6 @@ mod tests {
             ExternalControlAction::Toggle.resolve(AppState::Idle, true),
             ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
         );
-        // Security gate: an idle external toggle starts microphone capture, so it
-        // is gated by start_recording_enabled exactly like Start. Without the
-        // opt-in an external toggle cannot start capture.
         assert_eq!(
             ExternalControlAction::Toggle.resolve(AppState::Idle, false),
             ExternalControlOutcome::Disabled
