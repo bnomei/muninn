@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
@@ -25,6 +27,10 @@ const MISSING_API_KEY_CODE: &str = "missing_openai_api_key";
 const RECORDING_CONFIG_UNSUPPORTED_CODE: &str = "openai_realtime_recording_config_unsupported";
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 24_000;
 const REQUIRED_CHANNELS: u16 = 1;
+/// After the first completed transcription segment arrives post-commit, wait at
+/// most this long for additional segments/content parts before finalizing, so a
+/// single-segment utterance is not delayed by the full streaming finish timeout.
+const POST_COMPLETION_DRAIN_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenAiStreamingTranscriptionProvider;
@@ -275,14 +281,37 @@ where
             ))
             .await?;
 
-        while let Some(message) = self.socket.next().await? {
+        // Drain completed transcription segments after the commit. The realtime
+        // session is persistent and does not close the socket once an utterance is
+        // transcribed, so we cannot read until close (the upstream finish timeout
+        // would abort and discard the transcript). Instead, wait for the first
+        // completed segment, then briefly drain any further segments/content parts
+        // that arrive back-to-back before finalizing. Stopping on the first
+        // completion would truncate multi-segment transcripts.
+        loop {
+            let message = if self.transcript.completed_count() == 0 {
+                // No completion yet: wait for the next message. Transcription
+                // latency is bounded by the upstream streaming finish timeout.
+                match self.socket.next().await? {
+                    Some(message) => message,
+                    None => break,
+                }
+            } else {
+                // At least one completion captured: only wait a short grace for
+                // additional segments so a single-segment utterance is not delayed
+                // by the full finish timeout.
+                match tokio::time::timeout(POST_COMPLETION_DRAIN_GRACE, self.socket.next()).await {
+                    Ok(result) => match result? {
+                        Some(message) => message,
+                        None => break,
+                    },
+                    Err(_elapsed) => break,
+                }
+            };
+
             match message {
                 Message::Text(text) => {
-                    let completed_before = self.transcript.completed_count();
                     self.transcript.handle_text_message(&text)?;
-                    if self.transcript.completed_count() > completed_before {
-                        break;
-                    }
                 }
                 Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
                 Message::Ping(payload) => {
@@ -850,6 +879,57 @@ api_key = "config-key"
             })
         );
         assert_eq!(state.close_calls, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_accumulates_multiple_completed_segments() {
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeOpenAiWebSocket::new(
+            Arc::clone(&state),
+            [
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"first segment"}"#
+                        .to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_002","content_index":0,"transcript":"second segment"}"#
+                        .to_string(),
+                ),
+            ],
+        );
+
+        let outcome = Box::new(OpenAiStreamingSession::new(socket, request()))
+            .finish()
+            .await
+            .expect("session should finalize");
+
+        // Regression: finish() must not stop after the first completed segment.
+        assert_eq!(outcome.raw_text.as_deref(), Some("first segment second segment"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_skips_empty_first_completion_for_later_text() {
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeOpenAiWebSocket::new(
+            Arc::clone(&state),
+            [
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"   "}"#
+                        .to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_002","content_index":0,"transcript":"real text"}"#
+                        .to_string(),
+                ),
+            ],
+        );
+
+        let outcome = Box::new(OpenAiStreamingSession::new(socket, request()))
+            .finish()
+            .await
+            .expect("session should finalize");
+
+        assert_eq!(outcome.raw_text.as_deref(), Some("real text"));
     }
 
     #[tokio::test(flavor = "current_thread")]
