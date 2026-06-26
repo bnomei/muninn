@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P1 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P1 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/runtime_pipeline.rs:76,143-144 | Slug: replay-audio-deleted-before-persist
 
 # Replay audio retention races temp WAV deletion
@@ -41,5 +41,17 @@ Hard-link/copy logic in `retain_audio_file` works when the source still exists. 
 
 Retain or copy audio before deleting the temp WAV (or block cleanup until persist acknowledges audio retention).
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. `ReplayPersistenceService::enqueue` now returns `true`
+  only after the worker queue accepts the replay request, which transfers temp
+  WAV ownership to the replay worker. `process_and_inject` stores that result in
+  `worker_owns_wav` and skips main-thread cleanup when the worker owns the file;
+  the worker deletes the WAV only after `persist_request` returns, so audio
+  retention runs before cleanup. If replay is disabled or enqueue fails, the
+  caller still owns and deletes the WAV. The original accepted-enqueue versus
+  immediate-cleanup race is blocked.
+
 DEVANA-KEY: src/runtime_pipeline.rs:76,143-144 | P1 | replay-audio-deleted-before-persist
-DEVANA-SUMMARY: P1 high src/runtime_pipeline.rs:76,143-144 - Async replay enqueue races synchronous WAV cleanup, so full-debug audio retention is often silently dropped.
+DEVANA-SUMMARY: Status=fixed | P1 high src/runtime_pipeline.rs:76,143-144 - Async replay enqueue races synchronous WAV cleanup, so full-debug audio retention is often silently dropped.

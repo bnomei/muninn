@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P0 | Confidence: high | Security-sensitive: yes | Status: open
+Priority: P0 | Confidence: high | Security-sensitive: yes | Status: fixed
 Location: src/stt_apple_speech_tool.rs:615-653 | Slug: apple-speech-helper-toctou
 
 # Apple Speech helper skips integrity check after first materialization
@@ -42,5 +42,18 @@ Counterexample value: replaced bytes at predictable `helper_output_path()` after
 
 Re-run `helper_needs_refresh()` (or equivalent signature check) before every spawn, or execute from a non-user-writable location with immutable permissions after install.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. The cached helper path fast path is gone. Both sync and
+  async helper execution call `materialize_helper_binary()` immediately before
+  spawning the helper, and `materialize_helper_binary()` now reads the on-disk
+  helper on every call via `helper_needs_refresh(&path)`, rewrites mismatched
+  bytes, ensures executable permissions, and only then returns the path. The
+  original "replace the cached helper after first materialization and wait for a
+  later dictation" counterexample is blocked. Residual checked: there is still a
+  narrower check-to-spawn race after per-call validation, but that is not the
+  cached-path bug reported here.
+
 DEVANA-KEY: src/stt_apple_speech_tool.rs:615-653 | P0 | apple-speech-helper-toctou
-DEVANA-SUMMARY: P0 high src/stt_apple_speech_tool.rs:615-653 - Cached Apple Speech helper path skips re-verification, allowing same-user replacement and arbitrary code execution on later transcriptions.
+DEVANA-SUMMARY: Status=fixed | P0 high src/stt_apple_speech_tool.rs:615-653 - Cached Apple Speech helper path skips re-verification, allowing same-user replacement and arbitrary code execution on later transcriptions.

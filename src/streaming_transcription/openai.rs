@@ -1,10 +1,9 @@
-use std::time::Duration;
-
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     connect_async,
@@ -28,10 +27,6 @@ const RECORDING_CONFIG_UNSUPPORTED_CODE: &str = "openai_realtime_recording_confi
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 24_000;
 const REQUIRED_CHANNELS: u16 = 1;
 const STREAM_CLOSED_WITH_ERROR_CODE: &str = "openai_realtime_closed_with_error";
-/// After the first completed transcription segment arrives post-commit, wait at
-/// most this long for additional segments/content parts before finalizing, so a
-/// single-segment utterance is not delayed by the full streaming finish timeout.
-const POST_COMPLETION_DRAIN_GRACE: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenAiStreamingTranscriptionProvider;
@@ -282,38 +277,26 @@ where
             ))
             .await?;
 
-        // Drain completed transcription segments after the commit. The realtime
-        // session is persistent and does not close the socket once an utterance is
-        // transcribed, so we cannot read until close (the upstream finish timeout
-        // would abort and discard the transcript). Instead, wait for the first
-        // completed segment, then briefly drain any further segments/content parts
-        // that arrive back-to-back before finalizing. Stopping on the first
-        // completion would truncate multi-segment transcripts.
+        // The realtime session is persistent and does not close after a single
+        // utterance. The server acknowledges this commit with the user item id
+        // (`input_audio_buffer.committed`) and later finalizes the item with its
+        // audio content indexes (`conversation.item.done`). Wait until each audio
+        // content part of that committed item has a completed transcript instead of
+        // using a fixed post-completion grace, which can truncate delayed final
+        // events. The upstream finish timeout remains the outer bound for a missing
+        // acknowledgement/finalization/completion.
         let mut error_close: Option<StreamingTranscriptionError> = None;
         loop {
-            let message = if self.transcript.completed_count() == 0 {
-                // No completion yet: wait for the next message. Transcription
-                // latency is bounded by the upstream streaming finish timeout.
-                match self.socket.next().await? {
-                    Some(message) => message,
-                    None => break,
-                }
-            } else {
-                // At least one completion captured: only wait a short grace for
-                // additional segments so a single-segment utterance is not delayed
-                // by the full finish timeout.
-                match tokio::time::timeout(POST_COMPLETION_DRAIN_GRACE, self.socket.next()).await {
-                    Ok(result) => match result? {
-                        Some(message) => message,
-                        None => break,
-                    },
-                    Err(_elapsed) => break,
-                }
+            let Some(message) = self.socket.next().await? else {
+                break;
             };
 
             match message {
                 Message::Text(text) => {
                     self.transcript.handle_text_message(&text)?;
+                    if self.transcript.committed_item_transcription_finished() {
+                        break;
+                    }
                 }
                 Message::Binary(_) | Message::Pong(_) | Message::Frame(_) => {}
                 Message::Ping(payload) => {
@@ -430,6 +413,8 @@ fn map_websocket_read_error(
 #[derive(Debug, Default)]
 struct OpenAiTranscriptAccumulator {
     partial_text: String,
+    committed_item_id: Option<String>,
+    committed_audio_content_indexes: Option<BTreeSet<u64>>,
     completed: Vec<OpenAiCompletedTranscript>,
 }
 
@@ -455,6 +440,8 @@ impl OpenAiTranscriptAccumulator {
             Some("conversation.item.input_audio_transcription.completed") => {
                 self.handle_completed(&value)
             }
+            Some("input_audio_buffer.committed") => self.handle_buffer_committed(&value),
+            Some("conversation.item.done") => self.handle_item_done(&value),
             Some("error") => Err(openai_provider_error(&value)),
             Some(_) => Ok(()),
             None => Err(StreamingTranscriptionError::failed(
@@ -519,13 +506,85 @@ impl OpenAiTranscriptAccumulator {
         Ok(())
     }
 
-    fn completed_count(&self) -> usize {
-        self.completed.len()
+    fn handle_buffer_committed(
+        &mut self,
+        value: &Value,
+    ) -> Result<(), StreamingTranscriptionError> {
+        let Some(item_id) = value.get("item_id").and_then(Value::as_str) else {
+            return Err(StreamingTranscriptionError::failed(
+                PROVIDER,
+                "invalid_openai_realtime_committed",
+                format!(
+                    "OpenAI Realtime committed event did not include a string item_id field: {value}"
+                ),
+            ));
+        };
+        self.committed_item_id = Some(item_id.to_string());
+        Ok(())
+    }
+
+    fn handle_item_done(&mut self, value: &Value) -> Result<(), StreamingTranscriptionError> {
+        let Some(item) = value.get("item").and_then(Value::as_object) else {
+            return Err(StreamingTranscriptionError::failed(
+                PROVIDER,
+                "invalid_openai_realtime_item_done",
+                format!("OpenAI Realtime item.done event did not include an item object: {value}"),
+            ));
+        };
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return Err(StreamingTranscriptionError::failed(
+                PROVIDER,
+                "invalid_openai_realtime_item_done",
+                format!("OpenAI Realtime item.done event did not include a string item.id field: {value}"),
+            ));
+        };
+        if self.committed_item_id.as_deref() != Some(item_id) {
+            return Ok(());
+        }
+        let Some(content) = item.get("content").and_then(Value::as_array) else {
+            return Err(StreamingTranscriptionError::failed(
+                PROVIDER,
+                "invalid_openai_realtime_item_done",
+                format!("OpenAI Realtime item.done event did not include an item.content array: {value}"),
+            ));
+        };
+
+        let mut indexes = content
+            .iter()
+            .enumerate()
+            .filter_map(|(index, part)| is_input_audio_content_part(part).then_some(index as u64))
+            .collect::<BTreeSet<_>>();
+
+        if indexes.is_empty() {
+            indexes.insert(0);
+        }
+        self.committed_audio_content_indexes = Some(indexes);
+        Ok(())
+    }
+
+    fn committed_item_transcription_finished(&self) -> bool {
+        let Some(committed_item_id) = self.committed_item_id.as_deref() else {
+            return false;
+        };
+        let Some(audio_content_indexes) = self.committed_audio_content_indexes.as_ref() else {
+            return false;
+        };
+
+        audio_content_indexes.iter().all(|content_index| {
+            self.completed.iter().any(|entry| {
+                entry.item_id == committed_item_id && entry.content_index == *content_index
+            })
+        })
     }
 
     fn into_outcome(self) -> StreamingTranscriptOutcome {
-        let raw_text = self
-            .completed
+        let mut completed = self.completed;
+        if let Some(committed_item_id) = self.committed_item_id.as_deref() {
+            completed.retain(|entry| entry.item_id == committed_item_id);
+            completed.sort_by_key(|entry| entry.content_index);
+        }
+
+        let raw_text = completed
             .into_iter()
             .filter_map(|entry| {
                 let transcript = entry.transcript.trim();
@@ -543,6 +602,13 @@ impl OpenAiTranscriptAccumulator {
             StreamingTranscriptOutcome::produced(PROVIDER, raw_text)
         }
     }
+}
+
+fn is_input_audio_content_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("input_audio" | "audio")
+    ) || part.get("transcript").is_some()
 }
 
 fn openai_provider_error(value: &Value) -> StreamingTranscriptionError {
@@ -915,11 +981,22 @@ api_key = "config-key"
             Arc::clone(&state),
             [
                 Message::Text(
-                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"first segment"}"#
+                    r#"{"type":"input_audio_buffer.committed","item_id":"item_002"}"#.to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.done","item":{"id":"item_002","content":[{"type":"input_audio"},{"type":"input_audio"}]}}"#
                         .to_string(),
                 ),
                 Message::Text(
-                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_002","content_index":0,"transcript":"second segment"}"#
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"previous segment"}"#
+                        .to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_002","content_index":0,"transcript":"first segment"}"#
+                        .to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_002","content_index":1,"transcript":"second segment"}"#
                         .to_string(),
                 ),
             ],
@@ -931,7 +1008,110 @@ api_key = "config-key"
             .expect("session should finalize");
 
         // Regression: finish() must not stop after the first completed segment.
-        assert_eq!(outcome.raw_text.as_deref(), Some("first segment second segment"));
+        assert_eq!(
+            outcome.raw_text.as_deref(),
+            Some("first segment second segment")
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_waits_for_delayed_completion_for_committed_item() {
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeOpenAiWebSocket::new_delayed(
+            Arc::clone(&state),
+            [
+                FakeIncoming::message(Message::Text(
+                    r#"{"type":"input_audio_buffer.committed","item_id":"item_001"}"#.to_string(),
+                )),
+                FakeIncoming::message(Message::Text(
+                    r#"{"type":"conversation.item.done","item":{"id":"item_001","content":[{"type":"input_audio"}]}}"#
+                        .to_string(),
+                )),
+                FakeIncoming::delayed(
+                    std::time::Duration::from_millis(350),
+                    Message::Text(
+                        r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"delayed final text"}"#
+                            .to_string(),
+                    ),
+                ),
+            ],
+        );
+
+        let outcome = Box::new(OpenAiStreamingSession::new(socket, request()))
+            .finish()
+            .await
+            .expect("session should wait for the committed item's delayed completion");
+
+        // Regression: a fixed post-completion grace can close the persistent socket
+        // before a delayed final event arrives.
+        assert_eq!(outcome.raw_text.as_deref(), Some("delayed final text"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_waits_for_all_finalized_audio_content_indexes() {
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeOpenAiWebSocket::new_delayed(
+            Arc::clone(&state),
+            [
+                FakeIncoming::message(Message::Text(
+                    r#"{"type":"input_audio_buffer.committed","item_id":"item_001"}"#.to_string(),
+                )),
+                FakeIncoming::message(Message::Text(
+                    r#"{"type":"conversation.item.done","item":{"id":"item_001","content":[{"type":"input_audio"},{"type":"input_audio"}]}}"#
+                        .to_string(),
+                )),
+                FakeIncoming::message(Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"first part"}"#
+                        .to_string(),
+                )),
+                FakeIncoming::delayed(
+                    std::time::Duration::from_millis(350),
+                    Message::Text(
+                        r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":1,"transcript":"second part"}"#
+                            .to_string(),
+                    ),
+                ),
+            ],
+        );
+
+        let outcome = Box::new(OpenAiStreamingSession::new(socket, request()))
+            .finish()
+            .await
+            .expect("session should wait for all finalized audio content indexes");
+
+        assert_eq!(outcome.raw_text.as_deref(), Some("first part second part"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_orders_committed_audio_parts_by_content_index() {
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeOpenAiWebSocket::new(
+            Arc::clone(&state),
+            [
+                Message::Text(
+                    r#"{"type":"input_audio_buffer.committed","item_id":"item_001"}"#.to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.done","item":{"id":"item_001","content":[{"type":"input_audio"},{"type":"input_audio"}]}}"#
+                        .to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":1,"transcript":"second part"}"#
+                        .to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"first part"}"#
+                        .to_string(),
+                ),
+            ],
+        );
+
+        let outcome = Box::new(OpenAiStreamingSession::new(socket, request()))
+            .finish()
+            .await
+            .expect("session should order finalized audio content indexes");
+
+        assert_eq!(outcome.raw_text.as_deref(), Some("first part second part"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -940,6 +1120,13 @@ api_key = "config-key"
         let socket = FakeOpenAiWebSocket::new(
             Arc::clone(&state),
             [
+                Message::Text(
+                    r#"{"type":"input_audio_buffer.committed","item_id":"item_002"}"#.to_string(),
+                ),
+                Message::Text(
+                    r#"{"type":"conversation.item.done","item":{"id":"item_002","content":[{"type":"input_audio"}]}}"#
+                        .to_string(),
+                ),
                 Message::Text(
                     r#"{"type":"conversation.item.input_audio_transcription.completed","item_id":"item_001","content_index":0,"transcript":"   "}"#
                         .to_string(),
@@ -1078,7 +1265,12 @@ api_key = "config-key"
 
     struct FakeOpenAiWebSocket {
         state: Arc<Mutex<FakeWebSocketState>>,
-        incoming: VecDeque<Message>,
+        incoming: VecDeque<FakeIncoming>,
+    }
+
+    struct FakeIncoming {
+        delay: Option<std::time::Duration>,
+        message: Message,
     }
 
     impl FakeOpenAiWebSocket {
@@ -1086,9 +1278,38 @@ api_key = "config-key"
             state: Arc<Mutex<FakeWebSocketState>>,
             incoming: impl IntoIterator<Item = Message>,
         ) -> Self {
+            Self::new_delayed(
+                state,
+                incoming
+                    .into_iter()
+                    .map(FakeIncoming::message)
+                    .collect::<Vec<_>>(),
+            )
+        }
+
+        fn new_delayed(
+            state: Arc<Mutex<FakeWebSocketState>>,
+            incoming: impl IntoIterator<Item = FakeIncoming>,
+        ) -> Self {
             Self {
                 state,
                 incoming: incoming.into_iter().collect(),
+            }
+        }
+    }
+
+    impl FakeIncoming {
+        fn message(message: Message) -> Self {
+            Self {
+                delay: None,
+                message,
+            }
+        }
+
+        fn delayed(delay: std::time::Duration, message: Message) -> Self {
+            Self {
+                delay: Some(delay),
+                message,
             }
         }
     }
@@ -1111,7 +1332,13 @@ api_key = "config-key"
         }
 
         async fn next(&mut self) -> Result<Option<Message>, StreamingTranscriptionError> {
-            Ok(self.incoming.pop_front())
+            let Some(incoming) = self.incoming.pop_front() else {
+                return Ok(None);
+            };
+            if let Some(delay) = incoming.delay {
+                tokio::time::sleep(delay).await;
+            }
+            Ok(Some(incoming.message))
         }
     }
 

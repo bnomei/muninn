@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: high | Security-sensitive: yes | Status: open
+Priority: P2 | Confidence: high | Security-sensitive: yes | Status: fixed
 Location: src/runtime_shell.rs:72-74, src/external_control/url_scheme.rs:51-72 | Slug: url-scheme-disable-ignored-reload
 
 # url_scheme_enabled=false after live reload leaves handler active
@@ -39,5 +39,17 @@ Control-flow trace: bootstrap install (once) → reload mutates config only → 
 
 Consult `url_scheme_enabled` on each URL event, or unregister/re-register the handler when the flag changes on reload.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. The URL handler now uses an atomic
+  `URL_SCHEME_ENABLED` gate checked inside `handle_get_url_event` before
+  dispatching any parsed action. `AppRuntime::run` seeds that gate from launch
+  config before installing the handler and refreshes it on every
+  `ConfigReloaded` event. Disabling `external_control.url_scheme_enabled` via
+  live reload therefore causes subsequent `muninn://` events to be ignored
+  before they reach the runtime worker. The original reload-disable
+  counterexample is blocked.
+
 DEVANA-KEY: src/runtime_shell.rs:72-74,src/external_control/url_scheme.rs:51-72 | P2 | url-scheme-disable-ignored-reload
-DEVANA-SUMMARY: P2 high src/runtime_shell.rs:72-74 - Disabling url_scheme_enabled via live reload does not stop the installed muninn:// handler from dispatching control actions.
+DEVANA-SUMMARY: Status=fixed | P2 high src/runtime_shell.rs:72-74 - Disabling url_scheme_enabled via live reload does not stop the installed muninn:// handler from dispatching control actions.

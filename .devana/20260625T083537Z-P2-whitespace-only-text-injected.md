@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/orchestrator.rs:84-86 | Slug: whitespace-only-text-injected
 
 # Whitespace-only pipeline text is treated as injectable
@@ -40,5 +40,15 @@ Refine acceptance trims and rejects empty candidate output (`refine.rs:411-420`)
 
 Align `non_empty_text` and `inject_checked` with trim-based emptiness used by STT/refine, or treat whitespace-only `final_text` as absent for routing.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. `orchestrator::non_empty_text` now treats
+  whitespace-only strings as absent by checking `!value.trim().is_empty()`, so a
+  blank `output.final_text` falls back to usable `transcript.raw_text` or no
+  injection. `TextInjector::inject_checked` also rejects trim-empty text before
+  calling the platform injector. The original blank-looking injection
+  counterexample is blocked.
+
 DEVANA-KEY: src/orchestrator.rs:84-86 | P2 | whitespace-only-text-injected
-DEVANA-SUMMARY: P2 high src/orchestrator.rs:84-86 - Whitespace-only final_text is preferred over a real transcript and passes inject_checked, causing blank injection.
+DEVANA-SUMMARY: Status=fixed | P2 high src/orchestrator.rs:84-86 - Whitespace-only final_text is preferred over a real transcript and passes inject_checked, causing blank injection.

@@ -74,9 +74,10 @@ After working this report, preserve the original finding body. Update line 2 `St
 - 2026-06-25: open by Devana. Initial report written from static source inspection.
 - 2026-06-26: fixed. Both backends now inspect the close frame in the
   `Message::Close` arm. A frame with a non-benign code (anything other than 1000
-  Normal / 1001 Going Away, or no frame at all) is captured as a
+  Normal / 1001 Going Away) is captured as a
   `StreamingTranscriptionError::failed(...)` carrying the close code and reason
-  (codes `deepgram_closed_with_error` / `openai_realtime_closed_with_error`).
+  (codes `deepgram_closed_with_error` / `openai_realtime_closed_with_error`);
+  a close without a frame is treated as benign.
   After the loop, the error is returned only when no usable final text was
   produced, so a transcript completed before a trailing error close is still
   returned as success. Added regression tests: deepgram

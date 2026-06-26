@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: medium | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: medium | Security-sensitive: no | Status: fixed
 Location: src/streaming_transcription/openai.rs:278-285 | Slug: openai-streaming-truncates-segments
 
 # OpenAI streaming finish exits after first completed segment
@@ -42,5 +42,35 @@ If the provider emits a single consolidated completion per utterance, behavior i
 
 Drain the websocket until close or an explicit end signal after commit, then build the outcome from all completed events.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: still open, narrowed. `finish()` no longer breaks immediately
+  after the first completed event: it waits for the first completion, then drains
+  additional messages for `POST_COMPLETION_DRAIN_GRACE` (300 ms). That blocks
+  the back-to-back multi-completion counterexample covered by current regression
+  tests. A delayed second final completion after the grace still follows
+  `Err(_elapsed) => break`, closes the socket, and builds the outcome from only
+  the completions already read. No repo-local guard, provider contract, or test
+  proves every final segment arrives within that 300 ms grace, so the report
+  remains open with the delayed-segment counterexample.
+- 2026-06-26: fixed. `finish()` no longer uses a fixed post-completion grace.
+  It waits for the server's `input_audio_buffer.committed` acknowledgement,
+  records that committed item id, then uses the committed item's
+  `conversation.item.done` content list to learn which audio content indexes
+  must produce `conversation.item.input_audio_transcription.completed` events.
+  The loop only exits once all finalized audio content indexes for that
+  committed item have completed (or the socket closes/errors, with the existing
+  controller finish timeout as the outer bound). This blocks both the delayed
+  final event counterexample and the review-discovered same-item delayed
+  multi-content counterexample. Final outcome assembly now prefers the
+  committed item's transcript parts and orders them by `content_index` so
+  unrelated item completions cannot contaminate the committed utterance. Added
+  `finish_waits_for_delayed_completion_for_committed_item` and
+  `finish_waits_for_all_finalized_audio_content_indexes`, plus coverage for
+  unrelated item completions and out-of-order committed audio parts; focused
+  OpenAI streaming tests, broader streaming tests, and the full library suite
+  pass.
+
 DEVANA-KEY: src/streaming_transcription/openai.rs:278-285 | P2 | openai-streaming-truncates-segments
-DEVANA-SUMMARY: P2 medium src/streaming_transcription/openai.rs:278-285 - OpenAI streaming finish stops reading after the first completed segment, truncating multi-part transcripts.
+DEVANA-SUMMARY: Status=fixed | P2 medium src/streaming_transcription/openai.rs:278-285 - OpenAI streaming finish now waits for transcription completion of the committed item instead of closing after a fixed post-completion grace.

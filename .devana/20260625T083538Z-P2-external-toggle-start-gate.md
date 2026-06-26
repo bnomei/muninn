@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P2 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P2 | Confidence: high | Security-sensitive: no | Status: stale
 Location: src/external_control/action.rs:45-53 | Slug: external-toggle-start-gate
 
 # External toggle incorrectly gated by start_recording_enabled when idle
@@ -42,5 +42,16 @@ Cross-entry mismatch: tray `Toggle` vs URL/MCP `Toggle` under the same config.
 
 Split toggle idle handling from the `start_recording_enabled` check, or update README if the gate is intentional.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: stale. The behavior was not changed to allow idle external
+  `toggle` without the microphone-start opt-in; instead the current contract now
+  explicitly says idle `toggle` is subject to the same
+  `start_recording_enabled = true` gate as `start`. `ExternalControlAction` and
+  its tests encode that gate. The original report's README/code mismatch no
+  longer exists, so this is not a current runtime defect under the documented
+  semantics.
+
 DEVANA-KEY: src/external_control/action.rs:45-53 | P2 | external-toggle-start-gate
-DEVANA-SUMMARY: P2 high src/external_control/action.rs:45-53 - External toggle when idle is blocked by start_recording_enabled despite README saying only start requires that opt-in.
+DEVANA-SUMMARY: Status=stale | P2 high src/external_control/action.rs:45-53 - External idle toggle is now documented and tested as gated by start_recording_enabled, so the original README/code mismatch no longer applies.

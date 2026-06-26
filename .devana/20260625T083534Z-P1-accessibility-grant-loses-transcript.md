@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P1 | Confidence: high | Security-sensitive: no | Status: open
+Priority: P1 | Confidence: high | Security-sensitive: no | Status: fixed
 Location: src/runtime_pipeline.rs:87-91,143-144 | Slug: accessibility-grant-loses-transcript
 
 # Accessibility grant during first injection silently discards completed transcript
@@ -42,5 +42,15 @@ Cross-entry mismatch: recording-start abort happens before pipeline work; inject
 
 After a successful Accessibility grant in the same interaction, proceed with `inject_checked` instead of aborting, or retain the injection text and expose an explicit retry that does not require re-recording.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. `should_abort_injection` now returns `false` when the
+  refreshed preflight allows injection, even if Accessibility was requested in
+  the same interaction. `process_and_inject` therefore proceeds to
+  `inject_checked` after a successful grant instead of returning before
+  injection. If Accessibility remains denied, the abort path is still used. The
+  original grant-then-discard counterexample is blocked.
+
 DEVANA-KEY: src/runtime_pipeline.rs:87-91,143-144 | P1 | accessibility-grant-loses-transcript
-DEVANA-SUMMARY: P1 high src/runtime_pipeline.rs:87-91,143-144 - Granting Accessibility on first injection aborts silently and deletes the WAV, losing a completed transcript despite the retry log message.
+DEVANA-SUMMARY: Status=fixed | P1 high src/runtime_pipeline.rs:87-91,143-144 - Granting Accessibility on first injection aborts silently and deletes the WAV, losing a completed transcript despite the retry log message.

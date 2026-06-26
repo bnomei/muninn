@@ -1,5 +1,5 @@
 DEVANA-FINDING: v1
-Priority: P1 | Confidence: high | Security-sensitive: yes | Status: open
+Priority: P1 | Confidence: high | Security-sensitive: yes | Status: fixed
 Location: src/replay.rs:349-362 | Slug: replay-prompt-leak-refine-context
 
 # Full-debug replay persists refine prompts despite documented redaction
@@ -41,5 +41,14 @@ Dataflow trace: live `AppConfig.transcript.system_prompt` → `replay_refine_con
 
 Omit `refine_context.system_prompt` in full-debug mode (or apply the same redaction policy as envelope/config snapshots) and update the regression test accordingly.
 
+## Status Notes
+
+- 2026-06-25: open by Devana. Initial report written from static source inspection.
+- 2026-06-26: fixed. `replay_refine_context` now preserves the
+  `refine_context.system_prompt` marker only as `[redacted]` instead of copying
+  the configured prompt text. Config snapshots still remove prompt keys, and
+  envelope/pipeline-outcome replay sanitization still clears transcript system
+  prompts. The original full-debug `record.json` prompt leak is blocked.
+
 DEVANA-KEY: src/replay.rs:349-362 | P1 | replay-prompt-leak-refine-context
-DEVANA-SUMMARY: P1 high src/replay.rs:349-362 - Full-debug replay writes refine prompts into record.json despite README claiming prompt fields are redacted.
+DEVANA-SUMMARY: Status=fixed | P1 high src/replay.rs:349-362 - Full-debug replay writes refine prompts into record.json despite README claiming prompt fields are redacted.
