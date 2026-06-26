@@ -7,7 +7,8 @@ pub(crate) enum ExternalControlAction {
     Start,
     /// Finish the active recording and run the pipeline. No-op when idle.
     Stop,
-    /// Start when idle, otherwise finish the active recording.
+    /// Start when idle (gated by `start_recording_enabled`, like `Start`),
+    /// otherwise finish the active recording.
     Toggle,
     /// Discard the active recording without running the pipeline.
     Cancel,
@@ -23,8 +24,12 @@ pub(crate) enum ExternalControlOutcome {
 impl ExternalControlAction {
     /// Map an action onto the [`AppEvent`] appropriate for the current state.
     ///
-    /// Start requests are explicitly gated by config. `Noop` means the action
-    /// is allowed but has no state transition to perform.
+    /// Starting capture from idle is explicitly gated by `start_recording_enabled`
+    /// for both `Start` and `Toggle`, so an external agent cannot bypass the
+    /// microphone opt-in by sending `toggle` instead of `start`. (The tray click
+    /// path resolves with the gate forced on via `to_app_event`, since a local
+    /// human action is already trusted.) `Noop` means the action is allowed but has
+    /// no state transition to perform.
     pub(crate) fn resolve(
         self,
         state: AppState,
@@ -197,6 +202,13 @@ mod tests {
         assert_eq!(
             ExternalControlAction::Toggle.resolve(AppState::Idle, true),
             ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
+        );
+        // Security gate: an idle external toggle starts microphone capture, so it
+        // is gated by start_recording_enabled exactly like Start. Without the
+        // opt-in an external toggle cannot start capture.
+        assert_eq!(
+            ExternalControlAction::Toggle.resolve(AppState::Idle, false),
+            ExternalControlOutcome::Disabled
         );
         // Regression: a recording started in done mode (hotkey, MCP, or URL
         // scheme) must stop on the next toggle instead of being a no-op.
