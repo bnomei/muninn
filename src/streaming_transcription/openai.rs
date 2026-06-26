@@ -27,6 +27,7 @@ const MISSING_API_KEY_CODE: &str = "missing_openai_api_key";
 const RECORDING_CONFIG_UNSUPPORTED_CODE: &str = "openai_realtime_recording_config_unsupported";
 const REQUIRED_SAMPLE_RATE_HZ: u32 = 24_000;
 const REQUIRED_CHANNELS: u16 = 1;
+const STREAM_CLOSED_WITH_ERROR_CODE: &str = "openai_realtime_closed_with_error";
 /// After the first completed transcription segment arrives post-commit, wait at
 /// most this long for additional segments/content parts before finalizing, so a
 /// single-segment utterance is not delayed by the full streaming finish timeout.
@@ -288,6 +289,7 @@ where
         // completed segment, then briefly drain any further segments/content parts
         // that arrive back-to-back before finalizing. Stopping on the first
         // completion would truncate multi-segment transcripts.
+        let mut error_close: Option<StreamingTranscriptionError> = None;
         loop {
             let message = if self.transcript.completed_count() == 0 {
                 // No completion yet: wait for the next message. Transcription
@@ -317,12 +319,37 @@ where
                 Message::Ping(payload) => {
                     self.socket.send(Message::Pong(payload)).await?;
                 }
-                Message::Close(_) => break,
+                Message::Close(frame) => {
+                    // A server-initiated error close (auth/quota/policy) must be a
+                    // provider failure, not an empty-success outcome that would be
+                    // reported to the user as "no speech detected". Benign closes
+                    // (1000 Normal, 1001 Going Away, or no frame) just end the loop.
+                    if let Some(frame) = frame {
+                        let code = u16::from(frame.code);
+                        if !matches!(code, 1000 | 1001) {
+                            error_close = Some(StreamingTranscriptionError::failed(
+                                PROVIDER,
+                                STREAM_CLOSED_WITH_ERROR_CODE,
+                                format!(
+                                    "OpenAI Realtime closed the stream with error code {code}: {}",
+                                    frame.reason
+                                ),
+                            ));
+                        }
+                    }
+                    break;
+                }
             }
         }
 
         let _ = self.socket.close().await;
-        Ok(self.transcript.into_outcome())
+        let outcome = self.transcript.into_outcome();
+        // Prefer a transcript that was produced before an error close; only surface
+        // the close as a failure when there is no usable final text.
+        match error_close {
+            Some(error) if !outcome.has_final_text() => Err(error),
+            _ => Ok(outcome),
+        }
     }
 
     async fn cancel(mut self: Box<Self>) {
@@ -930,6 +957,28 @@ api_key = "config-key"
             .expect("session should finalize");
 
         assert_eq!(outcome.raw_text.as_deref(), Some("real text"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_reports_error_close_frame_as_failure() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeOpenAiWebSocket::new(
+            Arc::clone(&state),
+            [Message::Close(Some(CloseFrame {
+                code: CloseCode::Policy,
+                reason: "insufficient_quota".into(),
+            }))],
+        );
+
+        let error = Box::new(OpenAiStreamingSession::new(socket, request()))
+            .finish()
+            .await
+            .expect_err("an error close with no transcript must surface as a failure");
+
+        assert_eq!(error.to_attempt().code, "openai_realtime_closed_with_error");
+        assert!(error.to_attempt().detail.contains("insufficient_quota"));
     }
 
     #[tokio::test(flavor = "current_thread")]
