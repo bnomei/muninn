@@ -35,6 +35,14 @@ pub(super) enum CommandErrorKind {
     Timeout,
 }
 
+/// Which phase of the bounded write/wait future failed, so the outer timeout can
+/// map it back to the right [`CommandErrorKind`].
+enum WritePhaseError {
+    Write(io::Error),
+    Close(io::Error),
+    Wait(io::Error),
+}
+
 #[derive(Debug)]
 pub(super) struct CommandError {
     pub(super) kind: CommandErrorKind,
@@ -76,26 +84,6 @@ pub(super) async fn run_command(
         stderr: CapturedOutput::default(),
     })?;
 
-    stdin
-        .write_all(stdin_bytes)
-        .await
-        .map_err(|source| CommandError {
-            kind: CommandErrorKind::WriteStdin,
-            details: source.to_string(),
-            timed_out: false,
-            exit_status: None,
-            stderr: CapturedOutput::default(),
-        })?;
-
-    stdin.shutdown().await.map_err(|source| CommandError {
-        kind: CommandErrorKind::CloseStdin,
-        details: source.to_string(),
-        timed_out: false,
-        exit_status: None,
-        stderr: CapturedOutput::default(),
-    })?;
-    drop(stdin);
-
     let stdout = child.stdout.take().ok_or_else(|| CommandError {
         kind: CommandErrorKind::MissingStdout,
         details: String::new(),
@@ -112,14 +100,55 @@ pub(super) async fn run_command(
         stderr: CapturedOutput::default(),
     })?;
 
+    // Spawn the stdout/stderr drains BEFORE writing stdin. A child that emits
+    // output while consuming input would otherwise fill its stdout pipe, stop
+    // reading stdin, and deadlock the parent's write_all. Draining concurrently
+    // keeps the child unblocked so the write can make progress.
     let stdout_reader =
         tokio::spawn(async move { read_to_end_capped(stdout, max_stdout_bytes).await });
     let stderr_reader =
         tokio::spawn(async move { read_to_end_capped(stderr, max_stderr_bytes).await });
 
-    let status = match timeout(timeout_budget, child.wait()).await {
+    // Drive the stdin write/shutdown and child.wait() under a single
+    // timeout_budget. Previously the write phase ran outside any timeout and with
+    // no concurrent stdout drain, so a child that never reads stdin to EOF (or
+    // stalls) blocked write_all forever and the timeout was never reached.
+    let write_and_wait = async {
+        stdin
+            .write_all(stdin_bytes)
+            .await
+            .map_err(WritePhaseError::Write)?;
+        stdin.shutdown().await.map_err(WritePhaseError::Close)?;
+        drop(stdin);
+        child.wait().await.map_err(WritePhaseError::Wait)
+    };
+
+    let wait_result = timeout(timeout_budget, write_and_wait).await;
+    let status = match wait_result {
         Ok(Ok(status)) => status,
-        Ok(Err(source)) => {
+        Ok(Err(WritePhaseError::Write(source))) => {
+            let (stderr, cleanup_notes) =
+                cleanup_after_command_failure(&mut child, stdout_reader, stderr_reader).await;
+            return Err(CommandError {
+                kind: CommandErrorKind::WriteStdin,
+                details: format_command_error_details(source.to_string(), cleanup_notes),
+                timed_out: false,
+                exit_status: None,
+                stderr,
+            });
+        }
+        Ok(Err(WritePhaseError::Close(source))) => {
+            let (stderr, cleanup_notes) =
+                cleanup_after_command_failure(&mut child, stdout_reader, stderr_reader).await;
+            return Err(CommandError {
+                kind: CommandErrorKind::CloseStdin,
+                details: format_command_error_details(source.to_string(), cleanup_notes),
+                timed_out: false,
+                exit_status: None,
+                stderr,
+            });
+        }
+        Ok(Err(WritePhaseError::Wait(source))) => {
             let (stderr, cleanup_notes) =
                 cleanup_after_command_failure(&mut child, stdout_reader, stderr_reader).await;
             return Err(CommandError {
@@ -253,4 +282,58 @@ fn format_command_error_details(primary: String, cleanup_notes: Vec<String>) -> 
     }
 
     format!("{primary}; {}", cleanup_notes.join("; "))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    // Far larger than any OS pipe buffer (~64 KB), so a child that reads and writes
+    // concurrently, or that never reads stdin, exposes back-pressure deadlocks.
+    const LARGE_PAYLOAD_BYTES: usize = 512 * 1024;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drains_stdout_while_writing_large_stdin_without_deadlock() {
+        // `cat` echoes stdin to stdout. If stdin were fully written before the
+        // stdout reader was spawned, cat would fill its stdout pipe, stop reading
+        // stdin, and the parent's write_all would deadlock.
+        let payload = vec![b'x'; LARGE_PAYLOAD_BYTES];
+
+        let result = run_command(
+            "/bin/cat",
+            &[],
+            &payload,
+            Duration::from_secs(10),
+            LARGE_PAYLOAD_BYTES * 2,
+            1024,
+        )
+        .await
+        .expect("cat should round-trip a large payload without deadlocking");
+
+        assert!(result.success);
+        assert_eq!(result.stdout.bytes.len(), LARGE_PAYLOAD_BYTES);
+        assert!(!result.stdout.truncated);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn times_out_when_child_never_reads_stdin() {
+        // `sleep` never reads stdin, so a payload larger than the pipe buffer blocks
+        // the parent's write_all. The write phase must now be bounded by
+        // timeout_budget instead of hanging forever.
+        let payload = vec![b'x'; LARGE_PAYLOAD_BYTES];
+
+        let error = run_command(
+            "/bin/sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            &payload,
+            Duration::from_millis(200),
+            1024,
+            1024,
+        )
+        .await
+        .expect_err("a child that never drains stdin must hit the timeout");
+
+        assert!(error.timed_out);
+        assert_eq!(error.kind, CommandErrorKind::Timeout);
+    }
 }
