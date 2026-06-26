@@ -68,8 +68,18 @@ impl AppRuntime {
         // macOS delivers the launch GetURL Apple Event during
         // applicationWillFinishLaunching, earlier than StartCause::Init, so the
         // observer set up here must already be in place to catch cold-launch URLs.
+        //
+        // The handler is always installed, but URL dispatch is gated on the
+        // runtime url_scheme_enabled flag (seeded here and refreshed on every live
+        // config reload). This makes url_scheme_enabled a real runtime control
+        // surface: disabling it via reload immediately stops external URL control
+        // even though the Apple Event handler stays registered for the process
+        // lifetime.
         #[cfg(target_os = "macos")]
-        if self.config.external_control.url_scheme_enabled {
+        {
+            crate::external_control::set_url_scheme_enabled(
+                self.config.external_control.url_scheme_enabled,
+            );
             crate::external_control::install_url_scheme_handler(proxy.clone());
         }
 
@@ -215,6 +225,12 @@ impl AppRuntime {
                 }
                 Event::UserEvent(UserEvent::ConfigReloaded(config)) => {
                     current_config = (*config).clone();
+                    // Refresh the URL-scheme gate so disabling (or re-enabling)
+                    // url_scheme_enabled via live reload takes effect immediately.
+                    #[cfg(target_os = "macos")]
+                    crate::external_control::set_url_scheme_enabled(
+                        current_config.external_control.url_scheme_enabled,
+                    );
                     indicator_config = current_config.indicator.clone();
                     preview_selection = current_config.resolve_profile_selection(&preview_context);
                     crate::sync_os_autostart(&config_path, &current_config);

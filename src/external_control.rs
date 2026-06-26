@@ -16,4 +16,4 @@ pub(crate) use action::{parse_url_action, ExternalControlAction, ExternalControl
 pub(crate) use mcp::spawn_mcp_server;
 pub(crate) use status::RuntimeStatusHandle;
 #[cfg(target_os = "macos")]
-pub(crate) use url_scheme::install_url_scheme_handler;
+pub(crate) use url_scheme::{install_url_scheme_handler, set_url_scheme_enabled};

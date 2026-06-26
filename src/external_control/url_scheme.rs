@@ -8,6 +8,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
@@ -26,6 +27,20 @@ const INTERNET_EVENT_CLASS: u32 = 0x4755_524C; // 'GURL'
 const AE_GET_URL: u32 = 0x4755_524C; // 'GURL'
 
 static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+
+/// Whether `muninn://` URLs should currently drive the runtime. The Apple Event
+/// handler is installed once at launch, but `url_scheme_enabled` can change at
+/// runtime via live config reload, so dispatch is gated on this flag rather than
+/// on whether the handler is installed. Defaults to disabled until the launch
+/// config is applied.
+static URL_SCHEME_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Update whether `muninn://` URLs are honored. Called with the launch config at
+/// bootstrap and again on every live config reload so that disabling
+/// `url_scheme_enabled` at runtime immediately stops external URL control.
+pub(crate) fn set_url_scheme_enabled(enabled: bool) {
+    URL_SCHEME_ENABLED.store(enabled, Ordering::SeqCst);
+}
 
 define_class!(
     // SAFETY:
@@ -60,6 +75,14 @@ fn handle_get_url_event(event: *mut AnyObject) {
         warn!(target: TARGET_RUNTIME, %url, "ignored unrecognized muninn:// URL");
         return;
     };
+    if !URL_SCHEME_ENABLED.load(Ordering::SeqCst) {
+        warn!(
+            target: TARGET_RUNTIME,
+            %url,
+            "ignored muninn:// URL because external_control.url_scheme_enabled is false"
+        );
+        return;
+    }
     let Some(proxy) = PROXY.get() else {
         warn!(target: TARGET_RUNTIME, "muninn:// handler invoked before proxy was installed");
         return;
