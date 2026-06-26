@@ -380,7 +380,9 @@ fn looks_like_acronym(text: &str) -> bool {
 }
 
 fn non_empty_text(text: &Option<String>) -> Option<&str> {
-    text.as_deref().filter(|value| !value.is_empty())
+    // Match orchestrator/STT/refine: whitespace-only text counts as absent so a
+    // blank final_text does not suppress scoring of a usable raw transcript.
+    text.as_deref().filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]

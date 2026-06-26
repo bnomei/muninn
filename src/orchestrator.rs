@@ -82,7 +82,10 @@ fn route_envelope(
 }
 
 fn non_empty_text(text: &Option<String>) -> Option<&str> {
-    text.as_deref().filter(|value| !value.is_empty())
+    // Treat whitespace-only text as absent so routing falls back to a usable
+    // counterpart instead of injecting blank-looking output. STT and refine paths
+    // use the same trim-based emptiness, so this keeps routing consistent with them.
+    text.as_deref().filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -152,6 +155,39 @@ mod tests {
         assert_eq!(route.target.text(), None);
         assert_eq!(route.reason, InjectionRouteReason::PipelineAborted);
         assert_eq!(route.pipeline_stop_reason, Some(abort_reason));
+    }
+
+    #[test]
+    fn whitespace_only_final_text_falls_back_to_transcript_raw_text() {
+        let outcome = PipelineOutcome::Completed {
+            envelope: sample_envelope()
+                .with_output_final_text("   \n\t")
+                .with_transcript_raw_text("ship to San Francisco"),
+            trace: Vec::new(),
+        };
+
+        let route = Orchestrator::route_injection(&outcome);
+
+        assert_eq!(
+            route.target,
+            InjectionTarget::TranscriptRawText("ship to San Francisco".to_string())
+        );
+        assert_eq!(route.reason, InjectionRouteReason::SelectedTranscriptRawText);
+    }
+
+    #[test]
+    fn whitespace_only_final_and_raw_text_returns_no_injection() {
+        let outcome = PipelineOutcome::Completed {
+            envelope: sample_envelope()
+                .with_output_final_text("  ")
+                .with_transcript_raw_text("\n\t"),
+            trace: Vec::new(),
+        };
+
+        let route = Orchestrator::route_injection(&outcome);
+
+        assert_eq!(route.target, InjectionTarget::None);
+        assert_eq!(route.reason, InjectionRouteReason::NoInjectableText);
     }
 
     #[test]

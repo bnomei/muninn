@@ -409,7 +409,10 @@ pub trait TextInjector: Send + Sync {
     async fn inject_unicode_text(&self, text: &str) -> MacosAdapterResult<()>;
 
     async fn inject_checked(&self, text: &str) -> MacosAdapterResult<()> {
-        if text.is_empty() {
+        // Reject whitespace-only text, not just zero-length, so a blank payload is
+        // never typed into the focused app. This matches the trim-based emptiness
+        // used by injection routing and the STT/refine pipeline.
+        if text.trim().is_empty() {
             return Err(MacosAdapterError::EmptyInjectionText);
         }
         self.inject_unicode_text(text).await
