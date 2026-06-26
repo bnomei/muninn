@@ -200,14 +200,20 @@ pub(crate) fn should_abort_injection(
     requested_accessibility: bool,
 ) -> bool {
     match ensure_injection_allowed(preflight) {
-        Ok(()) if requested_accessibility => {
-            info!(
-                target: logging::TARGET_RUNTIME,
-                "Accessibility access changed during this interaction; retry the injection action"
-            );
-            true
+        Ok(()) => {
+            if requested_accessibility {
+                // Accessibility was requested this interaction and the refreshed
+                // preflight now reports it granted (AXIsProcessTrusted is true), so
+                // injection will succeed. Proceed instead of aborting: aborting here
+                // discards an already-transcribed utterance and deletes its WAV with
+                // no retry path, forcing the user to re-dictate.
+                info!(
+                    target: logging::TARGET_RUNTIME,
+                    "Accessibility access was granted during this interaction; proceeding with injection"
+                );
+            }
+            false
         }
-        Ok(()) => false,
         Err(error) => {
             log_injection_block(preflight, &error);
             true

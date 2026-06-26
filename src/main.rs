@@ -555,9 +555,24 @@ mod tests {
     }
 
     #[test]
-    fn injection_aborts_after_accessibility_prompt_even_when_now_granted() {
-        assert!(should_abort_injection(
+    fn injection_proceeds_after_accessibility_prompt_when_now_granted() {
+        // A fresh Accessibility grant that the refreshed preflight already reflects
+        // must not abort: the utterance is fully transcribed and aborting would
+        // delete the WAV with no retry path, losing the transcript.
+        assert!(!should_abort_injection(
             PermissionPreflightStatus::all_granted(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn injection_aborts_after_accessibility_prompt_when_still_denied() {
+        assert!(should_abort_injection(
+            PermissionPreflightStatus {
+                microphone: PermissionStatus::Granted,
+                accessibility: PermissionStatus::Denied,
+                input_monitoring: PermissionStatus::Granted,
+            },
             true,
         ));
     }
