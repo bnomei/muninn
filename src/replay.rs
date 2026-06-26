@@ -357,8 +357,13 @@ fn replay_refine_context(config: &AppConfig) -> Option<ReplayRefineContext> {
         return None;
     }
 
+    // Redact the prompt text. The README promises full-debug replay redacts prompt
+    // fields, and config/envelope snapshots already strip system_prompt; persisting
+    // the verbatim refine prompt here would leak private vocabulary, names, and
+    // project hints into shared/backed-up replay directories. Keep the field present
+    // as a marker so the artifact still records that a refine prompt was configured.
     Some(ReplayRefineContext {
-        system_prompt: system_prompt.to_string(),
+        system_prompt: REDACTED_VALUE.to_string(),
     })
 }
 
@@ -1057,7 +1062,7 @@ mod tests {
     }
 
     #[test]
-    fn persist_replay_includes_system_prompt_only_in_refine_context_when_refine_is_present() {
+    fn persist_replay_redacts_refine_prompt_but_records_that_refine_was_present() {
         let root = temp_dir("persist-refine");
         let mut config = AppConfig::launchable_default();
         config.logging.replay_enabled = true;
@@ -1104,9 +1109,12 @@ mod tests {
         )
         .expect("parse replay record");
 
+        // refine_context is present (a non-empty refine prompt was configured) but
+        // the prompt text itself is redacted, matching the README redaction promise.
+        assert!(!config.transcript.system_prompt.trim().is_empty());
         assert_eq!(
             record["refine_context"]["system_prompt"],
-            Value::String(config.transcript.system_prompt)
+            Value::String(REDACTED_VALUE.to_string())
         );
         assert_eq!(
             record["input_envelope"]["transcript"].get("system_prompt"),
