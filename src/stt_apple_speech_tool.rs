@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
@@ -613,23 +613,19 @@ fn resolved_config_from_builtin_steps(
 }
 
 fn materialize_helper_binary() -> Result<PathBuf, CliError> {
-    static HELPER_PATH: OnceLock<PathBuf> = OnceLock::new();
     static HELPER_INIT: Mutex<()> = Mutex::new(());
 
-    if let Some(path) = HELPER_PATH.get() {
-        return Ok(path.clone());
-    }
-
+    // Re-validate the on-disk helper against the embedded bytes on every call
+    // rather than caching the path. A cached path would let a same-user attacker
+    // replace the materialized binary after first use and have Muninn execute the
+    // tampered file on the next dictation (TOCTOU). The mutex serializes concurrent
+    // refreshes so two callers never stage/rename the helper at the same time.
     let _guard = HELPER_INIT.lock().map_err(|_| {
         CliError::new(
             "apple_speech_helper_lock_failed",
             "Apple Speech helper initialization lock was poisoned",
         )
     })?;
-
-    if let Some(path) = HELPER_PATH.get() {
-        return Ok(path.clone());
-    }
 
     let path = helper_output_path();
     if helper_needs_refresh(&path)? {
@@ -649,7 +645,6 @@ fn materialize_helper_binary() -> Result<PathBuf, CliError> {
     }
 
     ensure_helper_permissions(&path)?;
-    let _ = HELPER_PATH.set(path.clone());
     Ok(path)
 }
 
