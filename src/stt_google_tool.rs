@@ -619,7 +619,10 @@ fn extract_google_transcript_text(body: &[u8]) -> Result<String, CliError> {
                 .and_then(|alternative| alternative.get("transcript"))
                 .and_then(Value::as_str)
         })
-        .collect::<String>();
+        .map(str::trim)
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let transcript = transcript.trim().to_string();
 
     if !transcript.is_empty() || value.get("results").is_some() {
@@ -977,9 +980,9 @@ mod tests {
     }
 
     #[test]
-    fn response_json_concatenates_multiple_result_segments() {
+    fn response_json_joins_multiple_result_segments() {
         let transcript = extract_google_transcript_text(
-            br#"{"results":[{"alternatives":[{"transcript":"hello world"}]},{"alternatives":[{"transcript":" goodbye now"}]}]}"#,
+            br#"{"results":[{"alternatives":[{"transcript":"hello world"}]},{"alternatives":[{"transcript":"goodbye now"}]}]}"#,
         )
         .expect("extract text from multi-segment json");
         assert_eq!(transcript, "hello world goodbye now");

@@ -334,7 +334,7 @@ pub struct PipelineTraceEntry {
     pub duration_ms: u64,
     /// True when the step hit its per-step timeout budget.
     pub timed_out: bool,
-    /// Child process exit code when the step ran externally; `None` on timeout.
+    /// Step exit code when available; `None` when timeout prevented a status.
     pub exit_status: Option<i32>,
     /// Error-recovery or contract-bypass policy recorded for this step.
     pub policy_applied: PipelinePolicyApplied,

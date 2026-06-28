@@ -139,6 +139,18 @@ impl IndicatorAdapter for MockIndicatorAdapter {
         self.set_state(fallback_state).await
     }
 
+    async fn set_temporary_state_with_glyph(
+        &mut self,
+        state: IndicatorState,
+        _glyph: Option<char>,
+        min_duration: Duration,
+        fallback_state: IndicatorState,
+        _fallback_glyph: Option<char>,
+    ) -> MacosAdapterResult<()> {
+        self.set_temporary_state(state, min_duration, fallback_state)
+            .await
+    }
+
     async fn state(&self) -> MacosAdapterResult<IndicatorState> {
         let inner = self.inner.lock().expect("indicator mutex poisoned");
         match inner.state_error.clone() {

@@ -5,6 +5,10 @@
 //! [`RuntimeStatusHandle::snapshot`].
 
 use std::net::SocketAddr;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use rmcp::{
     model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
@@ -30,7 +34,7 @@ use crate::runtime_tray::{send_user_event, UserEvent};
 pub(crate) struct RecordingControlServer {
     proxy: EventLoopProxy<UserEvent>,
     status: RuntimeStatusHandle,
-    start_recording_enabled: bool,
+    start_recording_enabled: Arc<AtomicBool>,
 }
 
 #[tool_router]
@@ -38,7 +42,7 @@ impl RecordingControlServer {
     fn new(
         proxy: EventLoopProxy<UserEvent>,
         status: RuntimeStatusHandle,
-        start_recording_enabled: bool,
+        start_recording_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             proxy,
@@ -95,14 +99,8 @@ impl RecordingControlServer {
         )
     )]
     fn start_recording(&self) -> Result<CallToolResult, McpError> {
-        if !self.start_recording_enabled {
-            return Ok(CallToolResult::success(vec![Content::json(
-                serde_json::json!({
-                    "status": "disabled",
-                    "action": "start_recording",
-                    "reason": "external_control.start_recording_enabled is false"
-                }),
-            )?]));
+        if let Some(result) = start_recording_disabled_result(&self.start_recording_enabled)? {
+            return Ok(result);
         }
 
         send_user_event(
@@ -178,7 +176,7 @@ pub(crate) fn spawn_mcp_server(
     proxy: EventLoopProxy<UserEvent>,
     bind_address: String,
     status: RuntimeStatusHandle,
-    start_recording_enabled: bool,
+    start_recording_enabled: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -218,7 +216,7 @@ async fn serve(
     proxy: EventLoopProxy<UserEvent>,
     bind_address: String,
     status: RuntimeStatusHandle,
-    start_recording_enabled: bool,
+    start_recording_enabled: Arc<AtomicBool>,
 ) {
     let bind_addr = match validate_bind_address(&bind_address) {
         Ok(addr) => addr,
@@ -237,7 +235,7 @@ async fn serve(
             Ok(RecordingControlServer::new(
                 proxy.clone(),
                 status.clone(),
-                start_recording_enabled,
+                start_recording_enabled.clone(),
             ))
         },
         LocalSessionManager::default().into(),
@@ -267,9 +265,27 @@ async fn serve(
     }
 }
 
+fn start_recording_disabled_result(
+    start_recording_enabled: &AtomicBool,
+) -> Result<Option<CallToolResult>, McpError> {
+    if start_recording_enabled.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    Ok(Some(CallToolResult::success(vec![Content::json(
+        serde_json::json!({
+            "status": "disabled",
+            "action": "start_recording",
+            "reason": "external_control.start_recording_enabled is false"
+        }),
+    )?])))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::validate_bind_address;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::{start_recording_disabled_result, validate_bind_address};
 
     #[test]
     fn accepts_loopback_bind_addresses() {
@@ -282,5 +298,23 @@ mod tests {
         assert!(validate_bind_address("0.0.0.0:2769").is_err());
         assert!(validate_bind_address("192.168.1.10:2769").is_err());
         assert!(validate_bind_address("[::]:2769").is_err());
+    }
+
+    #[test]
+    fn start_recording_gate_reads_updated_server_state() {
+        let state = AtomicBool::new(false);
+        assert!(start_recording_disabled_result(&state)
+            .expect("disabled response")
+            .is_some());
+
+        state.store(true, Ordering::SeqCst);
+        assert!(start_recording_disabled_result(&state)
+            .expect("enabled response")
+            .is_none());
+
+        state.store(false, Ordering::SeqCst);
+        assert!(start_recording_disabled_result(&state)
+            .expect("disabled response")
+            .is_some());
     }
 }

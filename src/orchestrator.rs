@@ -192,7 +192,10 @@ mod tests {
             route.target,
             InjectionTarget::TranscriptRawText("ship to San Francisco".to_string())
         );
-        assert_eq!(route.reason, InjectionRouteReason::SelectedTranscriptRawText);
+        assert_eq!(
+            route.reason,
+            InjectionRouteReason::SelectedTranscriptRawText
+        );
     }
 
     #[test]

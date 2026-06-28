@@ -412,22 +412,13 @@ pub trait IndicatorAdapter: Send + Sync {
         self.set_state(state).await
     }
     /// Show `state` for at least `min_duration`, then revert to `fallback_state`.
-    ///
-    /// Default implementation ignores timing and delegates to [`IndicatorAdapter::set_state`].
     async fn set_temporary_state(
         &mut self,
         state: IndicatorState,
         min_duration: Duration,
         fallback_state: IndicatorState,
-    ) -> MacosAdapterResult<()> {
-        let _ = min_duration;
-        let _ = fallback_state;
-        self.set_state(state).await
-    }
+    ) -> MacosAdapterResult<()>;
     /// Temporary indicator update with optional primary and fallback glyphs.
-    ///
-    /// Default implementation ignores glyphs and delegates to
-    /// [`IndicatorAdapter::set_temporary_state`].
     async fn set_temporary_state_with_glyph(
         &mut self,
         state: IndicatorState,
@@ -435,12 +426,7 @@ pub trait IndicatorAdapter: Send + Sync {
         min_duration: Duration,
         fallback_state: IndicatorState,
         fallback_glyph: Option<char>,
-    ) -> MacosAdapterResult<()> {
-        let _ = glyph;
-        let _ = fallback_glyph;
-        self.set_temporary_state(state, min_duration, fallback_state)
-            .await
-    }
+    ) -> MacosAdapterResult<()>;
     /// Read the indicator phase last applied by the adapter.
     async fn state(&self) -> MacosAdapterResult<IndicatorState>;
     /// Returns the glyph currently shown, if any.

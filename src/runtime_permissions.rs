@@ -1,8 +1,9 @@
 //! macOS TCC permission refresh before recording and injection.
 //!
 //! Hotkey recording requires Input Monitoring; tray and external controls use a
-//! lighter preflight. Prompting during a user gesture may grant access but still
-//! aborts that gesture so the user retries with stable permissions.
+//! lighter recording preflight. Recording prompts abort the active start gesture
+//! so the user retries with stable permissions; injection proceeds immediately
+//! when Accessibility is granted during its refresh.
 
 use anyhow::{anyhow, Result};
 use muninn::{PermissionKind, PermissionPreflightStatus, PermissionStatus, PermissionsAdapter};
@@ -150,8 +151,9 @@ where
 /// Whether to cancel this recording start after a permission refresh.
 ///
 /// Aborts when required permissions are still missing, or when a prompt fired
-/// during this gesture so the user can retry with stable TCC state. Hotkey
-/// Input Monitoring prompts always abort; tray starts continue after IM prompts.
+/// during this gesture so the user can retry with stable TCC state. Input
+/// Monitoring is only prompted for hotkey starts, and hotkey Input Monitoring
+/// prompts always abort.
 pub(crate) fn should_abort_recording_start(
     preflight: PermissionPreflightStatus,
     requested_microphone: bool,

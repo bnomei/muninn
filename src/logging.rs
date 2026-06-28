@@ -49,9 +49,7 @@ pub(crate) enum DiagnosticEvent {
         path: Option<String>,
     },
     /// Config file change detected on disk.
-    ConfigChanged {
-        path: String,
-    },
+    ConfigChanged { path: String },
     /// Recording capture began after permissions passed.
     RecordingStarted {
         profile_id: String,
@@ -63,10 +61,7 @@ pub(crate) enum DiagnosticEvent {
         source: &'static str,
     },
     /// Runtime worker failed to build or exited with an error.
-    RuntimeWorkerFailed {
-        stage: &'static str,
-        detail: String,
-    },
+    RuntimeWorkerFailed { stage: &'static str, detail: String },
 }
 
 #[cfg(test)]

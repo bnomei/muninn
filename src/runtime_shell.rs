@@ -5,7 +5,13 @@
 //! process runs as an accessory app (no dock icon). URL-scheme and MCP handlers
 //! register on this thread *before* the loop starts.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{Context, Result};
 use muninn::{
@@ -117,6 +123,9 @@ impl AppRuntime {
         let mut last_indicator_state = IndicatorState::Idle;
         let mut last_active_glyph = None;
         let runtime_status = crate::external_control::RuntimeStatusHandle::new(preflight);
+        let mcp_start_recording_enabled = Arc::new(AtomicBool::new(
+            current_config.external_control.start_recording_enabled,
+        ));
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -157,7 +166,7 @@ impl AppRuntime {
                             proxy.clone(),
                             current_config.external_control.mcp_bind_address.clone(),
                             runtime_status.clone(),
-                            current_config.external_control.start_recording_enabled,
+                            mcp_start_recording_enabled.clone(),
                         );
                     }
                 }
@@ -235,6 +244,10 @@ impl AppRuntime {
                 }
                 Event::UserEvent(UserEvent::ConfigReloaded(config)) => {
                     current_config = (*config).clone();
+                    mcp_start_recording_enabled.store(
+                        current_config.external_control.start_recording_enabled,
+                        Ordering::SeqCst,
+                    );
                     #[cfg(target_os = "macos")]
                     crate::external_control::set_url_scheme_enabled(
                         current_config.external_control.url_scheme_enabled,

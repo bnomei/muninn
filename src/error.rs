@@ -41,6 +41,14 @@ impl fmt::Display for PermissionKind {
     }
 }
 
+fn format_permission_list(permissions: &[PermissionKind]) -> String {
+    permissions
+        .iter()
+        .map(|permission| permission.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Failure modes for platform adapters, preflight, and runtime I/O boundaries.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum MacosAdapterError {
@@ -48,7 +56,10 @@ pub enum MacosAdapterError {
     #[error("unsupported platform")]
     UnsupportedPlatform,
     /// One or more required TCC permissions are not granted.
-    #[error("missing required permissions: {permissions:?}")]
+    #[error(
+        "missing required permissions: {}",
+        format_permission_list(permissions)
+    )]
     MissingPermissions { permissions: Vec<PermissionKind> },
     /// The hotkey event source closed its channel or stream.
     #[error("hotkey event stream closed")]
