@@ -1,3 +1,9 @@
+//! Builtin Google Cloud Speech STT pipeline step.
+//!
+//! Base64-encodes `audio.wav_path` into a `speech:recognize` REST request and
+//! writes `transcript.raw_text`. Runnable as a subprocess internal tool or
+//! in-process via [`process_input_in_process`].
+
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use muninn::resolve_secret;
 use muninn::MuninnEnvelopeV1;
@@ -21,6 +27,7 @@ use tracing::{error, info, warn};
 const DEFAULT_LANGUAGE_CODE: &str = "en-US";
 const PROVIDER_LOG_TARGET: &str = muninn::TARGET_PROVIDER;
 
+/// Google STT step failure surfaced to the pipeline runner or internal-tool stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
     code: &'static str,
@@ -35,6 +42,7 @@ impl CliError {
         }
     }
 
+    /// Serialize the error as JSON for subprocess stderr consumers.
     pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
@@ -45,6 +53,7 @@ impl CliError {
         .to_string()
     }
 
+    /// Borrow the human-readable error message.
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -132,6 +141,10 @@ struct GoogleRecognitionConfig<'a> {
     model: Option<&'a str>,
 }
 
+/// Entry point for `muninn __internal_step stt_google` subprocess invocation.
+///
+/// Reads a [`MuninnEnvelopeV1`] from stdin and writes the updated envelope to
+/// stdout; failures log and emit JSON on stderr before returning failure.
 pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -203,6 +216,7 @@ where
     }
 }
 
+/// Run Google STT inside the pipeline process using resolved builtin configuration.
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
     config: &ResolvedBuiltinStepConfig,
@@ -597,13 +611,19 @@ fn extract_google_transcript_text(body: &[u8]) -> Result<String, CliError> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|result| result.get("alternatives").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|alternative| alternative.get("transcript").and_then(Value::as_str))
-        .next()
+        .filter_map(|result| {
+            result
+                .get("alternatives")
+                .and_then(Value::as_array)
+                .and_then(|alternatives| alternatives.first())
+                .and_then(|alternative| alternative.get("transcript"))
+                .and_then(Value::as_str)
+        })
         .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let transcript = transcript.trim().to_string();
 
     if !transcript.is_empty() || value.get("results").is_some() {
         return Ok(transcript);
@@ -957,6 +977,24 @@ mod tests {
         )
         .expect("extract text from json");
         assert_eq!(transcript, "hello from google");
+    }
+
+    #[test]
+    fn response_json_joins_multiple_result_segments() {
+        let transcript = extract_google_transcript_text(
+            br#"{"results":[{"alternatives":[{"transcript":"hello world"}]},{"alternatives":[{"transcript":"goodbye now"}]}]}"#,
+        )
+        .expect("extract text from multi-segment json");
+        assert_eq!(transcript, "hello world goodbye now");
+    }
+
+    #[test]
+    fn response_json_uses_first_alternative_per_result() {
+        let transcript = extract_google_transcript_text(
+            br#"{"results":[{"alternatives":[{"transcript":"primary","confidence":0.9},{"transcript":"secondary","confidence":0.4}]}]}"#,
+        )
+        .expect("extract text using first alternative");
+        assert_eq!(transcript, "primary");
     }
 
     #[test]

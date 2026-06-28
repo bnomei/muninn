@@ -1,3 +1,9 @@
+//! Deepgram live transcription over the streaming WebSocket `/v1/listen` API.
+//!
+//! Sends linear16 PCM in binary frames, accumulates `is_final` `Results` messages,
+//! and closes with a `CloseStream` control message. Implements
+//! [`StreamingTranscriptionProvider`] for [`TranscriptionProvider::Deepgram`].
+
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Url;
@@ -20,9 +26,11 @@ use crate::{
 };
 
 const PROVIDER: TranscriptionProvider = TranscriptionProvider::Deepgram;
+const STREAM_CLOSED_WITH_ERROR_CODE: &str = "deepgram_closed_with_error";
 const MISSING_API_KEY_CODE: &str = "missing_deepgram_api_key";
 const CLOSE_STREAM_CONTROL: &str = r#"{"type":"CloseStream"}"#;
 
+/// Deepgram [`StreamingTranscriptionProvider`] using `tokio-tungstenite`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DeepgramStreamingTranscriptionProvider;
 
@@ -221,6 +229,7 @@ where
             .send(Message::Text(CLOSE_STREAM_CONTROL.to_string()))
             .await?;
 
+        let mut error_close: Option<StreamingTranscriptionError> = None;
         while let Some(message) = self.socket.next().await? {
             match message {
                 Message::Text(text) => {
@@ -230,11 +239,30 @@ where
                 Message::Ping(payload) => {
                     self.socket.send(Message::Pong(payload)).await?;
                 }
-                Message::Close(_) => break,
+                Message::Close(frame) => {
+                    if let Some(frame) = frame {
+                        let code = u16::from(frame.code);
+                        if !matches!(code, 1000 | 1001) {
+                            error_close = Some(StreamingTranscriptionError::failed(
+                                PROVIDER,
+                                STREAM_CLOSED_WITH_ERROR_CODE,
+                                format!(
+                                    "Deepgram closed the stream with error code {code}: {}",
+                                    frame.reason
+                                ),
+                            ));
+                        }
+                    }
+                    break;
+                }
             }
         }
 
-        Ok(self.transcript.into_outcome())
+        let outcome = self.transcript.into_outcome();
+        match error_close {
+            Some(error) if !outcome.has_final_text() => Err(error),
+            _ => Ok(outcome),
+        }
     }
 
     async fn cancel(mut self: Box<Self>) {
@@ -701,6 +729,55 @@ api_key = "secret"
         let state = state.lock().expect("fake state poisoned");
         assert_eq!(state.binary_payloads, vec![vec![0x34, 0x12, 0xFE, 0xFF]]);
         assert_eq!(state.text_payloads, vec![CLOSE_STREAM_CONTROL]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_reports_error_close_frame_as_failure() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeDeepgramWebSocket::new(
+            Arc::clone(&state),
+            [Message::Close(Some(CloseFrame {
+                code: CloseCode::Library(4001),
+                reason: "insufficient_credits".into(),
+            }))],
+        );
+
+        let error = Box::new(DeepgramStreamingSession::new(socket, 16_000, 1))
+            .finish()
+            .await
+            .expect_err("an error close with no transcript must surface as a failure");
+
+        assert_eq!(error.to_attempt().code, "deepgram_closed_with_error");
+        assert!(error.to_attempt().detail.contains("insufficient_credits"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn finish_keeps_transcript_when_error_close_follows_final_text() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+        let state = Arc::new(Mutex::new(FakeWebSocketState::default()));
+        let socket = FakeDeepgramWebSocket::new(
+            Arc::clone(&state),
+            [
+                Message::Text(
+                    r#"{"type":"Results","is_final":true,"speech_final":true,"channel":{"alternatives":[{"transcript":"streamed text"}]}}"#
+                        .to_string(),
+                ),
+                Message::Close(Some(CloseFrame {
+                    code: CloseCode::Library(4001),
+                    reason: "insufficient_credits".into(),
+                })),
+            ],
+        );
+
+        let outcome = Box::new(DeepgramStreamingSession::new(socket, 16_000, 1))
+            .finish()
+            .await
+            .expect("a produced transcript should win over a trailing error close");
+
+        assert_eq!(outcome.raw_text.as_deref(), Some("streamed text"));
     }
 
     #[tokio::test(flavor = "current_thread")]

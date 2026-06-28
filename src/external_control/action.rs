@@ -1,3 +1,9 @@
+//! Transport-agnostic external recording-control actions and state resolution.
+//!
+//! [`ExternalControlAction`] values originate from the `muninn://` URL scheme or
+//! MCP tools and are resolved against [`AppState`] before the runtime worker
+//! applies the resulting [`AppEvent`].
+
 use muninn::{AppEvent, AppState};
 
 /// A transport-agnostic recording-control request from an external agent.
@@ -13,10 +19,15 @@ pub(crate) enum ExternalControlAction {
     Cancel,
 }
 
+/// Result of resolving an [`ExternalControlAction`] against the current state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExternalControlOutcome {
+    /// Action maps to an [`AppEvent`] the runtime worker should apply.
     Enabled(AppEvent),
+    /// Start or toggle was rejected because `external_control.start_recording_enabled`
+    /// is false while idle.
     Disabled,
+    /// Action is allowed but has no state transition in the current state.
     Noop,
 }
 
@@ -61,6 +72,9 @@ impl ExternalControlAction {
         }
     }
 
+    /// Resolve with start recording enabled and return only an enabled [`AppEvent`].
+    ///
+    /// Treats [`ExternalControlOutcome::Disabled`] like [`ExternalControlOutcome::Noop`].
     pub(crate) fn to_app_event(self, state: AppState) -> Option<AppEvent> {
         match self.resolve(state, true) {
             ExternalControlOutcome::Enabled(app_event) => Some(app_event),
@@ -197,6 +211,10 @@ mod tests {
         assert_eq!(
             ExternalControlAction::Toggle.resolve(AppState::Idle, true),
             ExternalControlOutcome::Enabled(AppEvent::DoneTogglePressed)
+        );
+        assert_eq!(
+            ExternalControlAction::Toggle.resolve(AppState::Idle, false),
+            ExternalControlOutcome::Disabled
         );
         // Regression: a recording started in done mode (hotkey, MCP, or URL
         // scheme) must stop on the next toggle instead of being a no-op.

@@ -1,3 +1,9 @@
+//! Thread-safe runtime status snapshots for MCP `get_status` and similar probes.
+//!
+//! [`RuntimeStatusHandle`] mirrors tray [`IndicatorState`] and permission
+//! preflight results into a serde-friendly [`RuntimeStatusSnapshot`] without
+//! touching the recorder coordinator.
+
 use std::sync::{Arc, Mutex};
 
 use muninn::{IndicatorState, PermissionPreflightStatus, PermissionStatus};
@@ -6,6 +12,7 @@ use tracing::warn;
 
 use crate::logging::TARGET_RUNTIME;
 
+/// JSON-serializable runtime status returned by MCP `get_status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RuntimeStatusSnapshot {
     pub state: RuntimeStatusState,
@@ -16,16 +23,23 @@ pub(crate) struct RuntimeStatusSnapshot {
     pub failure: Option<RuntimeFailureSnapshot>,
 }
 
+/// High-level runtime state derived from indicator, permissions, and failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RuntimeStatusState {
+    /// Ready to accept a recording start; not busy and permissions allow capture.
     Idle,
+    /// Microphone capture is active.
     RecordingActive,
+    /// Missing credentials indicator or a required permission blocks recording.
     PermissionBlocked,
+    /// Pipeline or post-capture work is in progress without an active recording.
     AlreadyRunning,
+    /// A runtime failure was recorded; see [`RuntimeStatusSnapshot::failure`].
     Failed,
 }
 
+/// Permission preflight snapshot exposed to external status clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RuntimePermissionSnapshot {
     pub microphone: RuntimePermissionStatus,
@@ -33,6 +47,7 @@ pub(crate) struct RuntimePermissionSnapshot {
     pub input_monitoring: RuntimePermissionStatus,
 }
 
+/// macOS permission status for a single capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RuntimePermissionStatus {
@@ -43,11 +58,13 @@ pub(crate) enum RuntimePermissionStatus {
     Unsupported,
 }
 
+/// Last reported runtime failure message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct RuntimeFailureSnapshot {
     pub message: String,
 }
 
+/// Shared, mutex-protected source of [`RuntimeStatusSnapshot`] values.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeStatusHandle {
     inner: Arc<Mutex<RuntimeStatusInner>>,
@@ -61,6 +78,7 @@ struct RuntimeStatusInner {
 }
 
 impl RuntimeStatusHandle {
+    /// Create a handle with idle indicator state and the given permission preflight.
     pub(crate) fn new(permissions: PermissionPreflightStatus) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RuntimeStatusInner {
@@ -71,10 +89,14 @@ impl RuntimeStatusHandle {
         }
     }
 
+    /// Build the current [`RuntimeStatusSnapshot`] for external clients.
     pub(crate) fn snapshot(&self) -> RuntimeStatusSnapshot {
         self.with_inner(snapshot_from_inner)
     }
 
+    /// Update the mirrored tray indicator state.
+    ///
+    /// Clears any stored failure snapshot when the indicator leaves [`IndicatorState::Idle`].
     pub(crate) fn set_indicator_state(&self, state: IndicatorState) {
         self.with_inner_mut("set_indicator_state", |inner| {
             inner.indicator_state = state;
@@ -84,12 +106,14 @@ impl RuntimeStatusHandle {
         });
     }
 
+    /// Replace the cached permission preflight snapshot.
     pub(crate) fn set_permissions(&self, permissions: PermissionPreflightStatus) {
         self.with_inner_mut("set_permissions", |inner| {
             inner.permissions = permissions;
         });
     }
 
+    /// Record a runtime failure and reset the indicator to idle.
     pub(crate) fn set_failure(&self, message: String) {
         self.with_inner_mut("set_failure", |inner| {
             inner.indicator_state = IndicatorState::Idle;

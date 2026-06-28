@@ -1,3 +1,10 @@
+//! Menu-bar tray icon and main-thread indicator bridge.
+//!
+//! [`TrayIconEvent`] callbacks arrive on an arbitrary thread; the bridge
+//! re-posts them as [`UserEvent::TrayEvent`] on the tao loop.
+//! [`EventLoopIndicator`] implements [`IndicatorAdapter`] by caching state on the
+//! worker thread and forwarding appearance updates to the main thread.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,27 +19,38 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEv
 use crate::external_control::ExternalControlAction;
 use crate::logging;
 
+/// Custom tao user events handled on the main thread.
 #[derive(Debug, Clone)]
 pub(crate) enum UserEvent {
+    /// Tray icon click or other menu-bar interaction.
     TrayEvent(TrayIconEvent),
+    /// Indicator glyph or color changed; refresh the tray icon.
     IndicatorUpdated {
         state: IndicatorState,
         glyph: Option<char>,
     },
+    /// Frontmost-app context changed; refresh idle preview glyph.
     PreviewContextUpdated(TargetContextSnapshot),
+    /// Config file reload succeeded; shell applies tray/MCP settings locally.
     ConfigReloaded(Box<AppConfig>),
+    /// Config file reload failed; previous config remains active.
     ConfigReloadFailed(String),
+    /// Retry delivering a config reload that filled the runtime message queue.
     RetryPendingConfigReload,
+    /// Runtime worker thread exited with an error.
     RuntimeFailure(String),
+    /// MCP or `muninn://` URL scheme action forwarded from external control.
     ExternalControl(ExternalControlAction),
 }
 
+/// Forward [`TrayIconEvent`] callbacks onto the tao event loop as [`UserEvent`].
 pub(crate) fn install_tray_event_bridge(proxy: EventLoopProxy<UserEvent>) {
     TrayIconEvent::set_event_handler(Some(move |event| {
         send_user_event(&proxy, UserEvent::TrayEvent(event), "tray_event_bridge");
     }));
 }
 
+/// Post a [`UserEvent`] to the main thread; returns false when the loop is gone.
 pub(crate) fn send_user_event(
     proxy: &EventLoopProxy<UserEvent>,
     event: UserEvent,
@@ -47,6 +65,7 @@ pub(crate) fn send_user_event(
     }
 }
 
+/// Build the Muninn menu-bar tray icon with the initial indicator image.
 pub(crate) fn build_tray_icon(icon: Icon) -> Result<tray_icon::TrayIcon> {
     TrayIconBuilder::new()
         .with_icon(icon)
@@ -55,6 +74,10 @@ pub(crate) fn build_tray_icon(icon: Icon) -> Result<tray_icon::TrayIcon> {
         .context("creating menu bar tray icon")
 }
 
+/// Refresh tray icon and tooltip for the current indicator and preview glyphs.
+///
+/// Honors `indicator.show_recording` and `indicator.show_processing` by
+/// collapsing hidden busy states back to idle appearance.
 pub(crate) fn update_tray_appearance(
     tray_icon: &tray_icon::TrayIcon,
     state: IndicatorState,
@@ -96,6 +119,7 @@ pub(crate) fn map_tray_event(event: &TrayIconEvent) -> Option<ExternalControlAct
     }
 }
 
+/// [`IndicatorAdapter`] that mirrors state on the worker thread and updates the tray on the main thread.
 #[derive(Clone)]
 pub(crate) struct EventLoopIndicator {
     proxy: EventLoopProxy<UserEvent>,
@@ -105,6 +129,7 @@ pub(crate) struct EventLoopIndicator {
 }
 
 impl EventLoopIndicator {
+    /// Create an indicator bridge bound to the given event-loop proxy.
     pub(crate) fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
         Self {
             proxy,
@@ -264,6 +289,7 @@ impl IndicatorAdapter for EventLoopIndicator {
     }
 }
 
+/// Build a menu-bar RGBA icon for the given indicator state and glyphs.
 pub(crate) fn indicator_icon(
     state: IndicatorState,
     active_glyph: Option<char>,
@@ -323,6 +349,10 @@ pub(crate) fn indicator_icon(
     .context("building indicator icon")
 }
 
+/// Resolve which glyph to paint for an indicator state.
+///
+/// Idle prefers the contextual preview glyph; busy states prefer the frozen
+/// utterance glyph. [`IndicatorState::MissingCredentials`] always uses `?`.
 pub(crate) fn resolved_indicator_glyph(
     state: IndicatorState,
     active_glyph: Option<char>,
@@ -410,9 +440,12 @@ fn menu_bar_icon_rgba(
     rgba
 }
 
+/// Pixel glyph drawn inside the circular menu-bar indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IndicatorGlyph {
+    /// Voice or default letter glyph for the current state.
     Letter(char),
+    /// Reserved `?` glyph for missing provider credentials.
     Question,
 }
 

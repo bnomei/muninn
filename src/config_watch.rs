@@ -1,3 +1,9 @@
+//! Background pollers that detect config file changes and frontmost-window context shifts.
+//!
+//! Watchers run on dedicated threads and forward [`UserEvent::ConfigReloaded`],
+//! [`UserEvent::ConfigReloadFailed`], and [`UserEvent::PreviewContextUpdated`] into the
+//! tao event loop via [`EventLoopProxy`].
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -15,6 +21,11 @@ const PREVIEW_CONTEXT_POLL_MIN_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(400);
 const PREVIEW_CONTEXT_POLL_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Poll the config file on a background thread and hot-reload validated [`AppConfig`] changes.
+///
+/// Uses metadata fingerprinting before reading file contents, then posts
+/// [`UserEvent::ConfigReloaded`] or [`UserEvent::ConfigReloadFailed`] to the event loop.
+/// Poll interval backs off when idle and resets after a detected change.
 pub fn spawn_config_watcher(config_path: PathBuf, proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
         logging::log_watcher_started("config", Some(config_path.as_path()));
@@ -99,6 +110,10 @@ pub fn spawn_config_watcher(config_path: PathBuf, proxy: EventLoopProxy<UserEven
     });
 }
 
+/// Poll frontmost-app context on a background thread for indicator preview updates.
+///
+/// Posts [`UserEvent::PreviewContextUpdated`] when bundle id, app name, or window title
+/// changes. Poll interval backs off when the context is stable.
 pub fn spawn_preview_context_watcher(proxy: EventLoopProxy<UserEvent>) {
     std::thread::spawn(move || {
         logging::log_watcher_started("preview_context", None::<&Path>);
@@ -143,6 +158,7 @@ fn next_poll_interval(
     std::time::Duration::from_millis(capped_ms as u64)
 }
 
+/// Stable comparison key for [`TargetContextSnapshot`] preview polling.
 pub(crate) fn preview_context_key(
     context: &TargetContextSnapshot,
 ) -> (Option<String>, Option<String>, Option<String>) {
@@ -153,13 +169,17 @@ pub(crate) fn preview_context_key(
     )
 }
 
+/// Cheap metadata fingerprint used before reading config file contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigFingerprint {
+    /// Config path does not exist.
     Missing,
+    /// File size and modification time observed from metadata.
     Metadata {
         modified_at: Option<SystemTime>,
         len: u64,
     },
+    /// Metadata could not be read (permissions, I/O error, etc.).
     Unreadable(String),
 }
 
@@ -170,6 +190,7 @@ enum ConfigSnapshot {
     Unreadable(String),
 }
 
+/// Read the current [`ConfigFingerprint`] for a config path without loading TOML.
 pub(crate) fn read_config_fingerprint(path: &Path) -> ConfigFingerprint {
     match fs::metadata(path) {
         Ok(metadata) => ConfigFingerprint::Metadata {

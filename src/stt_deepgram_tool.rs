@@ -1,3 +1,9 @@
+//! Builtin Deepgram STT pipeline step.
+//!
+//! Uploads `audio.wav_path` to the Deepgram listen REST API and writes
+//! `transcript.raw_text`. Runnable as a subprocess internal tool or in-process
+//! via [`process_input_in_process`].
+
 use muninn::resolve_secret;
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
@@ -20,6 +26,7 @@ const DEFAULT_ENDPOINT: &str = "https://api.deepgram.com/v1/listen";
 const DEFAULT_MODEL: &str = "nova-3";
 const DEFAULT_LANGUAGE: &str = "en";
 
+/// Deepgram step failure surfaced to the pipeline runner or internal-tool stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
     code: &'static str,
@@ -34,6 +41,7 @@ impl CliError {
         }
     }
 
+    /// Serialize the error as JSON for subprocess stderr consumers.
     pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
@@ -44,6 +52,7 @@ impl CliError {
         .to_string()
     }
 
+    /// Borrow the human-readable error message.
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -103,6 +112,10 @@ enum PreparedEnvelope {
     NeedsTranscription(PreparedTranscriptionRequest),
 }
 
+/// Entry point for `muninn __internal_step stt_deepgram` subprocess invocation.
+///
+/// Reads a [`MuninnEnvelopeV1`] from stdin and writes the updated envelope to
+/// stdout; failures log and emit JSON on stderr before returning failure.
 pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -180,6 +193,7 @@ where
     }
 }
 
+/// Run Deepgram STT inside the pipeline process using resolved builtin configuration.
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
     config: &ResolvedBuiltinStepConfig,

@@ -1,3 +1,9 @@
+//! Post-recording pipeline orchestration and live config reload.
+//!
+//! Builds the [`PipelineRunner`], maps indicator stages to transcription versus
+//! refine steps, and performs injection after [`Orchestrator::route_injection`].
+//! Runs on the runtime worker thread.
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -19,15 +25,26 @@ use uuid::Uuid;
 use crate::replay_dispatch::ReplayPersistenceService;
 use crate::{internal_tools, logging};
 
+/// Inputs required to run the pipeline and inject routed text for one utterance.
 pub(crate) struct ProcessingContext<'a> {
+    /// Profile, voice, and effective config resolved at capture time.
     pub(crate) resolved: &'a ResolvedUtteranceConfig,
+    /// Pipeline steps and deadline for this utterance.
     pub(crate) pipeline: &'a PipelineConfig,
+    /// Step executor bound to builtin in-process tools.
     pub(crate) runner: &'a PipelineRunner,
+    /// macOS accessibility text injector.
     pub(crate) injector: &'a MacosTextInjector,
+    /// Background replay writer that may take ownership of the temp WAV.
     pub(crate) replay_persist: &'a ReplayPersistenceService,
+    /// Optional streaming STT outcome merged into the envelope before the pipeline runs.
     pub(crate) streaming_outcome: Option<StreamingTranscriptOutcome>,
 }
 
+/// Run the pipeline, persist replay, inject text, and return to idle.
+///
+/// Refreshes Accessibility permission before injection. Deletes the temporary WAV
+/// unless replay persistence queued successfully.
 pub(crate) async fn process_and_inject<I>(
     context: ProcessingContext<'_>,
     indicator: &mut I,
@@ -45,6 +62,7 @@ where
         replay_persist,
         streaming_outcome,
     } = context;
+    let mut worker_owns_wav = false;
     let result = async {
         let envelope = build_envelope(resolved, recorded, streaming_outcome);
         let mut outcome = run_pipeline_with_indicator_stages(
@@ -73,7 +91,8 @@ where
         let missing_credentials_feedback = should_show_missing_credentials_feedback(&outcome);
         let permissions = MacosPermissionsAdapter::new();
 
-        replay_persist.enqueue(replay_config, envelope, outcome, route, replay_recorded);
+        worker_owns_wav =
+            replay_persist.enqueue(replay_config, envelope, outcome, route, replay_recorded);
 
         *state = state.on_event(AppEvent::ProcessingFinished);
 
@@ -141,7 +160,9 @@ where
     .await;
 
     *state = state.on_event(AppEvent::InjectionFinished);
-    cleanup_recording_file(&recorded.wav_path);
+    if !worker_owns_wav {
+        cleanup_recording_file(&recorded.wav_path);
+    }
     result?;
     let indicator_state = indicator
         .state()
@@ -159,6 +180,7 @@ where
     Ok(())
 }
 
+/// Indicator shown immediately after recording stops, before the pipeline runs.
 pub(crate) fn initial_processing_indicator(pipeline: &PipelineConfig) -> IndicatorState {
     match pipeline.steps.first() {
         Some(step) if internal_tools::is_transcription_step(step) => IndicatorState::Transcribing,
@@ -166,6 +188,7 @@ pub(crate) fn initial_processing_indicator(pipeline: &PipelineConfig) -> Indicat
     }
 }
 
+/// Clone configured pipeline steps and resolve builtin or sibling-binary commands.
 pub(crate) fn resolve_pipeline_config(config: &AppConfig) -> Result<PipelineConfig> {
     let mut pipeline = config.pipeline.clone();
     for step in &mut pipeline.steps {
@@ -177,6 +200,7 @@ pub(crate) fn resolve_pipeline_config(config: &AppConfig) -> Result<PipelineConf
     Ok(pipeline)
 }
 
+/// Build a [`PipelineRunner`] with the in-process builtin step executor.
 pub(crate) fn build_pipeline_runner(
     strict_step_contract: bool,
     builtin_steps: ResolvedBuiltinStepConfig,
@@ -187,6 +211,10 @@ pub(crate) fn build_pipeline_runner(
     )
 }
 
+/// Apply a reloaded [`AppConfig`] to the worker's pipeline state.
+///
+/// Hotkey changes are detected, logged, and discarded; restart Muninn to pick
+/// up new bindings.
 pub(crate) fn apply_live_config_reload(
     current_config: &mut AppConfig,
     pipeline: &mut PipelineConfig,
@@ -219,6 +247,7 @@ pub(crate) fn apply_live_config_reload(
     Ok(())
 }
 
+/// Whether the tray should flash the missing-credentials `?` indicator.
 pub(crate) fn should_show_missing_credentials_feedback(outcome: &PipelineOutcome) -> bool {
     outcome_contains_missing_credential_error(outcome)
         || outcome_trace_contains_missing_credential_error(outcome)
@@ -545,7 +574,8 @@ fn resolve_step_command(cmd: &str) -> Result<String> {
     Ok(cmd.to_string())
 }
 
-fn cleanup_recording_file(path: &Path) {
+/// Best-effort delete of a temporary capture WAV file.
+pub(crate) fn cleanup_recording_file(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
         warn!(
             target: logging::TARGET_RECORDING,

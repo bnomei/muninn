@@ -1,3 +1,10 @@
+//! Registry and dispatch for Muninn builtin pipeline steps.
+//!
+//! Maps canonical step command names (STT providers and `refine`) onto
+//! in-process executors and `__internal_step` subprocess entry points. Pipeline
+//! configuration rewrites builtin commands to envelope-json I/O before the
+//! [`muninn::PipelineRunner`] runs.
+
 use std::process::ExitCode;
 
 use anyhow::Result;
@@ -15,23 +22,34 @@ use crate::{
 
 const INTERNAL_STEP_MARKER: &str = "__internal_step";
 
+/// High-level category for a builtin pipeline step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinStepKind {
+    /// Speech-to-text provider step.
     Transcription,
+    /// Post-transcription transform such as refine.
     Transform,
 }
 
+/// Canonical builtin steps recognized by command name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinStep {
+    /// Apple Speech on-device STT.
     SttAppleSpeech,
+    /// Local whisper.cpp STT.
     SttWhisperCpp,
+    /// Deepgram cloud STT.
     SttDeepgram,
+    /// OpenAI cloud STT.
     SttOpenAi,
+    /// Google cloud STT.
     SttGoogle,
+    /// LLM transcript refinement.
     Refine,
 }
 
 impl BuiltinStep {
+    /// Pipeline `cmd` string for this builtin step.
     pub const fn canonical_name(self) -> &'static str {
         match self {
             Self::SttAppleSpeech => "stt_apple_speech",
@@ -43,6 +61,7 @@ impl BuiltinStep {
         }
     }
 
+    /// Return whether this step is transcription or transform.
     pub const fn kind(self) -> BuiltinStepKind {
         match self {
             Self::SttAppleSpeech
@@ -54,10 +73,12 @@ impl BuiltinStep {
         }
     }
 
+    /// True when this step is an STT provider rather than a transform.
     pub const fn is_transcription(self) -> bool {
         matches!(self.kind(), BuiltinStepKind::Transcription)
     }
 
+    /// Dispatch subprocess `__internal_step` execution for this builtin.
     pub fn run_as_internal_tool(self) -> ExitCode {
         match self {
             Self::SttAppleSpeech => stt_apple_speech_tool::run_as_internal_tool(),
@@ -97,12 +118,14 @@ impl BuiltinStep {
     }
 }
 
+/// [`InProcessStepExecutor`] that runs registered builtin steps in-process.
 #[derive(Debug, Clone)]
 pub struct BuiltinStepExecutor {
     config: ResolvedBuiltinStepConfig,
 }
 
 impl BuiltinStepExecutor {
+    /// Build an executor with resolved builtin-step configuration.
     pub fn new(config: ResolvedBuiltinStepConfig) -> Self {
         Self { config }
     }
@@ -120,6 +143,9 @@ impl InProcessStepExecutor for BuiltinStepExecutor {
     }
 }
 
+/// Handle `muninn __internal_step <name>` CLI dispatch when args match.
+///
+/// Returns `None` when `args` are not an internal-step invocation.
 pub fn maybe_handle_internal_step(args: &[String]) -> Option<ExitCode> {
     if args.get(1).map(String::as_str) != Some(INTERNAL_STEP_MARKER) {
         return None;
@@ -138,6 +164,10 @@ pub fn maybe_handle_internal_step(args: &[String]) -> Option<ExitCode> {
     Some(tool.run_as_internal_tool())
 }
 
+/// Normalize a builtin `step.cmd` to its canonical name and envelope-json I/O.
+///
+/// Returns `Ok(true)` when the command was rewritten, `Ok(false)` for external
+/// commands left unchanged.
 pub fn rewrite_internal_tool_step(step: &mut PipelineStepConfig) -> Result<bool> {
     let Some(tool) = lookup_builtin_step(&step.cmd) else {
         return Ok(false);
@@ -148,10 +178,12 @@ pub fn rewrite_internal_tool_step(step: &mut PipelineStepConfig) -> Result<bool>
     Ok(true)
 }
 
+/// True when `step.cmd` names a builtin STT provider.
 pub fn is_transcription_step(step: &PipelineStepConfig) -> bool {
     lookup_builtin_step(&step.cmd).is_some_and(BuiltinStep::is_transcription)
 }
 
+/// Resolve a pipeline command string to a [`BuiltinStep`] when recognized.
 pub fn lookup_builtin_step(raw: &str) -> Option<BuiltinStep> {
     if let Some(provider) = TranscriptionProvider::lookup_step_name(raw) {
         return Some(match provider {

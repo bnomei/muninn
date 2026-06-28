@@ -1,32 +1,48 @@
+//! Step stdin/stdout codec for [`MuninnEnvelopeV1`] pipeline I/O modes.
+//!
+//! [`StepIoMode::EnvelopeJson`] round-trips full envelopes; [`StepIoMode::TextFilter`]
+//! (and [`StepIoMode::Auto`], resolved to text filter) reads and writes plain text
+//! against `output.final_text` or `transcript.raw_text`. Used by [`super::execution`].
+
 use crate::config::{PipelineStepConfig, StepIoMode};
 use crate::envelope::MuninnEnvelopeV1;
 use serde_json::Value;
 
+/// How decoded step stdout should be reflected in pipeline trace policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DecodeDisposition {
+    /// Step output replaced or updated the envelope normally.
     Normal,
+    /// Non-strict mode preserved the input envelope after invalid stdout.
     ContractBypass,
 }
 
+/// Decoded step stdout paired with contract disposition metadata.
 #[derive(Debug)]
 pub(super) struct DecodedStepOutput {
     pub(super) envelope: MuninnEnvelopeV1,
     pub(super) disposition: DecodeDisposition,
 }
 
+/// Codec failure category mapped to [`super::StepFailureKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum CodecErrorKind {
+    /// Input envelope serialization failed.
     SerializeInput,
+    /// Stdout was not valid for the configured I/O mode.
     InvalidStdout,
+    /// Envelope-json stdout failed [`MuninnEnvelopeV1`] deserialization.
     InvalidEnvelope,
 }
 
+/// Codec-layer error with a caller-facing message.
 #[derive(Debug)]
 pub(super) struct CodecError {
     pub(super) kind: CodecErrorKind,
     pub(super) message: String,
 }
 
+/// Serialize `input_envelope` for step stdin according to `step.io_mode`.
 pub(super) fn encode_step_input(
     step: &PipelineStepConfig,
     input_envelope: &MuninnEnvelopeV1,
@@ -43,6 +59,11 @@ pub(super) fn encode_step_input(
     }
 }
 
+/// Parse step stdout into the next envelope for the configured I/O mode.
+///
+/// When `strict_step_contract` is false, invalid envelope-json stdout returns
+/// the input envelope with [`DecodeDisposition::ContractBypass`] instead of
+/// failing.
 pub(super) fn decode_step_output(
     step: &PipelineStepConfig,
     input_envelope: MuninnEnvelopeV1,

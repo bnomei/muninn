@@ -1,4 +1,17 @@
-use std::path::PathBuf;
+//! tao event-loop shell for the Muninn menu-bar runtime.
+//!
+//! Owns the main-thread [`tao`] loop, tray icon lifecycle, and forwarding of
+//! [`UserEvent`] messages into the background [`RuntimeWorker`]. On macOS the
+//! process runs as an accessory app (no dock icon). URL-scheme and MCP handlers
+//! register on this thread *before* the loop starts.
+
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::{Context, Result};
 use muninn::{
@@ -21,6 +34,7 @@ use crate::{config_watch, logging};
 
 const CONFIG_RELOAD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Loaded configuration and startup permission snapshot for the menu-bar runtime.
 pub(crate) struct AppRuntime {
     config_path: PathBuf,
     config: AppConfig,
@@ -29,6 +43,10 @@ pub(crate) struct AppRuntime {
 }
 
 impl AppRuntime {
+    /// Validate platform support, run macOS permission preflight, and build runtime state.
+    ///
+    /// Uses a short-lived current-thread Tokio runtime on the calling thread so
+    /// permission adapters can run before the tao event loop starts.
     pub(crate) fn new(config_path: PathBuf, config: AppConfig) -> Result<Self> {
         let platform = detect_platform();
         ensure_supported_platform().with_context(|| {
@@ -51,6 +69,11 @@ impl AppRuntime {
         })
     }
 
+    /// Run the main-thread tao event loop until the process exits.
+    ///
+    /// Spawns the [`RuntimeWorker`], config watchers, and optional MCP server on
+    /// `StartCause::Init`. Tray, indicator, and config-reload [`UserEvent`]
+    /// updates are handled here; recording state lives on the worker thread.
     pub(crate) fn run(self) -> Result<()> {
         let mut event_loop_builder = EventLoopBuilder::<UserEvent>::with_user_event();
         let mut event_loop = event_loop_builder.build();
@@ -69,7 +92,10 @@ impl AppRuntime {
         // applicationWillFinishLaunching, earlier than StartCause::Init, so the
         // observer set up here must already be in place to catch cold-launch URLs.
         #[cfg(target_os = "macos")]
-        if self.config.external_control.url_scheme_enabled {
+        {
+            crate::external_control::set_url_scheme_enabled(
+                self.config.external_control.url_scheme_enabled,
+            );
             crate::external_control::install_url_scheme_handler(proxy.clone());
         }
 
@@ -97,6 +123,9 @@ impl AppRuntime {
         let mut last_indicator_state = IndicatorState::Idle;
         let mut last_active_glyph = None;
         let runtime_status = crate::external_control::RuntimeStatusHandle::new(preflight);
+        let mcp_start_recording_enabled = Arc::new(AtomicBool::new(
+            current_config.external_control.start_recording_enabled,
+        ));
 
         event_loop.run(move |event, _, control_flow| {
             *control_flow = ControlFlow::Wait;
@@ -137,7 +166,7 @@ impl AppRuntime {
                             proxy.clone(),
                             current_config.external_control.mcp_bind_address.clone(),
                             runtime_status.clone(),
-                            current_config.external_control.start_recording_enabled,
+                            mcp_start_recording_enabled.clone(),
                         );
                     }
                 }
@@ -215,6 +244,14 @@ impl AppRuntime {
                 }
                 Event::UserEvent(UserEvent::ConfigReloaded(config)) => {
                     current_config = (*config).clone();
+                    mcp_start_recording_enabled.store(
+                        current_config.external_control.start_recording_enabled,
+                        Ordering::SeqCst,
+                    );
+                    #[cfg(target_os = "macos")]
+                    crate::external_control::set_url_scheme_enabled(
+                        current_config.external_control.url_scheme_enabled,
+                    );
                     indicator_config = current_config.indicator.clone();
                     preview_selection = current_config.resolve_profile_selection(&preview_context);
                     crate::sync_os_autostart(&config_path, &current_config);

@@ -1,3 +1,10 @@
+//! macOS TCC permission refresh before recording and injection.
+//!
+//! Hotkey recording requires Input Monitoring; tray and external controls use a
+//! lighter recording preflight. Recording prompts abort the active start gesture
+//! so the user retries with stable permissions; injection proceeds immediately
+//! when Accessibility is granted during its refresh.
+
 use anyhow::{anyhow, Result};
 use muninn::{PermissionKind, PermissionPreflightStatus, PermissionStatus, PermissionsAdapter};
 use tracing::{info, warn};
@@ -14,20 +21,29 @@ where
         .map_err(|error| anyhow!(error))
 }
 
+/// Outcome of a recording permission refresh triggered by a user gesture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RecordingPermissionRefresh {
+    /// Permission snapshot after any prompts completed.
     pub(crate) preflight: PermissionPreflightStatus,
+    /// Whether a microphone access prompt was shown during this refresh.
     pub(crate) requested_microphone: bool,
+    /// Whether an Input Monitoring prompt was shown during this refresh.
     pub(crate) requested_input_monitoring: bool,
 }
 
+/// Surface that initiated a recording start request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordingStartSource {
+    /// Global hotkey listener; requires Input Monitoring when not already granted.
     Hotkey,
+    /// Menu-bar tray click; does not bootstrap Input Monitoring on first use.
     Tray,
+    /// MCP or `muninn://` external control action.
     External,
 }
 
+/// Stable log label for a [`RecordingStartSource`].
 pub(crate) fn recording_source_name(source: RecordingStartSource) -> &'static str {
     match source {
         RecordingStartSource::Hotkey => "hotkey",
@@ -36,6 +52,10 @@ pub(crate) fn recording_source_name(source: RecordingStartSource) -> &'static st
     }
 }
 
+/// Prompt for missing recording permissions appropriate to the start source.
+///
+/// Microphone is requested for all sources. Input Monitoring prompts run only
+/// for hotkey starts.
 pub(crate) async fn refresh_recording_permissions_for_user_action<A>(
     permissions: &A,
     source: RecordingStartSource,
@@ -86,12 +106,16 @@ where
     })
 }
 
+/// Outcome of an injection permission refresh triggered before text output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InjectionPermissionRefresh {
+    /// Permission snapshot after any prompts completed.
     pub(crate) preflight: PermissionPreflightStatus,
+    /// Whether an Accessibility prompt was shown during this refresh.
     pub(crate) requested_accessibility: bool,
 }
 
+/// Prompt for Accessibility access when injection is about to run.
 pub(crate) async fn refresh_injection_permissions_for_user_action<A>(
     permissions: &A,
 ) -> Result<InjectionPermissionRefresh>
@@ -124,6 +148,12 @@ where
     })
 }
 
+/// Whether to cancel this recording start after a permission refresh.
+///
+/// Aborts when required permissions are still missing, or when a prompt fired
+/// during this gesture so the user can retry with stable TCC state. Input
+/// Monitoring is only prompted for hotkey starts, and hotkey Input Monitoring
+/// prompts always abort.
 pub(crate) fn should_abort_recording_start(
     preflight: PermissionPreflightStatus,
     requested_microphone: bool,
@@ -195,19 +225,24 @@ fn log_recording_start_block(
     );
 }
 
+/// Whether to skip injection after a permission refresh.
+///
+/// Proceeds when Accessibility is granted, including immediately after a
+/// successful prompt. Aborts when injection permissions remain blocked.
 pub(crate) fn should_abort_injection(
     preflight: PermissionPreflightStatus,
     requested_accessibility: bool,
 ) -> bool {
     match ensure_injection_allowed(preflight) {
-        Ok(()) if requested_accessibility => {
-            info!(
-                target: logging::TARGET_RUNTIME,
-                "Accessibility access changed during this interaction; retry the injection action"
-            );
-            true
+        Ok(()) => {
+            if requested_accessibility {
+                info!(
+                    target: logging::TARGET_RUNTIME,
+                    "Accessibility access was granted during this interaction; proceeding with injection"
+                );
+            }
+            false
         }
-        Ok(()) => false,
         Err(error) => {
             log_injection_block(preflight, &error);
             true
@@ -238,6 +273,7 @@ fn log_injection_block(preflight: PermissionPreflightStatus, error: &anyhow::Err
     );
 }
 
+/// Validate that recording may start for the given source and preflight snapshot.
 pub(crate) fn ensure_recording_can_start(
     preflight: PermissionPreflightStatus,
     source: RecordingStartSource,

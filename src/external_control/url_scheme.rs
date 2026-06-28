@@ -8,6 +8,7 @@
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
@@ -26,6 +27,16 @@ const INTERNET_EVENT_CLASS: u32 = 0x4755_524C; // 'GURL'
 const AE_GET_URL: u32 = 0x4755_524C; // 'GURL'
 
 static PROXY: OnceLock<EventLoopProxy<UserEvent>> = OnceLock::new();
+
+static URL_SCHEME_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable handling of incoming `muninn://` URLs.
+///
+/// When false, parsed URLs are logged and dropped so automation can be turned
+/// off via `external_control.url_scheme_enabled` without unregistering the handler.
+pub(crate) fn set_url_scheme_enabled(enabled: bool) {
+    URL_SCHEME_ENABLED.store(enabled, Ordering::SeqCst);
+}
 
 define_class!(
     // SAFETY:
@@ -60,6 +71,14 @@ fn handle_get_url_event(event: *mut AnyObject) {
         warn!(target: TARGET_RUNTIME, %url, "ignored unrecognized muninn:// URL");
         return;
     };
+    if !URL_SCHEME_ENABLED.load(Ordering::SeqCst) {
+        warn!(
+            target: TARGET_RUNTIME,
+            %url,
+            "ignored muninn:// URL because external_control.url_scheme_enabled is false"
+        );
+        return;
+    }
     let Some(proxy) = PROXY.get() else {
         warn!(target: TARGET_RUNTIME, "muninn:// handler invoked before proxy was installed");
         return;

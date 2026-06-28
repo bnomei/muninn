@@ -1,7 +1,20 @@
+//! Secret resolution with environment-variable precedence over config.
+//!
+//! Whitespace-only values are treated as absent so empty strings do not
+//! override a fallback source.
+
+/// Resolve a secret from an environment value, falling back to config.
+///
+/// The environment value wins when present and non-empty after trimming.
+/// Whitespace-only strings in either source are ignored.
 pub fn resolve_secret(env_value: Option<String>, config_value: Option<String>) -> Option<String> {
     normalize_secret(env_value).or_else(|| normalize_secret(config_value))
 }
 
+/// Resolve a secret from `env_key`, falling back to config.
+///
+/// Reads the named environment variable at call time and applies the same
+/// precedence rules as [`resolve_secret`].
 pub fn resolve_secret_from_env(env_key: &str, config_value: Option<String>) -> Option<String> {
     let env_value = std::env::var(env_key).ok();
     resolve_secret(env_value, config_value)

@@ -1,23 +1,47 @@
+//! Recording-runtime state machine shared by hotkeys, tray, and external control.
+//!
+//! [`AppState::on_event`] is the single transition table. Invalid event/state
+//! pairs leave the state unchanged; processing and injecting ignore new
+//! recording triggers until the pipeline finishes.
+
+/// High-level capture and pipeline phase tracked by the runtime coordinator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppState {
+    /// No active capture and no pipeline work in flight.
     Idle,
+    /// Push-to-talk capture; release ends recording and enters processing.
     RecordingPushToTalk,
+    /// Done-mode capture; a second done toggle ends recording and enters processing.
     RecordingDone,
+    /// Transcription and refinement running after capture ends.
     Processing,
+    /// Final text is being injected into the focused target.
     Injecting,
 }
 
+/// Input events that drive [`AppState`] transitions from hotkeys, tray, and
+/// external control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
+    /// Begin or continue push-to-talk capture.
     PttPressed,
+    /// End push-to-talk capture and start processing.
     PttReleased,
+    /// Toggle done-mode capture on or off.
     DoneTogglePressed,
+    /// Discard the active capture without running the pipeline.
     CancelPressed,
+    /// Pipeline finished; move to injection.
     ProcessingFinished,
+    /// Injection finished; return to idle.
     InjectionFinished,
 }
 
 impl AppState {
+    /// Apply an [`AppEvent`] and return the next state.
+    ///
+    /// Unhandled combinations are a no-op and return `self`. While processing
+    /// or injecting, recording triggers are ignored until the pipeline completes.
     #[must_use]
     pub const fn on_event(self, event: AppEvent) -> Self {
         use AppEvent::*;

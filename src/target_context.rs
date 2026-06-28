@@ -1,6 +1,16 @@
+//! Frontmost-application snapshot for profile matching and replay metadata.
+//!
+//! On macOS, reads the active app via `NSWorkspace` and best-effort window
+//! title via `CGWindowListCopyWindowInfo`. On other targets, returns an empty
+//! snapshot with a timestamp only.
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+/// Point-in-time description of the focused application and window.
+///
+/// Serialized into utterance metadata and used as a profile-matching key.
+/// Missing fields mean the value could not be read or was blank after trimming.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct TargetContextSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -13,6 +23,7 @@ pub struct TargetContextSnapshot {
 }
 
 impl TargetContextSnapshot {
+    /// Empty context fields with `captured_at` set to the current UTC timestamp.
     #[must_use]
     pub fn empty_now() -> Self {
         Self {
@@ -24,6 +35,12 @@ impl TargetContextSnapshot {
     }
 }
 
+/// Capture the frontmost application context for the current platform.
+///
+/// On macOS, queries `NSWorkspace` for bundle ID and localized name, then
+/// scans on-screen windows for a title owned by the frontmost PID. Prefers a
+/// layer-0 window title when multiple windows match. On non-macOS targets,
+/// returns [`TargetContextSnapshot::empty_now`] without reading the desktop.
 #[must_use]
 pub fn capture_frontmost_target_context() -> TargetContextSnapshot {
     #[cfg(target_os = "macos")]

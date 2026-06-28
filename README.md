@@ -284,7 +284,7 @@ mcp_bind_address = "127.0.0.1:2769"
 Action semantics, shared by both transports:
 - `start` begins recording only when `start_recording_enabled = true`; otherwise the request is rejected, and it is a no-op unless Muninn is idle.
 - `stop` finishes the active recording and runs the transcription pipeline; no-op when idle.
-- `toggle` starts when idle, otherwise stops the active recording.
+- `toggle` starts when idle (subject to the same `start_recording_enabled = true` opt-in as `start`, since starting capture is gated regardless of verb), otherwise stops the active recording.
 - `cancel` discards the active recording without running the pipeline or injecting text.
 
 Recording does not stop on its own. An agent typically calls `start`, and a human ends it with the hotkey, a tray click, or an explicit `stop`/`cancel`. Opting in with `start_recording_enabled = true` is the local trust decision for configured agents and scripts; Muninn does not ask for a repeated interactive confirmation for every external start request after that opt-in.

@@ -1,3 +1,9 @@
+//! Muninn desktop binary entry point.
+//!
+//! Initializes tracing, synchronizes macOS autostart state, and hands off to
+//! [`AppRuntime`] for the tao event loop. `__internal_step` invocations
+//! short-circuit before the menu-bar runtime starts.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -555,9 +561,21 @@ mod tests {
     }
 
     #[test]
-    fn injection_aborts_after_accessibility_prompt_even_when_now_granted() {
-        assert!(should_abort_injection(
+    fn injection_proceeds_after_accessibility_prompt_when_now_granted() {
+        assert!(!should_abort_injection(
             PermissionPreflightStatus::all_granted(),
+            true,
+        ));
+    }
+
+    #[test]
+    fn injection_aborts_after_accessibility_prompt_when_still_denied() {
+        assert!(should_abort_injection(
+            PermissionPreflightStatus {
+                microphone: PermissionStatus::Granted,
+                accessibility: PermissionStatus::Denied,
+                input_monitoring: PermissionStatus::Granted,
+            },
             true,
         ));
     }

@@ -1,3 +1,10 @@
+//! macOS microphone capture via `cpal` and WAV output for the transcription pipeline.
+//!
+//! [`MacosAudioRecorder`] implements [`AudioRecorder`]: it opens the default input
+//! device, buffers PCM in memory, optionally streams resampled frames to a live
+//! transcription sink, and writes a temporary WAV on stop. Capture and file I/O are
+//! macOS-only; other platforms return [`crate::MacosAdapterError::UnsupportedPlatform`].
+
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -27,6 +34,7 @@ const DEFAULT_STREAMING_FRAME_MS: u16 = 100;
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 
+/// macOS `cpal` recorder that buffers input and writes a temp WAV on stop.
 #[derive(Default)]
 pub struct MacosAudioRecorder {
     #[cfg(target_os = "macos")]
@@ -86,6 +94,7 @@ struct CaptureConfigChoice {
 }
 
 impl MacosAudioRecorder {
+    /// Construct a recorder with the given output [`RecordingConfig`].
     #[must_use]
     pub const fn new(output_config: RecordingConfig) -> Self {
         Self {
@@ -97,6 +106,7 @@ impl MacosAudioRecorder {
         }
     }
 
+    /// Replace output recording settings; drops a cached capture engine when idle.
     pub fn set_recording_config(&mut self, output_config: RecordingConfig) {
         let config_changed = self.output_config != output_config;
         self.output_config = output_config;
@@ -106,6 +116,7 @@ impl MacosAudioRecorder {
         }
     }
 
+    /// Set the streaming transcription frame duration used when an audio sink is attached.
     pub fn set_streaming_transcription_config(
         &mut self,
         streaming_config: StreamingTranscriptionConfig,
@@ -113,6 +124,9 @@ impl MacosAudioRecorder {
         self.streaming_frame_ms = streaming_config.frame_ms;
     }
 
+    /// Open the default input device and build a paused capture engine.
+    ///
+    /// macOS only. Useful to pay device-selection cost before the first recording.
     pub async fn warm_up(&mut self) -> MacosAdapterResult<()> {
         #[cfg(target_os = "macos")]
         {
@@ -129,10 +143,19 @@ impl MacosAudioRecorder {
 
 #[async_trait(?Send)]
 impl AudioRecorder for MacosAudioRecorder {
+    /// Begin capture on the default macOS input device.
+    ///
+    /// Delegates to [`AudioRecorder::start_recording_with_audio_sink`] without a
+    /// streaming sink.
     async fn start_recording(&mut self) -> MacosAdapterResult<()> {
         self.start_recording_with_audio_sink(None).await
     }
 
+    /// Begin capture and optionally stream resampled [`AudioFrame`] batches to `sink`.
+    ///
+    /// Rebuilds the `cpal` engine when idle and the default input device or
+    /// [`RecordingConfig`] changed since the last warm-up. Buffered capture is
+    /// capped at three minutes; overflow is flagged on stop.
     async fn start_recording_with_audio_sink(
         &mut self,
         sink: Option<Sender<AudioFrame>>,
@@ -211,6 +234,11 @@ impl AudioRecorder for MacosAudioRecorder {
         }
     }
 
+    /// Pause capture, render a temp WAV, and return [`RecordedAudio`] metadata.
+    ///
+    /// Flushes any partial streaming frame before clearing the sink. When the
+    /// in-memory buffer overflowed, reported duration reflects capped samples
+    /// rather than wall-clock elapsed time.
     async fn stop_recording(&mut self) -> MacosAdapterResult<RecordedAudio> {
         #[cfg(target_os = "macos")]
         {
@@ -317,6 +345,7 @@ impl AudioRecorder for MacosAudioRecorder {
         }
     }
 
+    /// Discard the active capture without writing a WAV file.
     async fn cancel_recording(&mut self) -> MacosAdapterResult<()> {
         #[cfg(target_os = "macos")]
         {

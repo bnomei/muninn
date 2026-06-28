@@ -1,3 +1,11 @@
+//! Sequential pipeline runner for [`MuninnEnvelopeV1`] post-processing steps.
+//!
+//! Each configured [`PipelineStepConfig`] runs against the current envelope,
+//! honoring per-step timeouts, a global [`PipelineConfig::deadline_ms`], and
+//! [`OnErrorPolicy`] recovery. Builtin steps may execute in-process via
+//! [`InProcessStepExecutor`]; all others spawn external commands through
+//! `execution` and `transport`, with stdin/stdout shaped by `codec`.
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,14 +23,23 @@ const MAX_STEP_STDOUT_BYTES: usize = 64 * 1024;
 const MAX_STEP_STDERR_BYTES: usize = 16 * 1024;
 const TRUNCATION_SUFFIX: &str = "\n[truncated]";
 
+/// Executes a configured pipeline and returns a traced [`PipelineOutcome`].
 #[derive(Clone)]
 pub struct PipelineRunner {
     strict_step_contract: bool,
     in_process_step_executor: Option<Arc<dyn InProcessStepExecutor>>,
 }
 
+/// Optional hook for builtin steps that run inside the runner process.
+///
+/// Returns `None` when the step command is not handled in-process, allowing
+/// the runner to fall back to external subprocess execution.
 #[async_trait]
 pub trait InProcessStepExecutor: Send + Sync {
+    /// Attempt in-process execution for `step`.
+    ///
+    /// `None` means the executor does not handle this command; `Some(Err(_))`
+    /// records a step failure with the returned [`InProcessStepError`].
     async fn try_execute(
         &self,
         step: &PipelineStepConfig,
@@ -30,11 +47,16 @@ pub trait InProcessStepExecutor: Send + Sync {
     ) -> Option<Result<MuninnEnvelopeV1, InProcessStepError>>;
 }
 
+/// Failure details surfaced by an in-process step executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InProcessStepError {
+    /// Maps to the same [`StepFailureKind`] taxonomy used for external steps.
     pub kind: StepFailureKind,
+    /// Human-readable failure summary for trace and abort reasons.
     pub message: String,
+    /// Provider stderr captured for diagnostics (often JSON for builtin tools).
     pub stderr: String,
+    /// Simulated exit status when the builtin tool would have exited non-zero.
     pub exit_status: Option<i32>,
 }
 
@@ -48,6 +70,11 @@ impl Default for PipelineRunner {
 }
 
 impl PipelineRunner {
+    /// Build a runner with no in-process executor.
+    ///
+    /// When `strict_step_contract` is false, envelope-json steps that emit
+    /// invalid stdout keep the input envelope and mark
+    /// [`PipelinePolicyApplied::ContractBypass`] instead of failing.
     pub fn new(strict_step_contract: bool) -> Self {
         Self {
             strict_step_contract,
@@ -55,6 +82,7 @@ impl PipelineRunner {
         }
     }
 
+    /// Build a runner that tries `in_process_step_executor` before spawning subprocesses.
     pub fn with_in_process_step_executor(
         strict_step_contract: bool,
         in_process_step_executor: Arc<dyn InProcessStepExecutor>,
@@ -65,6 +93,8 @@ impl PipelineRunner {
         }
     }
 
+    /// Run every step in `config` against `envelope`, stopping early on abort
+    /// policies, fallback policies, or an exhausted global deadline.
     pub async fn run(
         &self,
         envelope: MuninnEnvelopeV1,
@@ -249,29 +279,45 @@ impl PipelineRunner {
     }
 }
 
+/// Terminal result of a pipeline run, including per-step trace metadata.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum PipelineOutcome {
+    /// All steps finished without an aborting error policy.
     Completed {
+        /// Final envelope after the last successful step.
         envelope: MuninnEnvelopeV1,
+        /// Per-step timing, exit status, and policy annotations.
         trace: Vec<PipelineTraceEntry>,
     },
+    /// Pipeline stopped early but retained the last envelope for injection.
+    ///
+    /// Triggered by [`OnErrorPolicy::FallbackRaw`], a global deadline during a
+    /// step, or a deadline hit before the next step starts.
     FallbackRaw {
+        /// Envelope at the point of fallback (may be pre-failure input).
         envelope: MuninnEnvelopeV1,
         trace: Vec<PipelineTraceEntry>,
         reason: PipelineStopReason,
     },
+    /// Pipeline halted with no injectable envelope.
+    ///
+    /// Produced when a step fails under [`OnErrorPolicy::Abort`].
     Aborted {
         trace: Vec<PipelineTraceEntry>,
         reason: PipelineStopReason,
     },
 }
 
+/// Why a pipeline returned [`PipelineOutcome::FallbackRaw`] or [`PipelineOutcome::Aborted`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum PipelineStopReason {
+    /// Global [`PipelineConfig::deadline_ms`] budget was exhausted.
     GlobalDeadlineExceeded {
         deadline_ms: u64,
+        /// Step running or about to start when the deadline fired.
         step_id: Option<String>,
     },
+    /// A single step failed and its [`OnErrorPolicy`] ended the run.
     StepFailed {
         step_id: String,
         failure: StepFailureKind,
@@ -279,34 +325,56 @@ pub enum PipelineStopReason {
     },
 }
 
+/// Diagnostics for one executed pipeline step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PipelineTraceEntry {
+    /// Step identifier from configuration.
     pub id: String,
+    /// Wall-clock duration of the step attempt in milliseconds.
     pub duration_ms: u64,
+    /// True when the step hit its per-step timeout budget.
     pub timed_out: bool,
+    /// Step exit code when available; `None` when timeout prevented a status.
     pub exit_status: Option<i32>,
+    /// Error-recovery or contract-bypass policy recorded for this step.
     pub policy_applied: PipelinePolicyApplied,
+    /// Captured stderr (truncated when it exceeds the runner capture budget).
     pub stderr: String,
 }
 
+/// Recovery or contract annotation attached to a [`PipelineTraceEntry`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PipelinePolicyApplied {
+    /// Step succeeded without special handling.
     None,
+    /// Non-strict mode kept the input envelope after invalid step stdout.
     ContractBypass,
+    /// Step failed under [`OnErrorPolicy::Continue`] and the pipeline continued.
     Continue,
+    /// Step failure triggered [`OnErrorPolicy::FallbackRaw`].
     FallbackRaw,
+    /// Step failure triggered [`OnErrorPolicy::Abort`].
     Abort,
+    /// Step timed out while the remaining global deadline was exhausted.
     GlobalDeadlineFallback,
 }
 
+/// Step failure category shared by external and in-process execution paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StepFailureKind {
+    /// Failed to serialize the input [`MuninnEnvelopeV1`] for step stdin.
     SerializeInput,
+    /// Child process could not be spawned.
     SpawnFailed,
+    /// Stdin/stdout/stderr I/O or wait failed before a definitive exit status.
     IoFailed,
+    /// Step exceeded its effective timeout budget.
     Timeout,
+    /// Child exited non-zero after successful I/O.
     NonZeroExit,
+    /// Step stdout was missing, truncated, or not valid for the configured I/O mode.
     InvalidStdout,
+    /// Envelope-json stdout parsed as JSON but failed [`MuninnEnvelopeV1`] validation.
     InvalidEnvelope,
 }
 

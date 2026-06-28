@@ -1,3 +1,10 @@
+//! Confidence-gated replacement of uncertain transcript spans.
+//!
+//! Reads `uncertain_spans` and scored `replacements` on a [`MuninnEnvelopeV1`],
+//! applies top-score and margin thresholds (stricter for acronyms and short
+//! spans), and materializes `output.final_text` when accepted edits change the
+//! raw transcript.
+
 use std::collections::HashMap;
 
 use crate::envelope::MuninnEnvelopeV1;
@@ -26,12 +33,18 @@ struct AcceptedReplacement {
     to: String,
 }
 
+/// Score and margin gates for accepting a replacement candidate.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct Thresholds {
+    /// Minimum top candidate score for normal-length spans.
     pub min_top_score: f32,
+    /// Minimum gap between first- and second-place scores for normal spans.
     pub min_margin: f32,
+    /// Minimum top score when the span is acronym-like or short.
     pub acronym_min_top_score: f32,
+    /// Minimum score margin for acronym-like or short spans.
     pub acronym_min_margin: f32,
+    /// Character length at or below which strict acronym thresholds apply.
     pub short_span_max_chars: usize,
 }
 
@@ -71,6 +84,7 @@ impl From<&crate::config::ScoringConfig> for Thresholds {
     }
 }
 
+/// Span shape inputs that select normal vs strict replacement thresholds.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SpanMetadata {
     pub is_acronym: bool,
@@ -78,6 +92,7 @@ pub struct SpanMetadata {
 }
 
 impl SpanMetadata {
+    /// Build metadata for a candidate span.
     #[must_use]
     pub const fn new(char_len: usize, is_acronym: bool) -> Self {
         Self {
@@ -86,27 +101,35 @@ impl SpanMetadata {
         }
     }
 
+    /// True when strict acronym thresholds should apply.
     #[must_use]
     pub const fn is_acronym_or_short(self, short_span_max_chars: usize) -> bool {
         self.is_acronym || self.char_len <= short_span_max_chars
     }
 }
 
+/// Inputs for evaluating whether a span's top replacement should be accepted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReplacementDecisionInput {
     pub candidate_scores: Vec<f32>,
     pub span: SpanMetadata,
 }
 
+/// Why a replacement candidate was accepted or rejected.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionReason {
+    /// Top score fell below the applicable minimum threshold.
     BelowTopThreshold,
+    /// Top score passed but margin to the runner-up was too small.
     BelowMarginThreshold,
+    /// Top score and margin both satisfied the applicable thresholds.
     Accepted,
+    /// No finite candidate scores were provided.
     NoCandidates,
 }
 
+/// Outcome of [`decide_replacement`] with diagnostic score fields.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct ReplacementDecision {
     pub accepted: bool,
@@ -117,6 +140,7 @@ pub struct ReplacementDecision {
     pub used_strict_thresholds: bool,
 }
 
+/// Evaluate candidate scores for one uncertain span against `thresholds`.
 #[must_use]
 pub fn decide_replacement(
     input: &ReplacementDecisionInput,
@@ -203,6 +227,10 @@ fn top_two_scores(scores: &[f32]) -> (Option<f32>, Option<f32>) {
     (top, second)
 }
 
+/// Apply scored replacements to a completed or fallback [`PipelineOutcome`].
+///
+/// Returns whether `output.final_text` was materialized. No-op for aborted
+/// outcomes.
 pub fn apply_scored_replacements_to_outcome<T>(outcome: &mut PipelineOutcome, thresholds: T) -> bool
 where
     T: Into<Thresholds>,
@@ -217,6 +245,10 @@ where
     }
 }
 
+/// Materialize `output.final_text` from scored span replacements when gates pass.
+///
+/// No-op when `output.final_text` is already non-empty, when raw text is missing,
+/// or when no accepted replacements change the transcript.
 pub fn apply_scored_replacements_to_envelope(
     envelope: &mut MuninnEnvelopeV1,
     thresholds: &Thresholds,
@@ -380,7 +412,7 @@ fn looks_like_acronym(text: &str) -> bool {
 }
 
 fn non_empty_text(text: &Option<String>) -> Option<&str> {
-    text.as_deref().filter(|value| !value.is_empty())
+    text.as_deref().filter(|value| !value.trim().is_empty())
 }
 
 #[cfg(test)]

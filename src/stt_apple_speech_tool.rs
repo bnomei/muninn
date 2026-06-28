@@ -1,9 +1,15 @@
+//! Builtin Apple Speech STT pipeline step.
+//!
+//! Materializes an embedded macOS helper binary, transcribes `audio.wav_path`
+//! via on-device Speech APIs, and writes `transcript.raw_text`. Runnable as a
+//! subprocess internal tool or in-process via [`process_input_in_process`].
+
 use std::fs;
 use std::io::ErrorKind;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use muninn::MuninnEnvelopeV1;
 use muninn::ResolvedBuiltinStepConfig;
@@ -23,6 +29,7 @@ const PROVIDER_ID: &str = "apple_speech";
 const EMBEDDED_HELPER_BYTES: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/apple_speech_transcriber"));
 
+/// Apple Speech step failure surfaced to the pipeline runner or internal-tool stderr.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliError {
     code: &'static str,
@@ -37,6 +44,7 @@ impl CliError {
         }
     }
 
+    /// Serialize the error as JSON for subprocess stderr consumers.
     pub(crate) fn to_stderr_json(&self) -> String {
         json!({
             "error": {
@@ -47,6 +55,7 @@ impl CliError {
         .to_string()
     }
 
+    /// Borrow the human-readable error message.
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -122,6 +131,10 @@ struct AppleSpeechHelperResponse {
     asset_status: Option<String>,
 }
 
+/// Entry point for `muninn __internal_step stt_apple_speech` subprocess invocation.
+///
+/// Reads a [`MuninnEnvelopeV1`] from stdin and writes the updated envelope to
+/// stdout; failures log and emit JSON on stderr before returning failure.
 pub fn run_as_internal_tool() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -207,6 +220,7 @@ where
     }
 }
 
+/// Run Apple Speech STT inside the pipeline process using resolved builtin configuration.
 pub(crate) async fn process_input_in_process(
     input: &MuninnEnvelopeV1,
     config: &ResolvedBuiltinStepConfig,
@@ -613,12 +627,7 @@ fn resolved_config_from_builtin_steps(
 }
 
 fn materialize_helper_binary() -> Result<PathBuf, CliError> {
-    static HELPER_PATH: OnceLock<PathBuf> = OnceLock::new();
     static HELPER_INIT: Mutex<()> = Mutex::new(());
-
-    if let Some(path) = HELPER_PATH.get() {
-        return Ok(path.clone());
-    }
 
     let _guard = HELPER_INIT.lock().map_err(|_| {
         CliError::new(
@@ -626,10 +635,6 @@ fn materialize_helper_binary() -> Result<PathBuf, CliError> {
             "Apple Speech helper initialization lock was poisoned",
         )
     })?;
-
-    if let Some(path) = HELPER_PATH.get() {
-        return Ok(path.clone());
-    }
 
     let path = helper_output_path();
     if helper_needs_refresh(&path)? {
@@ -649,7 +654,6 @@ fn materialize_helper_binary() -> Result<PathBuf, CliError> {
     }
 
     ensure_helper_permissions(&path)?;
-    let _ = HELPER_PATH.set(path.clone());
     Ok(path)
 }
 

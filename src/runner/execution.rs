@@ -1,3 +1,9 @@
+//! External subprocess execution glue for one pipeline step.
+//!
+//! Encodes stdin via [`super::codec`], runs the child through [`super::transport`],
+//! maps transport and codec failures onto [`super::StepFailure`], and records
+//! contract-bypass policy when non-strict decoding preserves the input envelope.
+
 use std::time::Duration;
 
 use crate::config::PipelineStepConfig;
@@ -7,6 +13,12 @@ use super::codec::{self, CodecError, CodecErrorKind, DecodeDisposition};
 use super::transport::{self, CapturedOutput, CommandError, CommandErrorKind};
 use super::{PipelinePolicyApplied, StepFailure, StepFailureKind, StepSuccess};
 
+/// Run `step` as an external command with encoded stdin and decoded stdout.
+///
+/// Non-zero exit codes, stdout truncation past `max_stdout_bytes`, and codec
+/// errors become [`super::StepFailure`]. Successful runs return
+/// [`super::StepSuccess`] with stderr rendered from capped bytes plus
+/// `truncation_suffix` when truncated.
 pub(super) async fn run_external_step(
     step: &PipelineStepConfig,
     input_envelope: MuninnEnvelopeV1,

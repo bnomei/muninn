@@ -1,3 +1,9 @@
+//! macOS LaunchAgent synchronization for `app.autostart`.
+//!
+//! Writes `~/Library/LaunchAgents/com.bnomei.muninn.plist` with the canonical
+//! executable path, `MUNINN_CONFIG`, and optional `.env` loading. Does not call
+//! `launchctl`; login-session agents are picked up on next login.
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -10,15 +16,20 @@ const LAUNCH_AGENT_FILE_NAME: &str = "com.bnomei.muninn.plist";
 const DEFAULT_LAUNCH_AGENT_PATH: &str =
     "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
+/// Result of synchronizing the user LaunchAgent with `app.autostart`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AutostartSyncStatus {
+    /// LaunchAgent plist written or already matched desired state.
     Enabled {
         plist_path: PathBuf,
         launch_path: PathBuf,
+        /// `true` when the plist content changed on disk.
         changed: bool,
     },
+    /// Autostart disabled; plist removed when present.
     Disabled {
         plist_path: PathBuf,
+        /// `true` when an existing plist file was deleted.
         removed: bool,
     },
 }
@@ -31,6 +42,11 @@ struct LaunchAgentSpec {
     load_dotenv: bool,
 }
 
+/// Write or remove the Muninn LaunchAgent plist to match `config.app.autostart`.
+///
+/// Canonicalizes the executable and config paths so relaunches survive symlinked
+/// Homebrew installs. Sets `WorkingDirectory` to the config file parent so
+/// relative `.env` loading behaves consistently at login.
 pub fn sync_autostart(config_path: &Path, config: &AppConfig) -> Result<AutostartSyncStatus> {
     let home_dir = std::env::var_os("HOME")
         .map(PathBuf::from)
