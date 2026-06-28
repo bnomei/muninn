@@ -124,9 +124,9 @@ enum PreparedEnvelope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct WavMetadata {
-    sample_rate_hz: u32,
-    channels: u16,
+pub(crate) struct WavMetadata {
+    pub(crate) sample_rate_hz: u32,
+    pub(crate) channels: u16,
 }
 
 #[derive(Debug, Serialize)]
@@ -369,7 +369,7 @@ fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(reqwest::Client::new)
 }
 
-fn google_request_body(
+pub(crate) fn google_request_body(
     wav_path: &Path,
     wav: WavMetadata,
     model: Option<&str>,

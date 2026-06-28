@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-06-28
+
+### Fixed
+
+- Fixed release CI by making the Criterion benchmark harness include source modules without invalidating their module-level documentation comments.
+
 ## [0.6.1] - 2026-06-19
 
 ### Changed

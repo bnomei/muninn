@@ -24,39 +24,34 @@ use tempfile::{NamedTempFile, TempDir};
 
 const BENCH_TIMESTAMP: &str = "2026-03-06T00:00:00Z";
 
-mod google_tool_impl {
-    #![allow(dead_code)]
-    #![allow(clippy::items_after_test_module)]
-    #![allow(unused_imports)]
-    include!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/src/stt_google_tool.rs"
-    ));
+#[allow(dead_code)]
+#[allow(clippy::items_after_test_module)]
+#[allow(unused_imports)]
+#[path = "../src/stt_google_tool.rs"]
+mod google_tool_impl;
 
-    pub fn bench_google_request_body(
-        wav_path: &std::path::Path,
-        sample_rate_hz: u32,
-        channels: u16,
-        model: Option<&str>,
-    ) -> Result<usize, String> {
-        google_request_body(
-            wav_path,
-            WavMetadata {
-                sample_rate_hz,
-                channels,
-            },
-            model,
-        )
-        .map(|body| body.len())
-        .map_err(|error| error.message().to_string())
-    }
+fn google_request_body_size(
+    wav_path: &std::path::Path,
+    sample_rate_hz: u32,
+    channels: u16,
+    model: Option<&str>,
+) -> Result<usize, String> {
+    google_tool_impl::google_request_body(
+        wav_path,
+        google_tool_impl::WavMetadata {
+            sample_rate_hz,
+            channels,
+        },
+        model,
+    )
+    .map(|body| body.len())
+    .map_err(|error| error.message().to_string())
 }
 
-mod replay_impl {
-    #![allow(dead_code)]
-    #![allow(unused_imports)]
-    include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/replay.rs"));
-}
+#[allow(dead_code)]
+#[allow(unused_imports)]
+#[path = "../src/replay.rs"]
+mod replay_impl;
 
 struct BenchExecutor;
 
@@ -168,7 +163,7 @@ fn bench_google_request_body(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(label), &label, |b, _| {
             b.iter(|| {
                 black_box(
-                    google_tool_impl::bench_google_request_body(
+                    google_request_body_size(
                         black_box(wav.path()),
                         sample_rate_hz,
                         channels,
