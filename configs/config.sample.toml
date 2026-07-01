@@ -42,8 +42,10 @@ sample_rate_khz = 16
 providers = ["apple_speech", "whisper_cpp", "deepgram", "openai", "google"]
 # Streaming transcription is opt-in. Recorded mode remains the default and still
 # writes a completed WAV for fallback/replay before downstream refine/injection.
-# Streaming-capable providers are deepgram, openai, and google; apple_speech and
-# whisper_cpp remain completed-recording providers for recorded mode/fallback.
+# Live streaming providers are deepgram and openai. Google streaming request
+# construction exists, but the pinned google-cloud-speech-v2 1.12.0 dependency
+# does not expose a callable streaming RPC, so Google remains recorded/fallback.
+# apple_speech and whisper_cpp remain completed-recording providers.
 # mode = "streaming"
 #
 # [transcription.streaming]
@@ -191,8 +193,11 @@ max_new_word_count = 2
 # only takes effect for the packaged macOS .app that registers the scheme.
 url_scheme_enabled = true
 # mcp_enabled runs a localhost streamable-HTTP MCP server exposing recording-control
-# tools (start_recording, stop_recording, cancel_recording).
+# tools (get_status, start_recording, stop_recording, cancel_recording).
 mcp_enabled = false
+# Explicit opt-in required before URL or MCP controls may start microphone capture.
+# stop/cancel remain available for active captures.
+start_recording_enabled = false
 # The server has no authentication; mcp_bind_address must be an explicit loopback
 # socket address such as 127.0.0.1:2769. Wildcard, LAN, hostname, and other
 # non-loopback binds are rejected.
@@ -247,9 +252,10 @@ language = "en"
 endpoint = "https://speech.googleapis.com/v1/speech:recognize"
 # model = "latest_short"
 # model can also be overridden with GOOGLE_STT_MODEL
-# Streaming uses Google Speech-to-Text v2 and cannot rely on API-key-only auth;
-# the API key above remains valid for the existing REST fallback. The official
-# google-cloud-speech-v2 crate may require Rust 1.88+.
+# Streaming request construction uses Google Speech-to-Text v2 and cannot rely on
+# API-key-only auth, but the pinned google-cloud-speech-v2 1.12.0 dependency
+# does not expose a callable streaming RPC. The API key above remains valid for
+# recorded REST fallback.
 # streaming_project_id = "your-gcp-project"
 # streaming_location = "global"
 # streaming_recognizer = "_"
